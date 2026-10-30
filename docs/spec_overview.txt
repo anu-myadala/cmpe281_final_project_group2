@@ -1,0 +1,284 @@
+Overview of the Component Designs
+This document is Deliverable #2 of Group 2: the component design of the Smart Car Intelligent Cloud Platform (SCICP). It
+takes the system design of Deliverable #1 as fixed (components, REST APIs, data stores, roles, and alert states) and gives each
+component its detailed design in the five sections of the component design template: component overview, application interface
+design, function, data and behavior design, business logic, and graphic user interface design. Each team member wrote the part
+for the component they will build, as Deliverable #1 assigned them. Figures and tables are numbered through the whole
+document; section numbers restart in each part, so "Section 4.1" in a part refers to that part.
+Table 1: Parts of this document and their owners
+Part
+
+Component
+
+I
+
+C1 Cloud Platform Dashboard and System Admin, Anukrithi Myadala
+with the C4 model registry pages
+
+Owner
+
+What the part covers
+Login and roles, owner and fleet dashboards with the live
+vehicle map, subscriptions, statistics and reports, tenant and user
+administration, WebSocket hub, model registry and activation,
+feedback labels
+
+II
+
+C2 Edge Agent and IoT Device Management, with Brandon Rivera
+per-car data management and the edge agent
+Venegas
+
+Vehicles, devices, and riders; provisioning and MQTT logins;
+device settings, commands, and status; Wi-Fi settings; clip
+upload, per-car data, and retention; the edge agent and the car
+simulator
+
+III
+
+C3 Alert Tracking and Monitoring, with the C4
+classifier worker and the MongoDB collections
+
+Alert rules and decision, alert life cycle and notifications, alert
+pages, classifier worker and training pipeline, audio_events and
+the other MongoDB collections
+
+Ray Zhao
+
+The shared conventions are defined once, in Part I, and the other parts follow them: every public endpoint is under /api/v1
+with a bearer JWT whose role and tenant come from the token; errors use one envelope and the codes of Table 8; internal calls
+between containers go to /internal/... with a service token; components never write each other's tables and read them only
+through the SELECT-only access of the C5 data layer; live updates go through the EventBus and the WebSocket hub of Part I;
+and MQTT topics live under scicp/v1/. Objects live in two S3 buckets in us-west-2: scicp-clips for the audio clips (key layout
+in Part II) and scicp-models for the model artifacts (Part I). All parts use the same seed data: Tenant A (tA, the Nguyen
+household, car AV-01), Tenant B (tB, Bay Shuttle LLC, cars AV-10 to AV-14), the model sound-classifier with version 1.1.0
+active and 1.2.0 registered, and the sample alert 20482.
+
+Interfaces between the components
+Table 2 is the integration contract between the parts: every call, message, or shared read that crosses a component boundary,
+with the part that defines it. Every row was checked against the parts that define it.
+Table 2: Interfaces between the components
+Interface
+
+From → to
+
+Contract
+
+Defined in
+
+Audio event
+
+C2 edge agent → C4
+classifier worker
+
+MQTT 3.1.1 over TLS, topic
+scicp/v1/{tenantId}/{vehicleId}/audio/event, QoS 1; eventId, deviceId,
+channel, ts, clip{clipId, s3Key, durationMs, sampleRate}, edge,
+location, context; C2 does not relay it
+
+Part III (format), Part II
+(publisher)
+
+Clip bytes
+
+C4 classifier worker →
+C2
+
+GET /internal/clips/{clipId} with the service token: 200 audio/wav, 5 s
+mono 16 kHz; 404 unknown, 410 deleted or expired (final: the event is
+stored without a result); the worker retries twice with a 5 s timeout and,
+only if C2 does not answer, reads clip.s3Key from S3 with its IAM role
+
+Part II, Part III
+
+Classification result
+
+C4 classifier worker →
+C3
+
+POST /internal/events/{eventRef}/result, idempotent per event and alert
+type
+
+Part III
+
+Model activation
+
+C1 → C4 classifier
+worker
+
+MQTT scicp/v1/platform/model/activated, {modelId, version}, QoS 1,
+retained, published after the activation commits; outside every car's
+topic root; the worker also polls the ACTIVE model_version row every
+30 s
+
+Part I (publisher), Part II
+(broker logins and ACL),
+Part III (consumer)
+
+Alert events
+
+C3 → C1 WsHub
+
+EventBus alert.created and alert.updated with tenantId as the routing
+key (in process; Redis in the full design); by in alert.updated is the
+display name of the user
+
+Part I, Part III
+
+Device status
+
+C2 → C1 WsHub
+
+EventBus device.status {tenantId, vehicleId, deviceId, status,
+lastSeenAt, faultReason?, muted?, config?{version, state}}; WsHub
+strips tenantId and forwards the optional fields unchanged
+
+Part I, Part II
+
+Open alerts on the
+overview
+
+C1 → C3
+
+GET /alerts?status=OPEN&tenantId&limit and GET /alerts/{alertId}
+with a service token; OPEN means NEW or ACKNOWLEDGED
+
+Part I, Part III
+
+Vehicle cards
+
+C1 → C2
+
+GET /vehicles and GET /vehicles/{id}/devices with a service token;
+items carry the connection and the device summary
+
+Part I, Part II
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+Interface
+
+Contract
+
+Defined in
+
+Vehicle positions for the C1 reads C2 collection
+map
+
+From → to
+
+Read-only Motor access to vehicle_telemetry: the newest document per
+car of a tenant in one aggregation ($match meta.tenantId, $sort ts
+descending, $group by meta.vehicleId with $first); the trail of one car
+comes from GET /vehicles/{id}/telemetry?limit=60 of C2; C1 writes
+nothing to the collection
+
+Part I, Part II
+
+Alert pins on the map
+
+C1 → C3
+
+GET /alerts/map?status=OPEN&tenantId with a service token: one
+point per open alert at the location of its event
+
+Part I, Part III
+
+Default subscriptions of
+a new car
+
+C2 → C1
+
+SubscriptionService.defaults(vehicleId) inside the vehicle-create
+transaction (a direct call in our build, a vehicle.created event in the full
+design); EMERGENCY, ACCIDENT, SECURITY, SAFETY enabled
+with DASHBOARD and EMAIL
+
+Part I, Part II
+
+Vehicle limit
+
+C2 reads C1 table
+
+SELECT tenant.code, plan, max_vehicles; POST /vehicles refuses the
+car beyond max_vehicles (BR-06 of Part I, BR-C2-02 of Part II)
+
+Part I, Part II
+
+Tenant list for the staff
+tenant selector
+
+C2 and C3 pages → C1
+
+GET /admin/tenants, read-only for IOT_ENGINEER and
+SERVICE_STAFF
+
+Part I, Part II, Part III
+
+Users
+
+C2 and C3 read C1 table SELECT-only: app_user role (rider check of BR-C2-26), email and
+name (alert emails and the by field of alert.updated)
+
+Part I, Part II, Part III
+
+Subscriptions, alert
+types, tenant time zone
+
+C3 reads C1 tables
+
+SELECT-only: subscription (service switch, channels, quiet hours,
+notify_riders), alert_type (default severity), tenant.time_zone
+
+Part I, Part III
+
+Vehicles, riders, and
+clips
+
+C3 and the worker read
+C2 tables
+
+SELECT-only: vehicle (vehicle_code, label, retention_days for
+expireAt), vehicle_rider (active riders), clip (state, so a deleted clip is
+not offered for playback)
+
+Part II, Part III
+
+Alert counts for
+statistics
+
+C1 reads C3 table
+
+SELECT-only view v_alert_summary
+
+Part I, Part III
+
+Feedback labels
+
+C3 alert page → C1
+
+POST /events/{eventRef}/feedback: FALSE_ALARM when an alert is
+marked a false alarm, CONFIRMED when it is resolved
+
+Part I, Part III
+
+MongoDB collections
+
+C2 writes, C3 specifies
+
+vehicle_telemetry and device_state_history are specified once, in Part
+III, with their indexes, shard keys, and retention; Part II gives the fields
+C2 writes; audio_events is written by the worker (C3 adds the decision
+fields) and read by C2 for the per-car data tab
+
+Part II, Part III
+
+A few details were aligned when the parts were combined, and each part now states them the same way. The model activation
+message is published on the MQTT topic above as well as on the EventBus, because the classifier worker runs in its own
+container and cannot receive in-process events. The tenant table carries a time_zone column, in which C3 evaluates quiet hours.
+The by field of alert.updated is the display name of the user who acted. The device.status message carries the optional muted and
+config fields that the C2 device editor needs. The tenant list of the administration API is readable by the two other staff roles so
+that their pages can offer a tenant selector. Each part keeps the ERD of the tables it owns: Part I the tenant, user, subscription,
+and registry tables, Part II the vehicle, device, command, network, and clip tables, Part III the alert tables and the MongoDB
+collections; together they are the Deliverable #1 ERD with the columns each part adds.
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)

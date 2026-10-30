@@ -1,0 +1,3376 @@
+Part III. C3 Alert Tracking and Monitoring
+Component owner: Ray Zhao (ray.zhao@sjsu.edu). Includes the C4 classifier worker and the MongoDB collections.
+
+1. Component Overview
+This part is the detailed design of component C3, Alert Tracking and Monitoring, of the Smart Car Intelligent Cloud Platform
+(SCICP), together with the C4 classifier worker that produces the results C3 consumes and the MongoDB collections that hold
+the sound events. It is task T7 of Table 19 of our Deliverable #1 [1] and keeps that system design unchanged (component
+boundaries, the REST APIs of its Table 9, the MySQL and MongoDB schemas, the alert states), filling in what is inside C3 and
+the worker. The model registry pages and the feedback API belong to C1 [2]; the vehicle, device and clip upload belong to C2.
+
+1.1 Purpose
+C3 decides when a classified sound becomes an alert, records what happens to the alert until it is closed, and tells the right
+people. For every result the worker reports, C3 applies the alert rules of the tenant to the top classes and the vehicle state, checks
+the owner's subscription, creates at most one alert, and sends it to the dashboards over the event bus and to the owner and riders
+by email. Owners, fleet managers, service staff and riders then list the alerts, play the clip, and acknowledge, resolve, or mark a
+false alarm; every action is stored with the user and time.
+The classifier worker is the other half of that path. It receives the audio event from the car over MQTT, fetches the clip,
+computes a CLAP embedding, classifies it into the seven semester classes with a small head, writes the event to MongoDB, and
+reports the result to C3. C3 does not talk to cars, does not change classes or models, and does not draw the dashboard shell; those
+belong to C2, C1 and the registry in C1. Figure 35 places C3 and the worker among their neighbors. As in Deliverable #1, we
+design for the full-scale platform (an SQS queue and an inference group per tenant size, IoT Core, Redis pub/sub) and build
+what the demo needs (one worker container, Mosquitto, one FastAPI service with an in-process event bus on one EC2 instance);
+the APIs, tables, classes and rules are the same in both.
+
+Figure 35: Context diagram of C3 and the C4 classifier worker
+
+1.2 Objectives
+Table 77 lists the six objectives for the component this semester and how the design meets each one. O2 and O5 are measured
+during testing; the others are checked by the unit tests of the decision tables of Section 4 and by the API and tenancy tests of the
+Deliverable #1 test plan.
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+
+Table 77: Objectives of the component
+ID
+
+Objective
+
+How the design meets it
+
+O1
+
+One alert per qualifying event, decided by the same rules
+every time
+
+AlertEngine applies the decision table of Section 4.1 to each of the top three
+classes; a unique key on (event_ref, alert_type_code) makes a repeated
+result harmless
+
+O2
+
+Alert created within 0.4 s of the worker's result; on the
+dashboard within 8 s p95 of the start of the sound
+
+The result call does the rule check, one INSERT and the event publish in
+one request; email is sent after the response; budget in Table 78
+
+O3
+
+Every change of an alert is traceable
+
+AlertStateMachine allows only the transitions of Section 4.4; each transition
+writes an alert_action row in the same transaction; an illegal transition
+answers 409
+
+O4
+
+A notification problem never delays or removes an alert
+
+NotificationService sends after the alert is committed, makes three attempts,
+and stores the outcome on the notification row
+
+O5
+
+Classification quality is measured on data the model has
+not seen
+
+The training pipeline splits by original recording so augmented copies stay
+together; precision, recall and F1 per class and macro-F1 are reported and
+compared with the provided models
+
+O6
+
+Tenant isolation enforced in one place
+
+C1's TenantContext resolves the scope; every alert query starts with
+tenant_id and every MongoDB pipeline with tenantId; another tenant's id
+answers 404
+
+Table 78 splits the 8 s p95 target of Deliverable #1 (its Table 6) over the steps of the path. The values are design targets for the
+first integration, to be replaced by the numbers we measure in T12 and T15; if the worker step needs more than 2.0 s on the
+t3.medium, we trade pre-roll length or the head size against it, not the alert steps.
+Table 78: Latency budget from the start of the sound to the dashboard
+Step
+
+Owner
+
+Target (s)
+
+Measured by
+
+Sound starts to clip complete (2 s pre-roll, 5 s clip, so about 3 s
+after the sound starts)
+
+C2
+
+3.0
+
+Fixed by the clip design
+
+Upload and publish
+
+C2
+
+0.8
+
+Agent timestamps
+
+Wait in the worker queue
+
+C4
+
+0.3
+
+Worker log
+
+Fetch, resample, CLAP, head
+
+C4
+
+2.0
+
+latencyMs in the result
+
+Result call: rules, INSERT, publish
+
+C3
+
+0.4
+
+API timer
+
+Event bus to browser
+
+C1
+
+1.0
+
+WsHub timestamp
+
+7.5
+
+Margin of 0.5 s to the 8 s target
+
+Total
+
+Non-functional requirements. The component inherits the our-build column of Table 6 of Deliverable #1: API reads within
+300 ms (the result call has the 0.4 s of Table 78); one instance that must run through the demo, so the worker restarts by Docker
+policy and reprocesses unacknowledged MQTT messages (QoS 1, duplicates ignored by event id); HTTPS and JWT roles for
+every public endpoint and a service token for the internal ones; tenant_id filtering in every query; and the nightly dumps to S3 of
+C5 (FR-C5-05), which cover the alert tables and the event collections.
+
+1.3 Function scope
+We partition the component into the ten modules of Table 79. The priority column is the one from Table 5 of Deliverable #1: H
+means the module works in the final demo and is tested, M means we build it if time allows, and L means it is designed here but
+not built this semester.
+Table 79: Modules of the component and the requirements they satisfy
+Module
+
+Functions
+
+Requirements
+
+Priority
+
+M1 Alert evaluation
+
+Rule lookup, vehicle state, top-class check, subscription check,
+severity, recipients, alert creation
+
+FR-C3-01, FR-C3-02
+
+H
+
+M2 Alert tracking
+
+Acknowledge, resolve, false alarm; state machine; alert_action
+history
+
+FR-C3-03
+
+H
+
+M3 Alert queue and detail
+
+List with filters, detail with event, rule, clip URL and history
+
+FR-C3-05
+
+H
+
+M4 Live updates
+
+alert.created and alert.updated on the event bus
+
+FR-C3-04
+
+H
+
+M5 Notifications
+
+Dashboard row, SES email to owner, fleet manager and riders, retry FR-C3-06
+
+H
+
+M6 Alert rules and map
+
+Tenant thresholds, severity override, alert map data
+
+M
+
+M7 Classifier worker
+
+MQTT consumer, clip fetch, CLAP embedding, 7-class head, model FR-C4-01, FR-C4-03
+reload, result report
+
+H
+
+M8 Event store
+
+audio_events, vehicle_telemetry and device_state_history
+collections, indexes, validators, retention
+
+H
+
+FR-C3-07
+
+FR-C5-02
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+Module
+
+Functions
+
+Requirements
+
+Priority
+
+M9 Training pipeline
+
+Dataset preparation, grouped split, head training, evaluation, model
+export (offline)
+
+FR-C4-01
+
+H
+
+M10 Design only
+
+Duplicate merging within 60 s, escalation, SMS, push, in-car alerts
+
+FR-C3-08
+
+L
+
+Out of scope. The model registry, the activation of versions and the feedback API (FR-C4-02, FR-C4-04) are built by C1;
+vehicles, devices, provisioning, the clip upload and the per-car retention setting are C2; subscriptions, alert type codes and
+default severities are C1 tables that C3 only reads; the dashboard shell, statistics and reports are C1; backups are C5. C3 hosts the
+alert pages inside the C1 shell and links to them, but their APIs and logic are specified here.
+
+1.4 Usage
+Table 80 shows who uses which module. OWNER and FLEET_MANAGER see the alerts of their tenant, a RIDER only
+receives the email and opens the read-only alert page for the vehicles of the active trip (BR-03 of C1), SERVICE_STAFF and
+SYS_ADMIN see every tenant, and IOT_ENGINEER has no alert pages. The alert rules page is for the fleet manager of a tenant
+and for staff (Deliverable #1, UC-08).
+Table 80: Roles and the modules they use
+Role
+
+M2 Actions
+
+M3 Queue and detail
+
+M4 Live updates
+
+M5 Email
+
+M6 Rules
+
+OWNER
+
+Y, own tenant
+
+Y, own tenant
+
+Y, tenant room
+
+Receives
+
+-
+
+FLEET_MANAGER
+
+Y, own tenant
+
+Y, own tenant
+
+Y, tenant room
+
+Receives
+
+Y, own tenant
+
+RIDER
+
+-
+
+Read, vehicles of the active trip
+
+-
+
+Receives
+
+-
+
+IOT_ENGINEER
+
+-
+
+-
+
+-
+
+-
+
+-
+
+SERVICE_STAFF
+
+Y, any tenant
+
+Y, any tenant
+
+Y, staff room
+
+-
+
+Y, any tenant and defaults
+
+SYS_ADMIN
+
+Y, any tenant
+
+Y, any tenant
+
+Y, staff room
+
+-
+
+Y, any tenant and defaults
+
+Table 81 gives the six usage scenarios that drive the sequence diagrams of Section 3.4 and the storyboards of Section 5.3. They
+use the seeded data of the C1 design: Tenant A (tA) is the Nguyen household with car AV-01, Tenant B (tB) is Bay Shuttle LLC
+with cars AV-10 to AV-14, and the classifier sound-classifier has version 1.1.0 active and 1.2.0 registered.
+Table 81: Usage scenarios
+ID
+
+Actor
+
+Scenario
+
+Modules
+
+SC1
+
+Owner Anh (tA)
+
+AV-01 drives at 48 km/h; the worker reports crash 0.91; C3 creates ACCIDENT alert
+20482 (CRITICAL), pushes it, and sends the SES email; Anh opens it, plays the clip
+and presses Acknowledge
+
+M1, M4, M5, M2
+
+SC2
+
+Fleet manager Maria (tB) AV-12 is parked at 23:10 and the worker reports scream 0.83; SECURITY is on with
+quiet hours 22:00 to 06:00, so the alert is created and shown on the dashboard but no
+email is sent; an earlier honking event on AV-12 created nothing because SAFETY is
+off
+
+M1, M4
+
+SC3
+
+Service staff
+
+Opens the alert monitor for Tenant B, filters HIGH, opens a siren alert, plays the clip,
+presses False alarm; the page also posts the FALSE_ALARM feedback label to C1
+
+M3, M2
+
+SC4
+
+Fleet manager Maria (tB) Raises the honking threshold of Tenant B from 0.60 to 0.75; the next honking event at
+0.70 creates no alert
+
+M6, M1
+
+SC5
+
+Service staff
+
+Activates sound-classifier 1.2.0 in the C1 registry; the worker loads it between two clips M7
+and the next alert detail shows modelVersion sound-classifier-1.2.0
+
+SC6
+
+System
+
+C2 cannot return a clip (404); the worker stores the event with inference.error, creates
+no alert, and the failure count appears in the worker log
+
+M7, M8
+
+1.5 Interfaces to other components
+As Deliverable #1 requires (its Section 3.2 and Table 8), components talk through REST calls and events and never write each
+other's tables: C3 reads the rows C1 and C2 own through the read-only access of the C5 data access layer (SELECT-only
+grants), and writes only the tables of Section 3.3. Table 82 lists every interface; Section 2 gives the calls and messages.
+Table 82: Interfaces between C3, the worker and the other components and services
+Counterpart
+
+Direction
+
+Interface
+
+Used for
+
+C2 edge agent through
+Mosquitto
+
+In (worker)
+
+MQTT 3.1.1 over TLS, topic
+scicp/v1/{tenantId}/{vehicleId}/audio/event, QoS 1
+
+The audio event to classify
+
+C2 clip service
+
+Out (worker)
+
+Internal REST GET /internal/clips/{clipId}, service
+token
+
+The clip bytes (5 s mono 16 kHz WAV)
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+Counterpart
+
+Direction
+
+Interface
+
+Used for
+
+C1 model registry
+
+Out (worker)
+
+SELECT of the ACTIVE model_version row; S3
+GET of the artifact; MQTT model topic or poll
+
+The active classifier head and its class list
+
+C1 subscription, alert_type and
+tenant tables
+
+Out (C3)
+
+SELECT-only through C5
+
+Service switch, channels, quiet hours,
+severities (BR-05 of C1); tenant.time_zone
+for the quiet-hours check
+
+C2 vehicle and vehicle_rider
+tables
+
+Out (C3)
+
+SELECT-only through C5
+
+Vehicle label and the active riders
+
+C1 EventBus and WsHub
+
+Out (C3)
+
+Publish alert.created, alert.updated with tenantId as
+routing key
+
+Live dashboard updates
+
+C1 AlertClient
+
+In (C3)
+
+GET /alerts?status=OPEN&tenantId&limit and
+GET /alerts/{alertId} with a service token
+
+Open alerts and total on the owner overview
+
+C1 feedback API
+
+Out (browser)
+
+POST /events/{eventRef}/feedback from the alert
+detail page
+
+The FALSE_ALARM label for retraining
+(CONFIRMED when an alert is resolved)
+
+C5 MySQL and MongoDB
+
+Both
+
+SQLAlchemy session; Motor client
+
+Alerts, rules, notifications, audio events
+
+Amazon S3
+
+Out
+
+StorageClient.presign_get(key, 15 min)
+
+Clip playback in the alert detail
+
+Amazon SES
+
+Out
+
+AlertMailer.send(alert, recipient)
+
+Alert email
+
+2. Component Application Interface Design and Analysis
+Sections 2.1 to 2.3 specify the REST APIs of C3 (alerts, alert rules, and the internal result call), 2.4 the interfaces of the classifier
+worker, 2.5 the events and WebSocket messages C3 produces, 2.6 the internal interfaces, and 2.7 who may call what and how
+the APIs are versioned and protected. Every C3 endpoint of Table 9 of Deliverable #1 is here; this design adds GET /alerts/map,
+DELETE /alert-rules/{ruleId}, the internal result call in full, the worker interfaces, and the model topic. The business rules BRC3-01 to BR-C3-14 are stated in Section 4.
+Conventions. C3 follows the conventions of the C1 design [2]: all endpoints are under /api/v1 and exchange JSON, dates are
+ISO 8601 in UTC, every request except login carries a bearer JWT, and the tenant of a request comes from the token, never from
+the URL; staff roles pass tenantId as a query parameter where a tenant scope is needed. vehicleId is the public vehicle code (AV01), the MongoDB tenantId is the tenant code (tA, tB), and eventRef is the 24-character ObjectId of the audio event. Errors use
+the one envelope and the codes of Table 8 in Part I; C3 adds two details: a refused transition is CONFLICT 409 with details
+{from, to, allowed[]}, and a refused rule value is BUSINESS_RULE 422 with details.rule set to the BR-C3 id. Lists are paged
+with page and size (default 25, maximum 100); limit is accepted as an alias of size so that C1's AlertClient works unchanged.
+
+2.1 Alerts
+Table 83 is the API of M3 and M2. The queue and the detail are read-only; the one write is the action, which changes the status
+through AlertStateMachine and answers 409 when the alert is not in a state that allows it. OPEN means NEW or
+ACKNOWLEDGED, as in C1's overview. The detail returns everything the alert page needs in one call so that the page opens
+within the 300 ms budget: the event, the rule that fired, a presigned clip URL (15 minutes), the action history and the notification
+outcomes.
+Table 83: Alert API
+Method and endpoint
+
+Request
+
+Response
+
+Errors and rules
+
+GET /alerts
+
+?status=NEW,
+ACKNOWLEDGED,
+RESOLVED, FALSE_ALARM or
+OPEN; type; severity; vehicleId;
+from; to; tenantId (staff);
+sort=createdAt or severity; page;
+size
+
+200 {items[{alertId, vehicleId, type, severity,
+status, topClass, confidence, createdAt,
+ageSeconds, acknowledgedBy}], total, page,
+size}
+
+400 bad filter; 403
+IOT_ENGINEER (BR-01 of C1); a
+RIDER sees only vehicles of the
+active trip (BR-03 of C1)
+
+GET /alerts/{alertId}
+
+none
+
+200 {alert, event{eventRef, ts, channel,
+location, context, topK[], modelVersion,
+latencyMs}, rule{ruleId, scope,
+minConfidence, vehicleState}, clip{url,
+expiresAt, durationMs}, actions[{action,
+userId, name, note, ts}],
+notifications[{recipient, channel, status}]}
+
+404 for an unknown id or another
+tenant's id
+
+POST
+/alerts/{alertId}/actions
+
+{action ACKNOWLEDGE,
+RESOLVE or FALSE_ALARM,
+note?}
+
+200 the alert in its new state
+
+409 not allowed from the current
+state (BR-C3-07); 403 RIDER,
+IOT_ENGINEER; 400 note over
+500 characters; 404. Writes
+alert_action; publishes alert.updated
+
+GET /alerts/map
+
+?status=OPEN; tenantId (staff)
+
+200 [{alertId, vehicleId, lat, lon, severity, type, 403 as above
+createdAt}] (M)
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+
+GET /api/v1/alerts/20482
+{ "alert": { "alertId": 20482, "vehicleId": "AV-01", "type": "ACCIDENT", "severity": "CRITICAL",
+"status": "NEW", "topClass": "crash", "confidence": 0.91, "vehicleState": "MOVING", "count": 1,
+"createdAt": "2026-11-04T21:42:12Z", "lat": 37.3352, "lon": -121.8811 },
+"event": { "eventRef": "6729b1c4e1f0a2d3c4b5a697", "ts": "2026-11-04T21:42:07.312Z",
+"channel": "exterior",
+"topK": [ {"class":"crash","conf":0.91}, {"class":"glass_break","conf":0.06},
+{"class":"traffic","conf":0.02} ],
+"modelVersion": "sound-classifier-1.1.0", "latencyMs": 1480 },
+"rule": { "ruleId": 2, "scope": "DEFAULT", "minConfidence": 0.70, "vehicleState": "MOVING" },
+"clip": { "url": "https://scicp-clips.s3.us-west-2.amazonaws.com/tenants/tA/vehicles/AV-01/2026/11/04/
+c41e8d2b.wav?X-Amz-...",
+"expiresAt": "2026-11-04T21:57:12Z", "durationMs": 5000 },
+"actions": [], "notifications": [ { "recipient": "anh@example.com", "channel": "EMAIL",
+"status": "SENT" } ] }
+
+POST /api/v1/alerts/20482/actions
+
+{ "action": "RESOLVE" }
+
+(the alert is already FALSE_ALARM)
+
+HTTP/1.1 409 Conflict
+{ "error": { "code": "CONFLICT", "message": "Action not allowed in this state",
+"details": { "rule": "BR-C3-07", "from": "FALSE_ALARM", "to": "RESOLVED",
+"allowed": [] } } }
+
+2.2 Alert rules
+Table 84 is the API of M6, the alert rule thresholds that FR-C3-07 and UC-08 require. A rule maps one sound class and one
+vehicle state to one alert type with a minimum confidence. The platform ships default rules (tenant_id null, Table 95 of Section
+3.3); a tenant changes a threshold by saving an override, so PUT on a default rule creates the tenant's own copy and answers 201,
+and DELETE of an override restores the default. GET returns the effective list, in which an override replaces its default.
+Table 84: Alert rules API (M)
+Method and endpoint
+
+Request
+
+Response
+
+Errors and rules
+
+GET /alert-rules
+
+?tenantId (staff; absent = defaults)
+
+200 [{ruleId, scope DEFAULT or TENANT,
+alertType, class, vehicleState ANY, MOVING
+or PARKED, minConfidence, severityOverride,
+minRepeats, windowSeconds, enabled,
+updatedBy, updatedAt}]
+
+403 OWNER, RIDER,
+IOT_ENGINEER
+
+POST /alert-rules
+
+{tenantId?, alertType, class,
+vehicleState, minConfidence,
+severityOverride?, minRepeats?,
+windowSeconds?}
+
+201 rule
+
+409 same class, state and type exists;
+422 BR-C3-09; 404 unknown class or
+type. Audit RULE_SAVE
+
+PUT /alert-rules/{ruleId} {minConfidence?, severityOverride? 200 rule; 201 when it creates a tenant override
+or null, minRepeats?,
+of a default
+windowSeconds?, enabled?}
+
+422 BR-C3-09, BR-C3-10; 403
+FLEET_MANAGER for another
+tenant or a default without tenant;
+404. Audit RULE_SAVE
+
+DELETE
+/alert-rules/{ruleId}
+
+409 on a default rule; 404. Audit
+RULE_DELETE
+
+none
+
+2.3 Internal result call
+Table 85 is the one call between the worker and C3. The worker has already inserted the audio event, so the call carries only
+what C3 needs to decide; C3 answers with the decision and also writes it into the event (decision.alert, decision.alertId,
+decision.alertType). The call is idempotent: a repeated result for the same event returns the first decision because (event_ref,
+alert_type_code) is unique, which makes the QoS 1 redelivery of MQTT harmless (BR-C3-12). It uses a service token (role
+SERVICE, HS256, 24 hours), and nginx does not route /internal/ from the Internet, so only containers on the Docker network
+can reach it.
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+
+Table 85: Internal result API (worker to C3)
+Method and endpoint
+
+Request
+
+Response
+
+Errors and rules
+
+POST
+/internal/events/{eventRef}/result
+
+{tenantId (code), vehicleId,
+topK[{class, conf}] (up to 3),
+modelVersion, latencyMs,
+error?}
+
+200 {decision{alert, alertId?, alertType?,
+severity?, reason}} with reason
+ALERT_CREATED, NO_RULE,
+BELOW_THRESHOLD, SERVICE_OFF,
+STATE_MISMATCH, REPEAT_PENDING,
+DUPLICATE_RESULT or
+ERROR_RECORDED
+
+401 bad token; 404 event
+not found for that tenant;
+400 topK empty without
+error
+
+POST /internal/events/6729b1c4e1f0a2d3c4b5a697/result
+{ "tenantId": "tA", "vehicleId": "AV-01", "modelVersion": "sound-classifier-1.1.0", "latencyMs": 1480,
+"topK": [ {"class":"crash","conf":0.91}, {"class":"glass_break","conf":0.06},
+{"class":"traffic","conf":0.02} ] }
+HTTP/1.1 200 OK
+{ "decision": { "alert": true, "alertId": 20482, "alertType": "ACCIDENT", "severity": "CRITICAL",
+"reason": "ALERT_CREATED" } }
+
+2.4 Worker interfaces
+Table 86 lists what the classifier worker consumes and produces. The worker is a separate container with no public endpoint
+except a health check, so its interfaces are a message subscription, three internal calls, and the model load. Two of them cross
+into the other components and are defined there as well: the internal clip call (Part II, Section 2.7) and the model topic (Part I,
+Section 2.8); each also has a fallback that works without the other component.
+Table 86: Interfaces of the classifier worker
+Interface
+
+Direction
+
+Contract
+
+Fallback or note
+
+MQTT subscribe
+scicp/v1/+/+/audio/event
+
+In
+
+QoS 1; JSON event with eventId, deviceId, channel, ts,
+clip{clipId, s3Key, durationMs, sampleRate}, edge{class,
+score, priority}, location (GeoJSON), context{speedKph,
+driveMode, ignition}; edge.priority HIGH events are
+processed first
+
+Unknown fields are ignored; an
+event without clip or eventId is
+dropped and logged
+
+GET /internal/clips/{clipId} (C2)
+
+Out
+
+Service token; 200 audio/wav of 5 s, mono, 16 kHz; 5 s
+timeout, 2 retries
+
+Defined in Part II, Section 2.7; if C2
+does not answer (timeout or
+connection error) the worker reads
+the s3Key with its IAM role; a 404
+or 410 is final (BR-C3-13)
+
+ACTIVE model row and artifact (C1)
+
+Out
+
+SELECT version_id, model_id, version, artifact_uri,
+sha256, metrics_json from model_version where status is
+ACTIVE; S3 GET of
+models/{modelId}/{version}/model.pt; SHA-256 checked
+before use
+
+The row is read again every 30 s
+
+MQTT subscribe
+scicp/v1/platform/model/activated (C1)
+
+In
+
+QoS 1, retained; {modelId, version}; published by C1
+when it activates a version
+
+Published by Part I after each
+activation; without it the 30 s poll
+applies
+
+SELECT vehicle.retention_days (C2)
+
+Out
+
+Read through C5 once per event; expireAt = ts plus the
+retention days (default 90)
+
+Part II owns the column
+
+insert into audio_events
+
+Out
+
+Document of Section 3.3 with unique key (tenantId,
+eventId)
+
+A duplicate key means the event
+was already stored; the worker skips
+to the result call
+
+POST
+/internal/events/{eventRef}/result (C3)
+
+Out
+
+Table 85
+
+3 attempts with 1 s, 2 s, 4 s back-off,
+then the event stays without decision
+and is listed in the worker log
+
+GET /healthz (port 8010, Docker
+network only)
+
+In
+
+200 {modelVersion, queued, lastEventAt}
+
+Used by the Docker health check
+and the load test
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+scicp/v1/tA/AV-01/audio/event
+{ "eventId": "3f1c0b1e-8f27-4d62-9c1a-5e7a4f2d90aa", "deviceId": "dev-0112", "channel": "exterior",
+"ts": "2026-11-04T21:42:07.312Z",
+"clip": { "clipId": "c41e8d2b", "s3Key": "tenants/tA/vehicles/AV-01/2026/11/04/c41e8d2b.wav",
+"durationMs": 5000, "sampleRate": 16000 },
+"edge": { "class": "crash", "score": 0.72, "priority": "HIGH" },
+"location": { "type": "Point", "coordinates": [-121.8811, 37.3352] },
+"context": { "speedKph": 48, "driveMode": "AUTONOMOUS", "ignition": true } }
+
+2.5 Events and WebSocket messages
+C3 holds no sockets. After each committed change it publishes one event on the EventBus; C1's WsHub subscribes, strips
+tenantId, and pushes the message to the tenant room and the staff room (Table 15 in Part I). Table 87 lists the two events with the
+fields C3 fills. An event is published after the database COMMIT, in process and at most once, so a client that reconnects reloads
+GET /alerts?status=OPEN instead of relying on a replay (the 10 s polling fallback of C1).
+Table 87: Events produced by C3
+Event and message
+
+Fields
+
+When
+
+Routing
+
+alert.created
+
+{type, alert{alertId, vehicleId, type, severity, status,
+topClass, confidence, createdAt}}
+
+AlertEngine committed a new
+alert
+
+Room of the alert's tenant and the
+staff room
+
+alert.updated
+
+{type, alertId, status, by} (by is the display name of the An action changed the status
+user)
+
+Same rooms
+
+2.6 Internal connectivity interfaces
+Table 88 lists the interfaces C3 uses that are not public; each is wrapped in one class (Section 3.1) so that the full-scale design
+can replace the implementation, for example the in-process EventBus by Redis or the direct result call by an SQS queue, without
+touching the services.
+Table 88: Internal interfaces of C3
+Interface
+
+Class in C3
+
+Direction and transport
+
+Contract
+
+Event bus alert.created,
+alert.updated
+
+EventBus (shared with C1)
+
+C3 publishes; C1 subscribes (inprocess, Redis in the full design)
+
+Table 87 plus tenantId as routing key
+
+Subscription, alert_type and
+tenant rows (C1)
+
+SubscriptionRepo, AlertTypeRepo,
+TenantRepo
+
+SELECT-only through C5
+
+Service switch, channels, quiet hours,
+notify_riders; default severity and escalation
+minutes; tenant.time_zone
+
+Vehicle and vehicle_rider
+rows (C2)
+
+VehicleRepo, RiderRepo
+
+SELECT-only through C5
+
+Vehicle code and label; riders whose
+valid_from and valid_to include now
+
+MySQL
+
+AlertRepo, AlertActionRepo,
+NotificationRepo, AlertRuleRepo
+
+SQLAlchemy, one transaction per
+service call
+
+Tables of Section 3.3
+
+MongoDB
+
+EventRepo (Motor)
+
+find_one, update_one on
+audio_events; count_documents for
+repeats
+
+Every filter starts with tenantId
+
+Amazon S3
+
+StorageClient (shared with C1)
+
+AWS SDK over HTTPS
+
+presign_get(key, 15 min) for the clip of the
+alert
+
+Amazon SES
+
+AlertMailer
+
+AWS SDK over HTTPS (SESv2
+send_email)
+
+One message per recipient; failures return to
+NotificationService
+
+2.7 API analysis
+Table 89 states which role may call each C3 group; it derives from BR-01 and BR-03 of the C1 design and is enforced by C1's
+RbacGuard as a dependency on every router, so a role without a page has no route and a direct call is refused with 403. Platform
+defaults of alert rules can be written only by SYS_ADMIN (BR-C3-10).
+Table 89: API groups and the roles that may call them
+API group
+
+OWNER
+
+FLEET_
+MANAGER
+
+RIDER
+
+IOT_
+ENGINEER
+
+SERVICE_
+STAFF
+
+SYS_
+ADMIN
+
+2.1 GET /alerts, GET
+/alerts/{id}
+
+Y, own tenant
+
+Y, own tenant
+
+Y, vehicles of the
+active trip
+
+-
+
+Y, any tenant
+
+Y, any tenant
+
+2.1 POST /alerts/{id}/actions
+
+Y
+
+Y
+
+-
+
+-
+
+Y
+
+Y
+
+2.1 GET /alerts/map
+
+Y
+
+Y
+
+-
+
+-
+
+Y
+
+Y
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+API group
+
+OWNER
+
+FLEET_
+MANAGER
+
+RIDER
+
+IOT_
+ENGINEER
+
+SERVICE_
+STAFF
+
+SYS_
+ADMIN
+
+2.2 GET /alert-rules
+
+-
+
+Y, own tenant
+
+-
+
+-
+
+Y, any tenant and
+defaults
+
+Y
+
+2.2 POST, PUT, DELETE
+/alert-rules
+
+-
+
+Y, own tenant
+
+-
+
+-
+
+Y, tenant rules
+
+Y, also defaults
+
+2.3 POST
+/internal/events/{id}/result
+
+Service token of
+the worker only;
+no user role may
+call it
+
+-
+
+-
+
+-
+
+-
+
+-
+
+C1's AlertClient calls GET /alerts and GET /alerts/{alertId} with the service token, which RbacGuard treats as the staff scope.
+Versioning: the prefix /api/v1 is the version, fields are only added within v1, and a breaking change would add /api/v2 beside it.
+Pagination: GET /alerts is paged with a total; the map is bounded to 500 points by design. Idempotency: GET, PUT and
+DELETE are idempotent by construction; the action call is protected by an optimistic update (UPDATE alert SET status = :new
+WHERE alert_id = :id AND status = :expected), so two users pressing Acknowledge at once produce one transition and one
+409; the result call is idempotent as described in Section 2.3. Rate limits: the 60 requests per minute per user of C1 apply; the
+result call has none, because the worker processes one clip at a time, which also gives the system its back-pressure.
+
+3. Component Function Design, Data and DB Design, and Behavior Analysis
+Section 3 is the white-box design of C3 and the classifier worker, drawn in UML 2.5 [3]: 3.1 the classes of the back end, the
+worker and the entities, 3.2 the functions that carry the business rules with pseudocode and a flowchart, 3.3 the data design
+(MySQL tables, MongoDB collections, S3 keys), and 3.4 the behavior analysis with state diagrams, sequence diagrams and the
+design decisions. The names used here are the names we will use in the code.
+
+3.1 Logic design
+3.1.1 Back-end classes of C3
+C3 is one Python package inside the FastAPI service, with four layers: routers, services, rule classes, and repositories. Figure 36
+shows them; Table 90 gives each class its responsibility. AlertEngine is the only class that creates an alert, which keeps the
+decision table of Section 4.1 in one place and is why the result call is the only way to create one. RbacGuard and TenantContext
+are the C1 classes that wrap every router and are not drawn.
+
+Figure 36: Class diagram of the C3 back end
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+
+Table 90: Back-end classes of C3
+Class
+
+Responsibility
+
+Key operations
+
+Collaborators
+
+AlertRouter
+
+Router for /alerts; maps JSON to service calls
+after the role and scope checks
+
+list, detail, act, map
+
+AlertService
+
+RuleRouter
+
+Router for /alert-rules
+
+list, create, update, delete
+
+RuleService
+
+ResultRouter
+
+Router for /internal/events/{eventRef}/result;
+accepts only the service token
+
+post_result
+
+AlertEngine
+
+AlertService
+
+Queries and actions on existing alerts; builds the
+detail response with clip URL and history
+
+list(filters, scope), get(id), act(id,
+action, user, note)
+
+AlertRepo, AlertActionRepo,
+AlertStateMachine, EventRepo,
+StorageClient, EventBus
+
+RuleService
+
+Effective rule list, saving and deleting tenant
+overrides, validation of BR-C3-09 and BR-C310
+
+effective(tenant), save(rule),
+delete(ruleId)
+
+AlertRuleRepo, AuditLogger (C1)
+
+AlertEngine
+
+Evaluates a result against rules, vehicle state,
+subscription and repeats; creates the alert and
+writes the decision into the event
+
+evaluate(event, topK),
+create_alert(decision)
+
+RuleResolver, RecipientResolver,
+AlertRepo, EventRepo,
+NotificationService, EventBus
+
+RuleResolver
+
+Finds the rule for a tenant, class and state
+(override first, then default); derives the vehicle
+state; counts repeats
+
+find_rule(tenant, cls, state),
+state_of(context), repeats(vehicle, cls,
+window)
+
+AlertRuleRepo, EventRepo
+
+RecipientResolver
+
+Applies decision table BR-05 of C1: owner, fleet resolve(alert, subscription, now),
+manager, riders, channels, quiet hours
+riders(vehicle, now)
+
+SubscriptionRepo, RiderRepo
+
+NotificationService
+
+Writes the notification rows with the alert, sends
+after the commit, makes up to three attempts
+
+enqueue(alert, recipients),
+send_with_retry(notification)
+
+NotificationRepo, AlertMailer
+
+AlertMailer
+
+Renders and sends the alert email through SES
+
+render(alert), send(alert, recipient)
+
+Amazon SES
+
+AlertStateMachine
+
+The transition table of Section 4.4; returns the
+next state or a refusal
+
+next(state, action), allowed(state, role) none
+
+Repositories
+
+One class per table or collection; each query
+takes the tenant scope
+
+See Section 3.3
+
+MySQL, MongoDB
+
+3.1.2 Classifier worker classes
+The worker is a separate Python process (one container) with a pipeline shape: MqttConsumer puts events on an EventQueue,
+one InferencePipeline takes them in priority order, calls the four stage classes, and hands the result to ResultWriter. Figure 37
+shows the runtime classes above and the offline training classes below; Table 91 describes them. The CLAP backbone
+(laion/clap-htsat-unfused [4]) is fixed and baked into the image, so only the small classifier head is versioned in the registry and
+reloaded, which keeps a model file small and activation fast.
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+
+Figure 37: Class diagram of the classifier worker and the offline training pipeline
+
+Table 91: Classes of the classifier worker and the training pipeline
+Class
+
+Responsibility
+
+MqttConsumer
+
+Subscribes to scicp/v1/+/+/audio/event with QoS 1,
+subscribe, on_message
+parses and validates the event, acknowledges after the
+event is stored
+
+Key operations
+
+Notes
+Drops events without eventId or
+clip
+
+EventQueue
+
+In-memory priority queue; edge.priority HIGH first,
+then arrival order
+
+put, get
+
+Bounded to 200; when full, the
+oldest STANDARD event is
+dropped and counted
+
+InferencePipeline
+
+Orchestrates one event: model check, clip fetch,
+preprocessing, embedding, prediction, store, result
+call
+
+process(event),
+ensure_model()
+
+One event at a time; records
+latencyMs
+
+ClipFetcher
+
+Gets the WAV from the internal clip call
+
+fetch(clipId)
+
+5 s timeout, 2 retries
+
+AudioPreprocessor
+
+Converts the 16 kHz clip to the 48 kHz CLAP input
+and normalizes it
+
+resample(wav, 48000),
+normalize
+
+librosa; the CLAP feature extractor
+pads to its 10 s window
+
+ClapEncoder
+
+Turns the audio into the 512-dimensional CLAP
+audio embedding
+
+embed(audio)
+
+Model loaded once, torch no_grad,
+CPU
+
+ClassifierHead
+
+Small network on the embedding that returns class
+probabilities
+
+predict(embedding),
+top_k(3)
+
+Weights, class list and normalizer
+come from the registry artifact
+
+ModelManager
+
+Loads the ACTIVE version and swaps it between two current(), reload(version)
+clips
+
+Checks SHA-256; keeps the old
+head if the new one fails to load
+
+ResultWriter
+
+Inserts the audio_events document and posts the
+result to C3
+
+insert_event(doc),
+post_result(ref, result)
+
+Duplicate key means already
+stored
+
+DatasetBuilder, GroupedSplitter,
+HeadTrainer, Evaluator,
+ModelExporter
+
+Offline: build the clip list from the seven drive
+folders, split by original recording, train the head,
+measure precision, recall and F1, write model.pt with
+its metrics
+
+See Section 3.2
+
+Run by hand in task T12 and again
+for each new version
+
+3.1.3 Entity classes
+Table 92 lists the domain classes that the services pass around. Alert, AlertAction, Notification, AlertRule and SoundClass are
+MySQL tables owned by C3 (Section 3.3); AudioEvent is the MongoDB document written by the worker; Decision and
+ClassScore exist only in memory and in the result call.
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+
+Table 92: Entity classes
+Class
+
+Attributes
+
+Relations
+
+Alert
+
+alertId, tenantId, vehicleId, alertTypeCode, ruleId, topClass, severity,
+status, eventRef, confidence, vehicleState, count, lat, lon, createdAt,
+acknowledgedBy, closedBy
+
+Has many AlertAction and Notification; refers to
+AlertRule, AlertType (C1) and AudioEvent by eventRef
+
+AlertAction
+
+actionId, alertId, action, userId, note, fromStatus, toStatus, ts
+
+Belongs to Alert; written in the same transaction as the
+status change
+
+Notification
+
+notificationId, alertId, recipientUserId, channel, status, attempts, lastError,
+sentAt
+
+Belongs to Alert
+
+AlertRule
+
+ruleId, tenantId (null = default), alertTypeCode, classId, vehicleState,
+minConfidence, severityOverride, minRepeats, windowSeconds, enabled
+
+Refers to SoundClass and AlertType
+
+SoundClass
+
+classId, name, category, defaultMic
+
+Seven rows, five of them with rules
+
+AudioEvent
+
+_id, tenantId, vehicleId, deviceId, eventId, ts, channel, location, clip, edge,
+inference, decision, context, expireAt
+
+Referenced by Alert.eventRef
+
+Decision
+
+alert, alertId, alertType, severity, reason
+
+Returned by AlertEngine; stored in AudioEvent.decision
+
+ClassScore
+
+class, conf
+
+Up to three per result, highest first
+
+3.2 Program function descriptions
+Table 93 lists the functions that carry the business rules, with their inputs, outputs and the rules they enforce; the pseudocode
+that follows is the specification the unit tests are written against, one test per column of the decision tables of Section 4. Figure
+38 is the flowchart of the alert decision for one class; AlertEngine repeats it for each of the top three classes and keeps the
+candidate with the highest severity.
+Table 93: Rule-carrying functions
+Function
+
+Class
+
+Input and output
+
+Rules
+
+evaluate
+
+AlertEngine
+
+(event, result) gives a Decision
+
+BR-C3-01 to BR-C3-06
+
+state_of
+
+RuleResolver
+
+event context gives MOVING or PARKED
+
+BR-C3-02
+
+find_rule
+
+RuleResolver
+
+tenant, class, state gives the rule or none
+
+BR-C3-03
+
+repeats
+
+RuleResolver
+
+vehicle, class, window gives the number of events
+
+BR-C3-05
+
+resolve
+
+RecipientResolver
+
+alert, subscription, time gives recipients and channels
+
+BR-05 (C1), BR-C3-11
+
+create_alert
+
+AlertEngine
+
+the winning candidate gives an alert, its history row and
+notifications
+
+BR-C3-04, BR-C3-12
+
+next
+
+AlertStateMachine
+
+(state, action) gives the next state or a refusal
+
+BR-C3-07
+
+act
+
+AlertService
+
+alert id, action, user, note gives the alert
+
+BR-C3-07, BR-C3-08
+
+send_with_retry
+
+NotificationService
+
+a notification gives SENT or FAILED
+
+BR-C3-11
+
+process
+
+InferencePipeline
+
+an MQTT event gives a stored event and a result call
+
+BR-C3-12, BR-C3-13, BR-C3-14
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+
+Figure 38: Flowchart FC1, the alert decision for one class of a result
+
+3.2.1 Pseudocode of the rule-carrying functions
+AlertEngine.evaluate decides, create_alert writes. The two are separate so that the decision can be unit-tested without a
+database, and so that the write is one transaction.
+def evaluate(event, result):
+
+# BR-C3-01 .. BR-C3-06
+
+if result.error:
+return store_decision(event, alert=False, reason='ERROR_RECORDED')
+state = RuleResolver.state_of(event.context)
+
+# MOVING or PARKED
+
+candidates, first_reason = [], None
+for score in result.topK[:3]:
+
+# highest confidence first
+
+rule = RuleResolver.find_rule(event.tenant, score.cls, state)
+if rule is None or not rule.enabled:
+first_reason = first_reason or reason_for(score.cls, state)
+
+# NO_RULE or STATE_MISMATCH
+
+continue
+if score.conf < rule.min_confidence:
+first_reason = first_reason or 'BELOW_THRESHOLD'; continue
+sub = SubscriptionRepo.get(event.vehicle, rule.alert_type)
+if sub is None or not sub.enabled:
+first_reason = first_reason or 'SERVICE_OFF'; continue
+if rule.min_repeats > 1 and RuleResolver.repeats(event.vehicle, score.cls,
+rule.window_s) < rule.min_repeats:
+first_reason = first_reason or 'REPEAT_PENDING'; continue
+candidates.append(Candidate(severity_of(rule), score, rule, sub))
+if not candidates:
+return store_decision(event, alert=False, reason=first_reason or 'NO_RULE')
+best = max(candidates, key=lambda c: (RANK[c.severity], c.score.conf))
+return create_alert(event, best)
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+def create_alert(event, best):
+
+# BR-C3-04, BR-C3-11, BR-C3-12
+
+with db.transaction():
+alert, created = AlertRepo.insert_unique(event.ref, best.rule.alert_type, best,
+event)
+
+# UNIQUE (event_ref, alert_type_code)
+
+if not created:
+return stored_decision(alert)
+
+# a repeated result returns the first decision
+
+AlertActionRepo.insert(alert, action='CREATE', user=None, to_status='NEW')
+recipients = RecipientResolver.resolve(alert, best.sub, now())
+NotificationRepo.insert_all(alert, recipients)
+EventRepo.set_decision(event.ref, alert)
+
+# DASHBOARD rows SENT, EMAIL rows PENDING
+
+# decision.alert, alertId, alertType
+
+EventBus.publish('alert.created', summary(alert), tenant=event.tenant)
+run_after_response(NotificationService.send_pending, alert.id)
+return Decision(alert=True, alertId=alert.id, reason='ALERT_CREATED')
+
+TRANSITIONS = {'NEW':
+
+{'ACKNOWLEDGE': 'ACKNOWLEDGED', 'RESOLVE': 'RESOLVED',
+
+'FALSE_ALARM': 'FALSE_ALARM'},
+'ACKNOWLEDGED': {'RESOLVE': 'RESOLVED', 'FALSE_ALARM': 'FALSE_ALARM'},
+'RESOLVED': {}, 'FALSE_ALARM': {}}
+def act(alert_id, action, user, note):
+
+# the last two are final
+# BR-C3-07, BR-C3-08
+
+alert = AlertRepo.get(alert_id, scope_of(user)) or raise_not_found()
+if user.role not in ACTORS: raise_forbidden()
+new = TRANSITIONS[alert.status].get(action)
+if new is None: raise_conflict(frm=alert.status, to=TARGET[action],
+allowed=list(TRANSITIONS[alert.status]))
+with db.transaction():
+if AlertRepo.update_status(alert_id, expected=alert.status, new=new,
+user=user) == 0:
+
+# WHERE status = expected
+
+raise_conflict(frm=alert.status, to=new)
+AlertActionRepo.insert(alert_id, action, user, note, alert.status, new)
+EventBus.publish('alert.updated', {'alertId': alert_id, 'status': new, 'by': user.name},
+tenant=alert.tenant)
+return AlertRepo.get(alert_id, scope_of(user))
+
+def resolve(alert, sub, now):
+
+# decision table 4.3, BR-05 of C1
+
+out = [Recipient(DASHBOARD, 'tenant room')]
+
+# the alert is always shown on the dashboard
+
+if 'EMAIL' not in sub.channels or in_quiet_hours(sub, now):
+return out
+
+# quiet hours cross midnight: 22:00 to 06:00
+
+out += [Recipient(EMAIL, u) for u in owner_and_fleet_managers(alert.tenant, alert.vehicle)]
+if sub.notify_riders:
+out += [Recipient(EMAIL, r) for r in RiderRepo.active(alert.vehicle, now)]
+return out
+def send_with_retry(n):
+
+# BR-C3-11
+
+for attempt, wait_s in enumerate([0, 30, 120], start=1):
+sleep(wait_s)
+try:
+AlertMailer.send(n.alert, n.recipient); NotificationRepo.mark(n, 'SENT', attempt); return
+except SesError as e:
+NotificationRepo.note(n, attempt, str(e))
+NotificationRepo.mark(n, 'FAILED')
+
+def process(event):
+ModelManager.ensure_current()
+
+# the alert itself is unaffected
+
+# InferencePipeline, BR-C3-12 .. BR-C3-14
+# a new version is swapped in here, between two clips
+
+t0 = now()
+try:
+wav
+
+= ClipFetcher.fetch(event.clip.clipId)
+
+# 5 s timeout, 2 retries
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+audio
+
+= AudioPreprocessor.resample(wav, 48000)
+
+emb
+
+= ClapEncoder.embed(audio)
+
+# 512-dimensional
+
+result = Result(topK=ClassifierHead.top_k(emb, 3), modelVersion=ModelManager.version,
+latencyMs=ms_since(t0))
+except (FetchError, DecodeError) as e:
+result = Result(topK=[], error=str(e), modelVersion=ModelManager.version,
+latencyMs=ms_since(t0))
+ref = ResultWriter.insert_event(event, result)
+
+# a duplicate (tenantId,
+
+eventId) returns the stored _id
+ResultWriter.post_result(ref, result)
+
+# 3 attempts, 1 s, 2 s, 4 s
+
+mqtt_ack(event)
+
+# only now, so a crash replays the message
+
+3.2.2 Training pipeline
+The offline pipeline of task T12 produces the head that the worker serves. Its one design decision matters for the numbers we
+report: the split is by original recording. The notebooks we were given split the files after augmentation, so noisy or pitch-shifted
+copies of one recording can land in both the training and the test set, which makes their 96 to 97 percent accuracy figures
+optimistic; we use them as baselines and re-measure on a split that cannot leak.
+clips = DatasetBuilder.collect(DRIVE_FOLDERS)
+
+# 7 class folders; every clip keeps origin_id of its
+
+source recording
+train, val, test = GroupedSplitter.split(clips, group='origin_id', ratio=(0.70, 0.15, 0.15),
+stratify='label', seed=42)
+emb = {c.id: ClapEncoder.embed(resample(c.audio, 48000)) for c in clips}
+head = Head(512, 128, 7)
+
+# backbone frozen
+
+# linear, ReLU, dropout 0.3, linear
+
+fit(head, train, emb, loss='cross_entropy', class_weights=balanced(train), early_stop='val macro-F1')
+report = Evaluator.report(head, test)
+hints
+
+# precision, recall, F1 per class, macro-F1, confusion matrix
+
+= {cls: lowest_conf_with_precision(head, val, cls,
+
+target=0.90) for cls in ALERT_CLASSES}
+
+# seeds min_confidence
+
+ModelExporter.write(head, classes=CLASSES, metrics=report,
+hints=hints)
+
+# model.pt for the registry upload
+
+3.3 Data and DB design
+C3 owns five MySQL tables (Table 94) and reads the tables of C1 and C2 through the SELECT-only grants of C5. The worker
+writes the MongoDB collection audio_events, and this section also specifies the three MongoDB collections of Deliverable #1
+(its Table 13), their indexes, validator, shard key and retention, because the MongoDB half of the data layer is part of this
+component. All MySQL tables are InnoDB with UTC DATETIME(3) timestamps and named foreign keys, and every tenantowned table has an index that starts with tenant_id (Deliverable #1, Section 4.1). Differences from the ERD of Deliverable #1:
+alert_type_id becomes alert_type_code because C1 keys alert_type by its code, alert gains vehicle_state, model_version, the
+four user and time columns of the lifecycle, and updated_at, alert_action gains the CREATE action and the from and to status,
+and alert_rule gains min_repeats, window_s, enabled and the update columns.
+
+3.3.1 MySQL tables owned by C3
+Table 94: MySQL tables owned by C3
+Table
+
+Columns
+
+Keys and indexes
+
+Notes
+
+alert
+
+alert_id BIGINT, tenant_id, vehicle_id VARCHAR(32),
+alert_type_code, rule_id, top_class_id, severity
+ENUM(LOW, MEDIUM, HIGH, CRITICAL), status
+ENUM(NEW, ACKNOWLEDGED, RESOLVED,
+FALSE_ALARM), event_ref CHAR(24), confidence
+DECIMAL(4,3), vehicle_state ENUM(MOVING,
+PARKED), model_version, count, lat, lon, created_at,
+updated_at, acknowledged_by, acknowledged_at,
+closed_by, closed_at
+
+PK alert_id; FK tenant_id,
+alert_type_code, rule_id, top_class_id,
+acknowledged_by, closed_by; UQ
+(event_ref, alert_type_code); index
+(tenant_id, status, created_at); index
+(tenant_id, vehicle_id, created_at)
+
+event_ref is the MongoDB _id;
+count is 1 until duplicate merging
+(L); partitioned by month in the full
+design; read by C1 through the
+view v_alert_summary
+
+alert_action
+
+action_id, alert_id, user_id NULL, action
+ENUM(CREATE, ACKNOWLEDGE, RESOLVE,
+FALSE_ALARM), from_status, to_status, note
+VARCHAR(500), ts
+
+PK action_id; FK alert_id, user_id; index Append only; CREATE has no
+(alert_id, ts)
+user; written in the transaction of
+the status change
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+Table
+
+Columns
+
+notification
+
+notification_id, alert_id, tenant_id, recipient_user_id,
+PK notification_id; FK alert_id,
+channel ENUM(DASHBOARD, EMAIL, SMS, PUSH), recipient_user_id; index (alert_id); index
+status ENUM(PENDING, SENT, FAILED), attempts,
+(status, created_at)
+last_error VARCHAR(255), created_at, sent_at
+
+Keys and indexes
+
+Notes
+DASHBOARD rows are SENT at
+once; SMS and PUSH are design
+only; email address comes from
+app_user
+
+alert_rule
+
+rule_id, tenant_id NULL, alert_type_code, class_id,
+vehicle_state ENUM(ANY, MOVING, PARKED),
+min_confidence DECIMAL(3,2), severity_override
+NULL, min_repeats TINYINT, window_s SMALLINT,
+enabled, updated_by, updated_at
+
+PK rule_id; FK tenant_id,
+alert_type_code, class_id; UQ
+(tenant_key, class_id, vehicle_state,
+alert_type_code)
+
+tenant_key is a generated column
+IFNULL(tenant_id, 0), because a
+unique key ignores NULLs; null
+tenant means a platform default
+
+sound_class
+
+class_id, name, category ENUM(EMERGENCY,
+ACCIDENT, SECURITY, SAFETY,
+BACKGROUND), default_mic ENUM(INTERIOR,
+EXTERIOR, EITHER)
+
+PK class_id; UQ name
+
+Seven rows seeded: siren, crash,
+glass_break, scream, honking,
+traffic, environmental
+
+The DDL below is for alert, the table with the most rules; the others follow the same conventions (BIGINT
+AUTO_INCREMENT keys, DATETIME(3) in UTC).
+CREATE TABLE alert (
+alert_id
+
+BIGINT AUTO_INCREMENT PRIMARY KEY,
+
+tenant_id
+
+BIGINT NOT NULL,
+
+vehicle_id
+
+VARCHAR(32) NOT NULL,
+
+alert_type_code
+
+VARCHAR(24) NOT NULL,
+
+rule_id
+
+BIGINT NOT NULL,
+
+top_class_id
+
+SMALLINT NOT NULL,
+
+severity
+
+ENUM('LOW','MEDIUM','HIGH','CRITICAL') NOT NULL,
+
+status
+
+ENUM('NEW','ACKNOWLEDGED','RESOLVED','FALSE_ALARM') NOT NULL DEFAULT 'NEW',
+
+event_ref
+
+CHAR(24) NOT NULL,
+
+confidence
+
+DECIMAL(4,3) NOT NULL,
+
+vehicle_state
+
+ENUM('MOVING','PARKED') NOT NULL,
+
+model_version
+
+VARCHAR(64) NOT NULL,
+
+count
+
+INT NOT NULL DEFAULT 1,
+
+-- public vehicle code, e.g. AV-01
+
+-- _id of the audio_events document
+
+lat DOUBLE NULL, lon DOUBLE NULL,
+created_at
+
+DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+
+updated_at
+
+DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+
+acknowledged_by
+
+BIGINT NULL, acknowledged_at DATETIME(3) NULL,
+
+closed_by
+
+BIGINT NULL, closed_at DATETIME(3) NULL,
+
+CONSTRAINT fk_alert_tenant FOREIGN KEY (tenant_id) REFERENCES tenant(tenant_id),
+CONSTRAINT fk_alert_type
+
+FOREIGN KEY (alert_type_code) REFERENCES alert_type(code),
+
+CONSTRAINT fk_alert_rule
+
+FOREIGN KEY (rule_id) REFERENCES alert_rule(rule_id),
+
+CONSTRAINT fk_alert_class
+
+FOREIGN KEY (top_class_id) REFERENCES sound_class(class_id),
+
+CONSTRAINT uq_alert_event_type UNIQUE (event_ref, alert_type_code),
+INDEX ix_alert_queue
+
+(tenant_id, status, created_at),
+
+INDEX ix_alert_vehicle (tenant_id, vehicle_id, created_at)
+) ENGINE=InnoDB;
+CREATE VIEW v_alert_summary AS
+
+-- read by C1 (statistics, false-alarm rate, acknowledge time)
+
+SELECT alert_id, tenant_id, vehicle_id, alert_type_code, severity, status, top_class_id,
+confidence, created_at, acknowledged_at, closed_at FROM alert;
+
+Table 95 lists the default rules and the classes that we seed. They implement the class and alert-type mapping of Table 4 of
+Deliverable #1; the minimum confidences are starting values that the training pipeline replaces with the per-class values it
+measures on the validation split (Section 3.2.2), and the severities come from the default severity of the alert type that C1 seeds
+(ACCIDENT critical, EMERGENCY and SECURITY high, SAFETY medium). Traffic and environmental are background
+classes and have no rule.
+Table 95: Seed data of alert_rule (tenant_id null)
+rule_id
+
+Class
+
+Vehicle state
+
+Alert type
+
+Minimum confidence
+
+Repeats
+
+siren
+
+ANY
+
+EMERGENCY
+
+0.60
+
+crash
+
+MOVING
+
+ACCIDENT
+
+0.70
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+rule_id
+
+Class
+
+Vehicle state
+
+Alert type
+
+Minimum confidence
+
+Repeats
+
+glass_break
+
+MOVING
+
+ACCIDENT
+
+0.70
+
+glass_break
+
+PARKED
+
+SECURITY
+
+0.70
+
+scream
+
+PARKED
+
+SECURITY
+
+0.60
+
+scream
+
+MOVING
+
+EMERGENCY
+
+0.60
+
+honking
+
+ANY
+
+SAFETY
+
+0.60
+
+2 events within 10 s
+
+3.3.2 MongoDB collections
+MongoDB holds the high-volume, append-heavy data whose shape varies with the model version. Table 96 gives the fields of
+audio_events, which the worker inserts and C3 updates once (the decision); the fields added to the document of Deliverable #1
+are eventId (the edge's UUID, for duplicate rejection), expireAt (the expiry date, because a TTL index needs a date field),
+inference.error, and decision.severity and decision.reason.
+Table 96: Fields of audio_events
+Field
+
+Type
+
+Written by
+
+Notes
+
+_id
+
+ObjectId
+
+MongoDB
+
+Becomes eventRef in the APIs and
+alert.event_ref
+
+eventId
+
+string (UUID)
+
+Worker, from the event
+
+Unique with tenantId; makes MQTT
+redelivery harmless
+
+tenantId, vehicleId, deviceId
+
+string
+
+Worker
+
+Tenant code (tA), vehicle code (AV-01),
+device code
+
+ts
+
+date
+
+Worker
+
+Time of the sound
+
+channel
+
+interior or exterior
+
+Worker
+
+Which microphone
+
+location
+
+GeoJSON Point
+
+Worker
+
+[longitude, latitude]
+
+clip
+
+{clipId, s3Key, durationMs, sampleRate}
+
+Worker
+
+The clip stays in S3
+
+edge
+
+{class, score, priority}
+
+Worker
+
+The edge pre-filter's guess, kept for tuning
+
+inference
+
+{topK[{class, conf}], modelVersion,
+latencyMs, error?}
+
+Worker
+
+At most three entries, highest first
+
+decision
+
+{alert, alertId, alertType, severity, reason}
+
+C3 (result call)
+
+Set once; absent until the result call returns
+
+context
+
+{speedKph, driveMode, ignition}
+
+Worker
+
+Input of the vehicle state
+
+expireAt
+
+date
+
+Worker
+
+ts plus the retention days of the vehicle
+(default 90)
+
+Table 97 lists the three collections with their indexes, shard key and retention. Every index that C3 or C1 queries through starts
+with tenantId, so a query without a tenant cannot use an index and is caught in testing. vehicle_telemetry and
+device_state_history are written by C2 and are specified here because the MongoDB collections, indexes and retention are one
+design.
+Table 97: MongoDB collections, indexes, shard key and retention
+Collection
+
+Indexes
+
+Shard key
+
+Retention
+
+audio_events
+
+{tenantId, vehicleId, ts}; unique {tenantId, eventId};
+{tenantId, decision.alert, ts}; 2dsphere on location; TTL
+on expireAt with expireAfterSeconds 0
+
+{tenantId, vehicleId,
+ts}
+
+90 days by default, set per vehicle through
+expireAt; hourly summaries are design only
+
+vehicle_telemetry
+
+Time-series collection: timeField ts, metaField {tenantId,
+vehicleId}, granularity seconds
+
+Same as the meta field 30 days (expireAfterSeconds 2,592,000)
+
+device_state_history
+
+{tenantId, deviceId, ts}; TTL on ts
+
+{tenantId, deviceId,
+ts}
+
+60 days (expireAfterSeconds 5,184,000)
+
+The shard key starts with tenantId so a tenant's data stays together, and vehicleId and ts spread a large fleet and keep one car's
+time-range queries on one shard. We do not shard this semester; one MongoDB node runs with the same indexes. The TTL,
+time-series and schema validation features used here are those of MongoDB 7.0 [5]. The commands below create audio_events
+with its validator and indexes.
+db.createCollection('audio_events', { validator: { $jsonSchema: {
+bsonType: 'object',
+required: ['tenantId', 'vehicleId', 'eventId', 'ts', 'clip', 'context', 'expireAt'],
+properties: {
+tenantId: { bsonType: 'string' }, vehicleId: { bsonType: 'string' },
+eventId: { bsonType: 'string' },
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+ts: { bsonType: 'date' }, channel: { enum: ['interior', 'exterior'] },
+clip: { bsonType: 'object', required: ['clipId', 's3Key', 'durationMs', 'sampleRate'] },
+inference: { bsonType: 'object', properties: { topK: { bsonType: 'array', maxItems: 3 },
+modelVersion: { bsonType: 'string' } } },
+decision: { bsonType: 'object', properties: { alert: { bsonType: 'bool' },
+reason: { bsonType: 'string' } } },
+expireAt: { bsonType: 'date' } } } }, validationLevel: 'strict', validationAction: 'error' });
+db.audio_events.createIndex({ tenantId: 1, vehicleId: 1, ts: 1 });
+db.audio_events.createIndex({ tenantId: 1, eventId: 1 }, { unique: true });
+db.audio_events.createIndex({ tenantId: 1, 'decision.alert': 1, ts: 1 });
+db.audio_events.createIndex({ location: '2dsphere' });
+db.audio_events.createIndex({ expireAt: 1 }, { expireAfterSeconds: 0 });
+
+Table 98 shows which index serves each query, which is also how we will check them with explain in the tests.
+Table 98: Query patterns and the index that serves each
+Query
+
+Issued by
+
+Index
+
+Insert one event; reject a duplicate eventId
+
+Worker
+
+unique {tenantId, eventId}
+
+Load one event by _id for the alert detail
+
+AlertService
+
+_id
+
+Count events of one class for one vehicle in the last 10 s
+(honking repeat)
+
+RuleResolver
+
+{tenantId, vehicleId, ts}, then a filter on
+inference.topK.0.class
+
+Events of one car, newest first (per-car data page)
+
+C2
+
+{tenantId, vehicleId, ts} read backward
+
+Events by class for a tenant and a day (statistics)
+
+C1
+
+prefix {tenantId} and the ts range of {tenantId, vehicleId, ts}
+
+Events that raised an alert in a period
+
+C1, C3
+
+{tenantId, decision.alert, ts}
+
+Alerts near a point (alert map, design)
+
+C3
+
+2dsphere on location
+
+3.3.3 Object storage and retention
+Clips live under tenants/{tenantId}/vehicles/{vehicleId}/YYYY/MM/DD/{clipId}.wav in the scicp-clips bucket, written by
+C2 and read by C3 only through StorageClient.presign_get with a 15 minute URL; before signing, AlertService checks that
+the key starts with the tenant prefix of the alert's own tenant, so a wrong event reference cannot expose another tenant's clip,
+and that the clip row of Part II is still STORED (SELECT-only on clip), so a clip the owner deleted or the retention job
+removed shows as no longer available instead of a broken link. The worker reads model artifacts from
+models/{modelId}/{version}/model.pt. When an audio event expires, the TTL index removes the document, the alert rows
+stay (they hold the class, confidence and model version), and the detail page shows that the event has expired and offers no
+clip. Alert rows are kept for the semester; the full design archives them after 12 months. The nightly MySQL and MongoDB
+dumps to S3 of C5 cover all of the tables and collections above.
+
+3.4 Behavior analysis
+3.4.1 State diagrams
+Three objects have a life cycle worth specifying: the alert, the notification, and the model inside the worker (Figure 39). Table
+99 describes each state. The alert states are those of Section 4.3 of Deliverable #1, with one addition: an alert can go from NEW
+straight to FALSE_ALARM, because the alert monitor offers all three buttons at once and staff often recognize a false alarm
+without acknowledging it first. ESCALATED and IN_PROGRESS stay design only.
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+
+Figure 39: State diagrams of the alert, the notification and the model in the worker
+
+Table 99: States and the events that leave them
+Object
+
+State
+
+Meaning
+
+Leaves by
+
+Alert
+
+NEW
+
+Created by AlertEngine; nobody has acted
+
+ACKNOWLEDGE, RESOLVE,
+FALSE_ALARM
+
+Alert
+
+ACKNOWLEDGED
+
+A person has seen it and takes care of it
+
+RESOLVE, FALSE_ALARM
+
+Alert
+
+RESOLVED
+
+Handled; final; the page sends the CONFIRMED label
+to C1
+
+none
+
+Alert
+
+FALSE_ALARM
+
+Not a real event; final; the page sends the label to C1
+
+none
+
+Notification
+
+PENDING
+
+Waiting to be sent, or waiting for the next of three
+attempts
+
+Send succeeds, third attempt fails, or a retry
+
+Notification
+
+SENT
+
+Delivered to SES (DASHBOARD rows are SENT at
+creation); final
+
+none
+
+Notification
+
+FAILED
+
+Three attempts failed; the error is stored; final
+
+none
+
+Model in the worker
+
+NO_MODEL
+
+No head loaded; the worker processes nothing, events
+An ACTIVE version is found
+wait in the queue, and /healthz reports no model version
+
+Model in the worker
+
+LOADING
+
+Reading the artifact and checking its SHA-256
+
+Hash ok gives READY; a failed load returns to
+the previous state and is logged
+
+Model in the worker
+
+READY
+
+A head is loaded and events are processed
+
+A new version becomes active, checked before
+each clip
+
+3.4.2 Sequence diagrams
+Figure 40 is the main path, scenario SC1. The clip is fetched and classified before anything is written, the event is stored before
+the result call, and the alert and its history and notifications are one MySQL transaction; the event is published and the email sent
+only after the commit, so a client never sees an alert that does not exist and a failed email never removes one. If the result call
+fails, the worker makes up to three attempts, and the repeat is harmless because the alert is unique per event and alert type.
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+
+Figure 40: Sequence diagram SQ1, from the audio event to the alert (scenario SC1)
+
+Figure 41 is the action path, scenario SC3. The status change is a single guarded UPDATE, so two users acting at the same
+moment produce one change and one 409, and the history row is written in the same transaction. The page itself posts the
+feedback label to C1 after it has the answer, so C3 never calls C1 and the two components stay independent.
+
+Figure 41: Sequence diagram SQ2, a false alarm marked on the alert page (scenario SC3)
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+
+3.4.3 Design decisions
+Table 100 records the decisions that shape the component, each with the alternative we rejected, so that the implementation does
+not drift from the design.
+Table 100: Design decisions
+Decision
+
+Rejected alternative
+
+Reason
+
+The alert decision lives in the API process
+(AlertEngine); the worker only reports a result
+
+The worker writes alerts to
+MySQL itself
+
+One place for the tenant rules and for the transaction; the worker
+needs no write access to MySQL and can be replaced by an SQS
+consumer in the full design without touching C3
+
+Evaluate the top three classes and let the highest
+severity win
+
+Use only the top class
+
+Overlapping sounds, such as a siren in traffic, are common; the perclass thresholds keep the extra candidates from raising false alarms
+
+One alert per event
+
+One alert per matching class
+
+One sound should not page a person twice; the unique key (event_ref,
+alert_type_code) enforces it
+
+Email after the commit, three attempts, outcome
+stored
+
+Send inside the request
+
+SES latency or an outage must not delay or roll back an alert; in
+development SES is in sandbox mode and sends only to verified
+addresses [6], so the demo recipients are verified
+
+Frozen CLAP backbone with a small head
+
+Fine-tune the whole model
+
+CPU only on a t3.medium and a small data set; a head is a small file
+that activates in seconds
+
+Split by original recording
+
+Random split after
+augmentation
+
+Augmented copies of one recording on both sides inflate every metric
+
+One clip at a time with a two-level priority queue Parallel inference threads
+
+The two vCPUs are shared with the databases; one clip gives a
+predictable latency, and the full design adds containers instead
+
+The worker reads the ACTIVE row and polls
+every 30 s, with an optional model topic
+
+C1 calls an endpoint on the
+worker
+
+No inbound endpoint on the worker; the retained MQTT message
+reaches a restarted worker, and the poll covers a missed message
+
+Repeat check by an indexed count in MongoDB
+
+An in-memory counter
+
+It survives a restart, is tenant-scoped, and costs one indexed query
+
+MOVING means ignition on and speed over 5
+km/h
+
+Any speed above zero
+
+GPS and wheel-speed noise at standstill would flip a parked car to
+MOVING
+
+Failure handling is part of the rules of Section 4: a clip that cannot be fetched, a failed model load, a duplicate event, a failed
+result call and an SES failure each have one defined outcome (Table 106).
+
+4. Component Business Logics
+The business logic of C3 and the worker is a set of fourteen rules (Table 101) and the decision tables that apply them. Each rule
+has one place in the code where it is enforced, and each column of a decision table becomes one unit test, so the design and the
+tests stay the same thing. The rules about subscriptions, recipients and roles come from the C1 design [2] (BR-01, BR-03, BR05) and are applied here, not redefined.
+Table 101: Business rules of C3 and the classifier worker
+ID
+
+Rule
+
+Enforced in
+
+BR-C3-01
+
+AlertEngine evaluates the top three classes of a result, each against its own rule; traffic and
+environmental have no rule and never create an alert
+
+AlertEngine.evaluate
+
+BR-C3-02
+
+The vehicle state is MOVING when ignition is on and speedKph is over 5; otherwise PARKED; a
+rule for ANY matches both
+
+RuleResolver.state_of
+
+BR-C3-03
+
+A tenant override replaces the default rule with the same class, state and alert type; a disabled rule
+counts as no rule
+
+RuleResolver.find_rule
+
+BR-C3-04
+
+An alert is created only when a rule matches, the confidence reaches its minimum, the service is on AlertEngine.evaluate, create_alert
+for the vehicle, and the repeats are met; one alert per event; the candidate with the highest severity
+wins, ties go to the higher confidence
+
+BR-C3-05
+
+A rule with min_repeats n and window w needs n events of the same top class for the same vehicle
+within w seconds, the current one included (honking: 2 in 10 s)
+
+RuleResolver.repeats
+
+BR-C3-06
+
+Severity is the rule's override, else the default of the alert type; EMERGENCY and ACCIDENT
+are never below HIGH
+
+severity_of
+
+BR-C3-07
+
+Allowed transitions: NEW to ACKNOWLEDGED, RESOLVED or FALSE_ALARM;
+ACKNOWLEDGED to RESOLVED or FALSE_ALARM; the two final states allow none;
+anything else answers 409
+
+AlertStateMachine
+
+BR-C3-08
+
+OWNER and FLEET_MANAGER act on their tenant, SERVICE_STAFF and SYS_ADMIN on
+any; RIDER and IOT_ENGINEER cannot; the first ACKNOWLEDGE stores acknowledged_by
+and acknowledged_at, a closing action stores closed_by and closed_at; every action writes
+alert_action with the old and new status
+
+AlertService.act
+
+BR-C3-09
+
+A rule value is accepted only with min_confidence from 0.40 to 0.99, min_repeats from 1 to 5, and RuleService.save
+window_s from 5 to 60; one rule per tenant, class, state and alert type
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+ID
+
+Rule
+
+Enforced in
+
+BR-C3-10
+
+FLEET_MANAGER edits overrides of its own tenant, SERVICE_STAFF overrides of any tenant,
+only SYS_ADMIN edits defaults; a tenant override may not disable an EMERGENCY or
+ACCIDENT rule or set its severity below HIGH (the owner can switch the service off in the
+subscription instead)
+
+RuleService.save
+
+BR-C3-11
+
+The dashboard always shows the alert; email follows the decision table of Section 4.3; it is sent
+after the commit, with three attempts at 0, 30 and 120 s; a failure is stored and the alert is
+unaffected
+
+RecipientResolver,
+NotificationService
+
+BR-C3-12
+
+One alert per (event_ref, alert_type_code); a repeated result returns the first decision; the worker
+skips an event whose (tenantId, eventId) is already stored
+
+create_alert, ResultWriter
+
+BR-C3-13
+
+If the clip cannot be fetched or decoded, the worker stores the event with inference.error, creates
+no alert, and counts the failure
+
+InferencePipeline.process
+
+BR-C3-14
+
+A new model version is loaded between two clips; if it fails to load or its hash differs, the worker
+keeps the old head and logs it; every result carries its modelVersion
+
+ModelManager
+
+4.1 Alert creation
+Table 102 is the decision table that AlertEngine applies to each of the top three classes (BR-C3-01 to BR-C3-05). Y means the
+condition holds, N that it does not, and a dash that it is not evaluated because an earlier condition already decided. The reason
+code is written to decision.reason and returned by the result call; STATE_MISMATCH is the NO_RULE case in which the
+class has a rule for the other vehicle state, which helps staff see why a glass break while parked produced no ACCIDENT.
+Table 102: Decision table for one class of a result
+R1
+
+R2
+
+R3
+
+R4
+
+R5
+
+Enabled rule for this
+class and vehicle
+state
+
+N
+
+Y
+
+Y
+
+Y
+
+Y
+
+Confidence reaches
+the rule's minimum
+
+-
+
+N
+
+Y
+
+Y
+
+Y
+
+Service on for this
+vehicle
+(subscription)
+
+-
+
+-
+
+N
+
+Y
+
+Y
+
+Enough repeats in
+the window
+
+-
+
+-
+
+-
+
+N
+
+Y
+
+Action
+
+No candidate
+
+No candidate
+
+No candidate
+
+No candidate
+
+Candidate with severity
+
+Reason code
+
+NO_RULE or
+STATE_MISMATCH
+
+BELOW_THRESHOLD
+
+SERVICE_OFF
+
+REPEAT_PENDING
+
+ALERT_CREATED
+
+The worked examples use the seeded rules of Table 95:
+•
+•
+•
+•
+
+SC1: crash 0.91 at 48 km/h; rule 2 matches (MOVING), 0.91 is at least 0.70, ACCIDENT is on for AV-01, one repeat
+is enough: R5, ACCIDENT alert, severity CRITICAL.
+SC2: honking 0.80 on AV-12 with SAFETY off in the subscription: R3, SERVICE_OFF, no alert. Later scream 0.83
+while parked: rule 5 matches, 0.83 is at least 0.60, SECURITY is on: R5, SECURITY alert, severity HIGH.
+SC4: honking 0.70 with the Tenant B override of 0.75: R2, BELOW_THRESHOLD; the same event under the default
+of 0.60 would reach R4 and need a second honking within 10 s.
+Glass break 0.85 while parked: rule 3 is for MOVING, so the engine looks for a PARKED rule and finds rule 4
+(SECURITY): R5, SECURITY alert. For a tenant whose PARKED rule is disabled, the same event gives R1 with
+STATE_MISMATCH.
+
+4.2 Severity
+Table 103 gives the severity of the winning candidate (BR-C3-06). Case S4 cannot happen at evaluation time because
+RuleService refuses to save it (422 BUSINESS_RULE), which keeps the engine free of special cases.
+Table 103: Decision table for severity
+Case
+
+Severity override on the rule
+
+Alert type
+
+Severity of the alert
+
+S1
+
+none
+
+any
+
+Default of the alert type: ACCIDENT critical, EMERGENCY
+high, SECURITY high, SAFETY medium
+
+S2
+
+present
+
+SAFETY or SECURITY
+
+The override
+
+S3
+
+present, HIGH or CRITICAL
+
+EMERGENCY or
+ACCIDENT
+
+The override
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+Case
+
+Severity override on the rule
+
+Alert type
+
+Severity of the alert
+
+S4
+
+present, below HIGH
+
+EMERGENCY or
+ACCIDENT
+
+Not saved: 422 BR-C3-10
+
+4.3 Recipients
+Table 104 is the notification half of rule BR-05 of the C1 design, applied by RecipientResolver after the alert exists (the
+SERVICE_OFF case of BR-05 was already decided in Table 102). Quiet hours are evaluated in the time zone of the tenant (both
+seeded tenants use America/Los_Angeles) and may cross midnight, as in 22:00 to 06:00.
+Table 104: Decision table for recipients and channels
+N1
+
+N2
+
+N3
+
+N4
+
+Email channel selected
+
+N
+
+Y
+
+Y
+
+Y
+
+Inside quiet hours
+
+-
+
+Y
+
+N
+
+N
+
+notify_riders on and a rider is active on the vehicle
+
+-
+
+-
+
+N
+
+Y
+
+Dashboard row and event
+
+Yes
+
+Yes
+
+Yes
+
+Yes
+
+Email to owner and fleet managers of the tenant
+
+No
+
+No
+
+Yes
+
+Yes
+
+Email to the active riders
+
+No
+
+No
+
+No
+
+Yes
+
+4.4 Alert transitions
+Table 105 is the transition table of AlertStateMachine (BR-C3-07). A refused cell answers 409 CONFLICT with the allowed
+actions in details. Who may press the buttons is BR-C3-08 and Table 89.
+Table 105: Decision table for alert transitions
+Current status
+
+ACKNOWLEDGE
+
+RESOLVE
+
+FALSE_
+ALARM
+
+NEW
+
+ACKNOWLEDGED
+
+RESOLVED
+
+FALSE_ALARM
+
+ACKNOWLEDGED
+
+RESOLVED
+
+FALSE_ALARM
+
+RESOLVED
+
+FALSE_ALARM
+
+4.5 Worker outcomes
+Table 106 lists what the worker does in each situation it can meet, so that no failure is left to the code to improvise (BR-C3-12 to
+BR-C3-14). The common rule is that an MQTT message is acknowledged only after its event is stored, so a crash replays it, and
+replays are harmless.
+Table 106: Decision table for the classifier worker
+Situation
+
+The worker
+
+Result for the event
+
+Normal clip, model READY
+
+Classifies, stores the event, posts the result
+
+Decision stored; alert if the rules say so
+
+The (tenantId, eventId) is already stored
+
+Skips the insert and posts the result again
+
+The first decision is returned; no second alert
+
+C2 does not answer after 2 retries (timeout
+or connection error)
+
+Reads clip.s3Key from S3 with its IAM role and
+continues
+
+Normal result; the fallback is counted in the
+worker log
+
+C2 answers 404 or 410, the S3 read also
+fails, or the clip cannot be decoded
+
+Stores the event with inference.error (clip_unavailable or No alert, reason ERROR_RECORDED; the
+clip_invalid) and posts it
+failure is counted
+
+No model loaded (NO_MODEL)
+
+Processes nothing; the event waits in the queue
+
+/healthz reports no model version; processing
+resumes when a model loads
+
+The new version's SHA-256 does not match, Keeps the old head and logs the error; tries again at the
+or the load fails
+next poll, at most 3 times per version
+
+The old version keeps classifying
+
+The result call fails three times
+
+Leaves the event without a decision and logs it
+
+No alert for that event; re-evaluation is design
+only
+
+The queue holds 200 events
+
+Drops the oldest STANDARD event and counts it;
+HIGH events are kept
+
+The count appears in /healthz
+
+SES fails for a recipient (C3)
+
+NotificationService stores the error and tries again up to
+three times
+
+Notification FAILED; the alert is unaffected
+
+Testing. Each column of Table 102 to Table 105 and each row of Table 106 is one unit test, about forty in all, run with pytest and
+seeded data; the tenancy tests call every endpoint of Section 2 with the token of the other tenant and expect 404; the latency of
+Table 78 is measured with the simulator and reported in the final report.
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+
+5. Component Graphic User Interface Design
+C3 builds the alert pages as React components (TypeScript, Material UI) that the C1 shell mounts through its role-based router;
+C1 provides the shell, the menu, the top bar with the open-alert count, and the WebSocket client, and the pages below fill the
+content area. The alert monitor, the alert detail and the alert rules page are the alert half of the staff and owner views of Part I
+(Table 33 there lists them as hosted C3 pages); the rider page is the read-only page that the alert email links to.
+
+5.1 GUI style
+Table 107 gives the style rules shared by all C3 pages. They extend the C1 style guide and add the chips and the live behavior
+that only alerts need.
+Table 107: GUI style of the C3 pages
+Element
+
+Rule
+
+Layout
+
+C1 shell; content in cards; in the alert monitor the queue is on the left and the detail on the right on screens 1200 px wide or
+more, and they stack below that
+
+Severity chip
+
+CRITICAL red, HIGH orange, MEDIUM yellow, LOW gray; the word is always on the chip, so color is never the only
+signal
+
+Status chip
+
+NEW blue and bold, ACKNOWLEDGED amber, RESOLVED green, FALSE_ALARM gray; word included
+
+Buttons
+
+The next sensible action is the primary button (Acknowledge on NEW, Resolve on ACKNOWLEDGED); the others are
+secondary; a button the role or state does not allow is disabled with a tooltip that says why
+
+Time
+
+Open alerts show their age as mm:ss up to one hour and hh:mm after; the tooltip shows the absolute time in the tenant's
+time zone
+
+Live behavior
+
+A new alert slides in at the top of the queue with a 3 s highlight and the Live badge; if the WebSocket drops, the badge
+reads Polling and the list reloads every 10 s
+
+Messages
+
+A toast confirms an action; on a 409 the toast reads that someone else already changed the alert, and the page reloads it
+
+Accessibility
+
+Full keyboard use, visible focus, new alerts announced through an aria-live region, text contrast of at least 4.5 to 1
+
+5.2 Function partition tree
+Figure 42 shows the five pages under the single entry that C3 adds to the shell, with the priority and the roles of each page and
+the functions on it. The priorities are those of Table 79: the alert monitor, the alert detail and the rider page are High, and the
+rules page and the map are Medium. In the build, the map is a scatter plot of latitude and longitude colored by severity; a map tile
+layer is design only.
+
+Figure 42: Function partition tree of the C3 pages
+
+5.3 Storyboards
+Three storyboards cover the scenarios of Table 81 that have a screen: SC1 for the owner (Table 108), SC3 for service staff
+(Table 109) and SC4 for the fleet manager (Table 110). Each step names the screen, what the user sees, what the user does, and
+the call or event behind it.
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+
+Table 108: Storyboard SB1, an owner acknowledges and closes an alert (SC1)
+Step
+
+Screen
+
+The user sees
+
+The user does
+
+Call or event
+
+Any page
+
+A toast, the open-alert count in the top bar
+goes up, and the email arrives
+
+Opens the alert monitor
+
+alert.created; SES email
+
+Alert monitor
+
+A new CRITICAL ACCIDENT row for AV01, highlighted
+
+Selects the row
+
+GET /alerts/20482
+
+Detail panel
+
+Summary, spectrogram, top classes (crash
+0.91), the rule that fired
+
+Presses Play clip
+
+Presigned clip URL from the
+detail
+
+Detail panel
+
+Status NEW, Acknowledge as the primary
+button
+
+Presses Acknowledge
+
+POST /alerts/20482/actions,
+alert.updated
+
+Detail panel and queue
+
+Chip ACKNOWLEDGED; the history shows
+the user and the time
+
+Later presses Resolve
+
+POST /alerts/20482/actions; the
+page posts the CONFIRMED
+label to C1
+
+Table 109: Storyboard SB2, service staff mark a false alarm (SC3)
+Step
+
+Screen
+
+The staff user sees
+
+The user does
+
+Call or event
+
+Alert monitor
+
+Open alerts of all tenants
+
+Sets Tenant to Tenant B and Severity
+to HIGH
+
+GET /alerts with tenantId and
+severity
+
+Queue
+
+A siren alert on one of the cars of
+Tenant B
+
+Selects it
+
+GET /alerts/{alertId}
+
+Detail panel
+
+The clip player and the top classes
+
+Presses Play clip and hears a speaker,
+not a siren
+
+Presigned clip URL
+
+Detail panel
+
+Resolve and False alarm buttons, an
+optional note
+
+Presses False alarm
+
+POST /alerts/{alertId}/actions,
+alert.updated
+
+Detail panel
+
+Chip FALSE_ALARM and a note that The page sends the label
+the label was sent
+
+POST /events/{eventRef}/feedback
+(C1)
+
+Table 110: Storyboard SB3, a fleet manager raises a threshold (SC4)
+Step
+
+Screen
+
+The fleet manager sees
+
+The user does
+
+Call or event
+
+Alert rules
+
+The effective rules of Tenant B; honking
+shows 0.60 with source DEFAULT
+
+Presses Edit on honking
+
+GET /alert-rules
+
+Edit panel
+
+Fields for minimum confidence, severity,
+repeats and window
+
+Enters 0.75 and presses Save
+
+PUT /alert-rules/{ruleId}, 201, audit
+RULE_SAVE
+
+Alert rules
+
+The honking row now shows 0.75, source
+TENANT, and a Reset button
+
+Presses Reset later to return to
+the default
+
+DELETE /alert-rules/{ruleId}
+
+None
+
+No new alert for a honking event at 0.70
+
+Nothing
+
+The decision reason
+BELOW_THRESHOLD is stored with
+the event
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+
+5.4 UI markup diagram
+Figure 43 marks the five regions of the alert monitor; Table 111 says what each region shows, where the data comes from, and
+what updates it live. The detail panel is the same component that the alert detail page uses at full width.
+
+Figure 43: UI markup diagram of the alert monitor
+
+Table 111: Regions of the alert monitor
+Region
+
+Content
+
+Data source
+
+1 Header
+
+Page title, the Live or Polling badge, and in the top bar the
+open-alert count
+
+GET /alerts?status=OPEN, its alert.created, alert.updated
+total
+
+2 Filters
+
+Status, type, severity, vehicle, tenant (staff only), Reset; the
+filters are kept in the page address
+
+The query of GET /alerts; the
+tenant filter lists GET
+/admin/tenants of C1
+
+None
+
+3 Queue
+
+Rows newest first with age, severity chip, type, car and status;
+25 per page
+
+GET /alerts
+
+New rows from alert.created; row
+changes from alert.updated
+
+4 Detail
+
+Summary, Play clip, a spectrogram drawn in the browser from
+the clip, top classes with bars, the rule that fired, the model
+version, the history
+
+GET /alerts/{alertId}
+
+alert.updated reloads it
+
+5 Actions
+
+Acknowledge, Resolve, False alarm
+
+POST
+/alerts/{alertId}/actions
+
+The result arrives as alert.updated
+
+Live update
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+
+5.5 GUI templates
+Figure 44 gives the templates of the two pages that differ from the monitor: the alert rules page with its edit panel, and the readonly rider page. Every page follows the loading, empty and error behavior of Table 112, so a page is never blank or silent.
+
+Figure 44: GUI templates of the alert rules page and the rider alert page
+
+Table 112: Loading, empty and error behavior of the pages
+Page
+
+Loading
+
+Empty
+
+Error or refused
+
+Alert monitor
+
+Skeleton rows
+
+No open alerts, with a link to show
+closed alerts
+
+A banner with Retry on a network error; no menu entry for a
+role without access
+
+Alert detail
+
+Skeleton card
+
+Not applicable
+
+404 Alert not found; a notice that the clip is no longer
+available when it was deleted or has expired; a toast on 409
+
+Alert rules
+
+Skeleton table
+
+Not applicable, because defaults always
+exist
+
+The message of a 422 under the field that caused it (BR-C309)
+
+Alert map
+
+Spinner
+
+No open alerts with a location
+
+A list of the same alerts if the plot cannot be drawn
+
+Rider alert page
+
+Skeleton card
+
+Not applicable
+
+Alert not found or no longer active; 404 for a trip that is not
+the rider's own
+
+References
+[1] Group 2 (A. Myadala, B. Rivera Venegas, R. Zhao), "Smart Car Intelligent Cloud Platform (SCICP): System Analysis and
+Design Document," CMPE 281 Project Option #2, Deliverable #1, San Jose State University, Oct. 4, 2026.
+[2] A. Myadala, "SCICP component design: C1 Cloud Platform Dashboard and System Admin," Part I of this document.
+[3] Object Management Group, "Unified Modeling Language (UML), version 2.5.1," Dec. 2017.
+[4] B. Elizalde, S. Deshmukh, M. Al Ismail, and H. Wang, "CLAP: Learning audio concepts from natural language
+supervision," in Proc. IEEE ICASSP, 2023; model laion/clap-htsat-unfused on the Hugging Face Hub.
+[5] MongoDB, Inc., "TTL indexes," "Time series collections," and "Schema validation," MongoDB 7.0 Manual, online
+documentation, 2026.
+[6] Amazon Web Services, "Amazon SES Developer Guide: moving out of the sandbox and sending limits," online
+documentation, 2026.
+

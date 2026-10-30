@@ -1,0 +1,40 @@
+# Environment and secrets
+.env
+.env.*.local
+*.pem
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+*.db
+*.db-journal
+*.sqlite
+
+# Node / Vite
+node_modules/
+dist/
+dist-ssr/
+*.local
+.vite/
+
+# Playwright
+playwright-report/
+test-results/
+blob-report/
+playwright/.cache/
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/

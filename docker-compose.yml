@@ -1,0 +1,191 @@
+# SCICP local stack (CMPE 281 Group 2): one command runs the C1 API, the web app, the C2/C3 stubs
+# with the demo generator, the seed, and the infrastructure (MySQL 8, MongoDB 7, MinIO, MailHog,
+# Mosquitto).
+#
+#   cp .env.example .env
+#   docker compose up --build
+#
+#   web        http://localhost:8080          (nginx: static build + /api, /ws, /c2, /c3 proxies)
+#   API docs   http://localhost:8000/api/v1/docs
+#   MailHog    http://localhost:8025
+#   MinIO      http://localhost:9001          (console; API on 9000; minioadmin / minioadmin)
+#   stubs      http://localhost:8002/api/v1/docs (C2), http://localhost:8003/api/v1/docs (C3)
+#
+# On EC2 add the override: docker compose -f docker-compose.yml -f docker-compose.aws.yml up -d --build
+
+name: scicp
+
+services:
+  # ------------------------------------------------------------------ infrastructure
+  mysql:
+    image: mysql:8.0
+    command: --default-authentication-plugin=mysql_native_password --character-set-server=utf8mb4 --collation-server=utf8mb4_0900_ai_ci
+    environment:
+      MYSQL_DATABASE: scicp
+      MYSQL_USER: scicp
+      MYSQL_PASSWORD: scicp
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root-change-me}
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uscicp", "-pscicp"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
+  mongo:
+    image: mongo:7
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.runCommand({ ping: 1 }).ok"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+
+  minio:
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:-minioadmin}
+      # The browser uploads and downloads model artifacts through presigned URLs (PUT and GET).
+      MINIO_API_CORS_ALLOW_ORIGIN: "*"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+
+  # One-shot: creates the two buckets and allows anonymous downloads of the model artifacts.
+  minio-init:
+    image: minio/mc:RELEASE.2025-04-16T18-13-26Z
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:-minioadmin}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:-minioadmin}
+      S3_MODELS_BUCKET: ${S3_MODELS_BUCKET:-scicp-models}
+      S3_CLIPS_BUCKET: ${S3_CLIPS_BUCKET:-scicp-clips}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        mc alias set local http://minio:9000 "$$S3_ACCESS_KEY" "$$S3_SECRET_KEY"
+        mc mb --ignore-existing "local/$$S3_MODELS_BUCKET"
+        mc mb --ignore-existing "local/$$S3_CLIPS_BUCKET"
+        mc anonymous set download "local/$$S3_MODELS_BUCKET"
+        mc anonymous set none "local/$$S3_CLIPS_BUCKET"
+        echo "buckets ready: $$S3_MODELS_BUCKET (public download), $$S3_CLIPS_BUCKET (private)"
+    restart: "no"
+
+  mailhog:
+    image: mailhog/mailhog:v1.0.1
+    ports:
+      - "8025:8025"   # web UI; SMTP on 1025 inside the network
+
+  mosquitto:
+    image: eclipse-mosquitto:2
+    volumes:
+      - ./deploy/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - mosquitto-data:/mosquitto/data
+    ports:
+      - "1883:1883"
+
+  # ------------------------------------------------------------------ platform
+  # Seed (one-shot): the Deliverable #2 sample data in MySQL, MongoDB and the model bucket.
+  seed:
+    build:
+      context: .
+      dockerfile: c1/api/Dockerfile
+    image: scicp/c1-api:local
+    env_file: .env
+    command: ["python", "-m", "seed.seed"]
+    depends_on:
+      mysql:
+        condition: service_healthy
+      mongo:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    restart: "no"
+
+  api:
+    build:
+      context: .
+      dockerfile: c1/api/Dockerfile
+    image: scicp/c1-api:local
+    env_file: .env
+    environment:
+      STUBS_INLINE: "0"
+      SEED_ON_START: "0"
+    ports:
+      - "8000:8000"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      mongo:
+        condition: service_healthy
+      seed:
+        condition: service_completed_successfully
+      mailhog:
+        condition: service_started
+      mosquitto:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health').status==200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+    restart: unless-stopped
+
+  # C2 (:8002) and C3 (:8003) stand-ins plus the demo event generator. Replaced by the real
+  # components later: point C2_BASE_URL / C3_BASE_URL (and the nginx upstreams) at them.
+  stubs:
+    build:
+      context: .
+      dockerfile: stubs/Dockerfile
+    image: scicp/stubs:local
+    env_file: .env
+    environment:
+      C1_BASE_URL: ${C1_BASE_URL:-http://api:8000/api/v1}
+    ports:
+      - "8002:8002"
+      - "8003:8003"
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+  web:
+    build:
+      context: ./c1/web
+    image: scicp/c1-web:local
+    ports:
+      - "${WEB_PORT:-8080}:8080"
+    depends_on:
+      api:
+        condition: service_healthy
+      stubs:
+        condition: service_started
+    restart: unless-stopped
+
+volumes:
+  mysql-data:
+  mongo-data:
+  minio-data:
+  mosquitto-data:

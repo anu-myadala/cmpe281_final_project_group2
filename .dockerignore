@@ -1,0 +1,17 @@
+# Build context of the api and stubs images is the repository root: keep it small.
+.git
+.env
+.env.*
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+**/*.db
+**/*.db-journal
+c1/web/node_modules
+c1/web/dist
+c1/web/test-results
+c1/web/playwright-report
+c1/api/tests
+docs
+deploy
+*.md

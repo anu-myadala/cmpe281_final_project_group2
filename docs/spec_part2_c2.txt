@@ -1,0 +1,4388 @@
+Part II. C2 Edge Agent and IoT Device Management
+Component owner: Brandon Rivera Venegas (brandon.riveravenegas@sjsu.edu). Includes per-car data management and the
+edge agent.
+
+1. Component Overview
+This part is the detailed design of component C2, Edge Agent and IoT Device Management, of the Smart Car Intelligent Cloud
+Platform (SCICP). It covers the cloud side of C2 (vehicles, IoT devices, provisioning, device configuration and control, device
+status, Wi-Fi settings, and per-car data management) and the edge agent and car simulator that act as the cars. It is task T7 of our
+Deliverable #1 [1] and keeps that system design unchanged: the component boundaries, the C2 REST APIs of its Table 9, the
+MQTT topics of its Table 14, the device states, and the vehicle and device tables of its ERD. It fills in what is inside C2 and fixes
+the interfaces that Part I [2] and Part III [3] already rely on: GET /internal/clips/{clipId}, the audio event format, the
+device.status event, the vehicle list for the overview, and the vehicle limit.
+
+1.1 Purpose
+C2 is the part of the platform that knows the cars. An IoT engineer registers a vehicle and its devices (interior and exterior
+microphones, cameras, and the edge gateway that runs the agent), provisions the vehicle so that its agent gets its own MQTT
+login and upload token, changes a device setting such as the microphone gain, and watches whether each device is online. C2
+sends every setting and command to the car over MQTT and shows it as confirmed only when the car says it applied it. C2 also
+receives the 5 s audio clips that the cars upload, stores them in S3, serves them to the classifier worker, and lets owners and
+engineers list, play, and delete the clips of each car and set how long they are kept.
+The edge agent is the other half. It is one Python program that runs on a laptop with its built-in microphone as the live car, or
+many times as simulated cars that replay the course datasets. It listens, cuts a clip when a pre-filter finds a candidate sound,
+uploads the clip to C2, publishes the audio event over MQTT, sends telemetry every 10 s, and applies the settings and
+commands it receives. C2 does not classify sounds, does not create alerts, and does not draw the dashboard shell; those belong to
+the C4 worker and C3 [3] and to C1 [2]. Figure 22 places C2 among its neighbors. As in Deliverable #1, we design for the fullscale platform (AWS IoT Core things with X.509 certificates, device shadows, pre-signed uploads, Redis for the event bus) and
+build what the demo needs (Mosquitto with one login per car, a multipart upload to the API, an in-process event bus, one EC2
+instance); the APIs, tables, classes, and rules are the same in both.
+
+Figure 22: Context diagram of C2, the edge agent, and their neighbors
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+
+1.2 Objectives
+Table 34 lists the six objectives for the component this semester and how the design meets each one. O3, O4, and O5 are
+measured during integration testing (tasks T12 and T15 of Deliverable #1); the others are checked by the unit tests of the
+decision tables of Section 4 and by the API and tenancy tests of the Deliverable #1 test plan.
+Table 34: Objectives of the component
+ID
+
+Objective
+
+How the design meets it
+
+O1
+
+Every car and device is registered once, in one tenant,
+within the plan limit
+
+Unique keys on VIN, vehicle code per tenant, device code, and serial
+number; VehicleService checks tenant.max_vehicles and DeviceService the
+device mix (BR-C2-02, BR-C2-03, BR-C2-05)
+
+O2
+
+A car can reach only its own topics and only upload its
+own clips
+
+One Mosquitto login per car with an ACL limited to
+scicp/v1/{tenantId}/{vehicleId}/#; a device token bound to the vehicle and
+the credential version; rotation revokes both (BR-C2-07 to BR-C2-09)
+
+O3
+
+The status shown for a device is never more than 40 s
+behind the car
+
+Telemetry every 10 s is the heartbeat; the sweep every 10 s marks a device
+OFFLINE after 30 s without one, and the broker's last-will message marks it
+at once when the connection drops (BR-C2-18 to BR-C2-21)
+
+O4
+
+A setting is shown as confirmed only when the car
+applied it
+
+Every setting is a device_command row that moves PENDING, SENT,
+APPLIED; the page shows the confirmed values and the pending ones
+separately; target median 2 s from Apply to "car confirmed" (BR-C2-13)
+
+O5
+
+Clip upload and event publish within 0.8 s, the C2 share
+of the 8 s alert budget of the C3 design (Table 78 in Part
+III)
+
+One multipart POST of a 160 KB WAV, one S3 PUT, one INSERT; the
+agent publishes the event as soon as it has the clipId; target POST
+/ingest/clips p95 300 ms on the t3.medium
+
+O6
+
+Clips are kept no longer than the car's retention period and expire_at is fixed at upload; a daily job deletes expired objects; DELETE
+can be deleted on request
+/clips/{clipId} removes the object at once and records who did it (BR-C2-23,
+BR-C2-24)
+
+Non-functional requirements. The component inherits the our-build column of Table 6 of Deliverable #1: API reads within
+300 ms; one instance that must run through the demo, so the agent reconnects with back-off and the broker keeps QoS 1
+messages for it; HTTPS for the API, MQTT over TLS on port 8883, JWT roles for users, a device token for cars, and a service
+token for internal calls; tenant_id filtering in every query; and the nightly dumps to S3 of C5 (FR-C5-05), which cover the C2
+tables. Wi-Fi passwords are stored encrypted and never returned by the API.
+
+1.3 Function scope
+We partition the component into the ten modules of Table 35. The priority column is the one from Table 5 of Deliverable #1,
+with two changes that follow the project brief, which names Wi-Fi connectivity and device control for the IoT team: the Wi-Fi
+settings of FR-C2-08 move from M to H (the offline outbox of the same requirement stays M), and the MUTE and UNMUTE
+commands of FR-C2-09 move to H as the one control command we demonstrate (restart stays M; firmware update and the
+cellular APN stay L).
+Table 35: Modules of the component and the requirements they satisfy
+Module
+
+Functions
+
+Requirements
+
+Priority
+
+M1 Vehicle registry
+
+Add, update, retire vehicles; vehicle limit; riders of a trip; vehicle list
+for the C1 overview
+
+FR-C2-01
+
+H (riders M)
+
+M2 Device registry
+
+Add, update, enable, disable, delete devices; device mix per car
+
+FR-C2-02
+
+H
+
+M3 Provisioning
+
+MQTT login and ACL in Mosquitto, device token, agent.yaml; rotate FR-C2-03
+and revoke
+
+H
+
+M4 Configuration and
+commands
+
+Microphone gain and detection threshold; MUTE, UNMUTE;
+command delivery, acknowledgement, timeout, resend
+
+FR-C2-04, FR-C2-09
+
+H (restart M)
+
+M5 Status monitor
+
+Telemetry and status ingestion, heartbeats, offline sweep, faults,
+device.status events, state history
+
+FR-C2-05
+
+H
+
+M6 Clip service
+
+Clip upload, internal clip fetch for the worker, per-car event and clip
+list, playback URL
+
+FR-C2-06, UC-10
+
+H
+
+M7 Retention
+
+Retention period per car, clip deletion, daily expiry job
+
+FR-C2-07
+
+M
+
+M8 Network settings
+
+Wi-Fi profiles per car, encrypted at rest, sent to the agent and
+confirmed
+
+FR-C2-08
+
+H (raised)
+
+M9 Edge agent and simulator
+
+Audio capture, pre-filter, clip cut, upload, event publish, telemetry,
+control handler; simulated fleet; SQLite outbox (M)
+
+UC-10, FR-C2-08
+
+H (outbox M)
+
+M10 Design only
+
+AWS IoT Core things and X.509 certificates, device shadows,
+firmware over the air, cellular APN, pre-signed clip upload
+
+FR-C2-09
+
+L
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+
+Out of scope. Classification, alert rules, alerts, and notifications are C4 and C3 [3]; the audio_events collection, its validator,
+indexes, and retention TTL are specified in Part III (Table 96 and Table 97) because Part III owns the MongoDB collections; the
+tenant, user, plan, and subscription tables and the dashboard shell are C1 [2]; backups are C5. C2 hosts its pages inside the C1
+shell and provides the Data tab that the C1 owner vehicle page embeds.
+
+1.4 Usage
+Table 36 shows who uses which module. IOT_ENGINEER is a staff role without a tenant (BR-07 of the C1 design), so the
+engineer picks the tenant in the top bar and the pages pass tenantId; SERVICE_STAFF and SYS_ADMIN may read every
+tenant's vehicles and devices; OWNER and FLEET_MANAGER see their own cars and use the Data tab and the riders list; a
+RIDER has no C2 page. Two non-human callers use C2: the edge agent with its device token, and the C1 and C4 containers with
+the service token.
+Table 36: Roles and the modules they use
+Role
+
+M1 Vehicles
+
+M2 Devices
+
+M3
+Provision
+
+M4 Config,
+commands
+
+M6 Clips (Data
+tab)
+
+M7 Retention,
+delete
+
+M8 Network
+
+OWNER
+
+Read own;
+riders
+
+Read own
+
+-
+
+-
+
+Y, own cars
+
+Y, own cars
+
+-
+
+FLEET_MANAGER
+
+Read own;
+riders
+
+Read own
+
+-
+
+-
+
+Y, own cars
+
+Y, own cars
+
+-
+
+IOT_ENGINEER
+
+Y, any tenant
+
+Y
+
+Y
+
+Y
+
+Y
+
+Y
+
+Y
+
+SERVICE_STAFF
+
+Read, any tenant Read
+
+-
+
+-
+
+Read
+
+-
+
+Read
+
+SYS_ADMIN
+
+Read, any tenant Read
+
+-
+
+-
+
+Read
+
+-
+
+Read
+
+Edge agent (device
+token)
+
+-
+
+-
+
+-
+
+Receives over
+MQTT
+
+Upload only
+
+-
+
+Receives over
+MQTT
+
+C1, C4 (service token)
+
+C1 reads the list
+
+C1 reads
+summary
+
+-
+
+-
+
+C4 fetches clips
+
+-
+
+-
+
+Table 37 gives the seven usage scenarios that drive the sequence diagrams of Section 3.4 and the storyboards of Section 5.3.
+They use the seeded data of the C1 and C3 designs: Tenant A (tA) is the Nguyen household on the BASIC plan (3 vehicles) with
+car AV-01, whose devices are dev-0110 (edge gateway), dev-0111 (interior microphone), and dev-0112 (exterior microphone);
+Tenant B (tB) is Bay Shuttle LLC on the FLEET plan (50 vehicles) with cars AV-10 to AV-14; and D. Patel is the IoT engineer
+of Deliverable #1.
+Table 37: Usage scenarios
+ID
+
+Actor
+
+Scenario
+
+Modules
+
+SC1
+
+IoT engineer D. Patel
+
+Adds AV-02 (VIN 7SAYGDEE5PA000202, Tesla Model Y 2023) to Tenant A, then
+an interior and an exterior microphone; a later attempt to add a fourth car to Tenant A
+is refused with 422 BR-C2-02
+
+M1, M2
+
+SC2
+
+D. Patel, edge agent
+
+Provisions AV-02, downloads agent.yaml, starts the agent on the laptop; the car
+connects, AV-02 becomes ACTIVE, and its three devices turn ONLINE on the
+dashboard
+
+M3, M5, M9
+
+SC3
+
+D. Patel
+
+Raises the gain of dev-0112 on AV-01 from +6 dB to +12 dB; the page shows v4
+SENT, then "car confirmed" about 1 s later
+
+M4
+
+SC4
+
+Edge agent AV-01
+
+AV-01 drives at 48 km/h; the pre-filter fires on a crash sound; the agent uploads clip
+c41e8d2b and publishes the event; the worker fetches the clip from C2 (the alert itself
+is SC1 of the C3 design)
+
+M9, M6
+
+SC5
+
+System
+
+The simulated AV-13 is stopped; 30 s later its gateway and microphones turn
+OFFLINE on the C1 overview; restarting it brings them back ONLINE
+
+M5
+
+SC6
+
+Owner Anh (tA)
+
+Opens the Data tab of AV-01, plays the crash clip, deletes an interior clip, and sets
+retention to 30 days
+
+M6, M7
+
+SC7
+
+D. Patel
+
+Saves the depot Wi-Fi BayShuttle-Depot (WPA2) as priority 1 for AV-12; the agent
+acknowledges and the next telemetry reports the network
+
+M8
+
+1.5 Interfaces to other components
+As Deliverable #1 requires (its Section 3.2 and Table 8), components talk through REST calls and events and never write each
+other's tables. C2 writes only the tables and collections of Section 3.3 and reads the C1 rows it needs (tenant.code and
+max_vehicles, app_user.role) through the read-only access of the C5 data access layer. Table 38 lists every interface; Section 2
+gives the calls and messages. The rows marked "agreed" are the ones Parts I and III depend on; they match those parts field for
+field.
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+
+Table 38: Interfaces between C2 and the other components and services
+Counterpart
+
+Direction
+
+Interface
+
+Used for
+
+Browser (engineer, owner,
+staff)
+
+In
+
+HTTPS REST under /api/v1, JSON, JWT bearer
+
+All C2 pages and the Data tab
+
+Edge agent
+
+In
+
+POST /ingest/clips with the device token
+
+Clip upload (Section 2.5)
+
+Edge agent through
+Mosquitto
+
+Both
+
+MQTT 3.1.1 over TLS; topics
+scicp/v1/{tenantId}/{vehicleId}/telemetry, /status in;
+/config, /command out
+
+Heartbeats, status, settings, commands
+(Section 2.8)
+
+Mosquitto dynamic security
+
+Out
+
+$CONTROL/dynamic-security/v1 with the admin login
+
+Create, rotate, and remove car logins and
+ACL roles
+
+C4 classifier worker (C3
+design)
+
+In
+
+GET /internal/clips/{clipId}, service token; agreed with
+Part III
+
+The clip bytes, 5 s mono 16 kHz WAV
+
+C4 worker
+
+(none)
+
+Subscribes to .../audio/event directly; the event format is
+the one of Table 86 in Part III, which the agent publishes;
+agreed
+
+C2 does not relay events
+
+C1 VehicleClient
+
+In
+
+GET /vehicles and GET /vehicles/{id}/devices with the
+service token; agreed
+
+Vehicle cards and status on the owner
+overview
+
+C1 EventBus and WsHub
+
+Out
+
+Publish device.status {vehicleId, deviceId, status,
+lastSeenAt, tenantId}; with three optional fields (Section
+2.9)
+
+Live device status on every page
+
+C1 SubscriptionService
+
+Out
+
+defaults(vehicleId) inside the vehicle-create transaction
+(direct call in our build)
+
+Default subscriptions of a new car
+
+C1 tenant table
+
+Out
+
+SELECT code, plan, max_vehicles through C5
+
+Vehicle limit (BR-06 of C1)
+
+C3 and the worker
+
+In (reads)
+
+SELECT on vehicle (label, retention_days), vehicle_rider,
+and clip (state) through C5
+
+Alert labels, riders to notify, expireAt of
+events
+
+C5 MySQL and MongoDB
+
+Both
+
+SQLAlchemy session; Motor client
+
+C2 tables; vehicle_telemetry and
+device_state_history writes; audio_events
+reads
+
+Amazon S3
+
+Out
+
+StorageClient put, get, delete, presign_get (15 min)
+
+Clip objects
+
+2. Component Application Interface Design and Analysis
+Sections 2.1 to 2.5 specify the REST APIs of C2 (vehicles and riders, devices, provisioning and commands, network, clips and
+per-car data), 2.6 the error cases, 2.7 the internal API, 2.8 the MQTT connectivity API between the cars and the platform, 2.9 the
+events C2 publishes, and 2.10 who may call what and how the APIs are protected. Every C2 endpoint of Table 9 of Deliverable
+#1 is here; this design adds GET and PUT on one vehicle's network, the command history and command status, the playback
+URL, the riders calls, GET /vehicles/{id}/telemetry, and the internal clip call. The business rules BR-C2-01 to BR-C2-26 are
+stated in Section 4.
+Conventions. C2 follows the conventions of the C1 design [2]: all endpoints are under /api/v1 and exchange JSON, dates are
+ISO 8601 in UTC, every request carries a bearer token, and the tenant of a request comes from the token, never from the URL;
+staff roles, which have no tenant, pass tenantId as a query parameter, and TenantContext validates it (BR-C2-01). vehicleId is
+the public vehicle code (AV-01), deviceId the public device code (dev-0112), tenantId in MQTT topics and MongoDB the
+tenant code (tA), and clipId 8 lowercase hexadecimal characters. Errors use the envelope {error: {code, message, details?}} and
+the codes of Table 8 in Part I; C2 adds four: GONE 410 when a clip was deleted or expired, PAYLOAD_TOO_LARGE 413 and
+UNSUPPORTED_MEDIA 415 for clip uploads, and NOT_IMPLEMENTED 501 for the design-only commands. A refused
+rule is BUSINESS_RULE 422 with details.rule set to the BR-C2 id and details.field next to it. Calls that need the car to act
+(settings, commands, network) answer 202 Accepted with a commandId, because the result arrives later over MQTT. Lists are
+paged with page and size (default 25, maximum 100). In the tables a question mark marks an optional field and vertical bars an
+enumeration.
+
+2.1 Vehicles and riders
+Table 39 is the API of M1. Vehicles are never deleted, because alerts and events refer to them; DELETE retires the vehicle (BRC2-04). The list is also the call that C1's VehicleClient makes with the service token, so its items carry the device summary and
+the connection the overview cards show.
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+
+Table 39: Vehicle and rider API
+Method and endpoint
+
+Request
+
+Response
+
+GET /vehicles
+
+?tenantId (staff, service), ?
+status, ?q (code or VIN), ?
+page, ?size
+
+200 {items[{vehicleId, vin, label, make,
+400 tenantId missing for a staff
+model, year, status, connection ONLINE or
+role; owner and fleet roles get
+OFFLINE or NEVER, lastSeenAt?,
+their own tenant only
+retentionDays, deviceSummary{total, online,
+offline, fault, disabled}}], page, size, total}
+
+Errors and rules
+
+POST /vehicles
+
+?tenantId (engineer);
+{vehicleId, vin, make,
+model, year, label?,
+retentionDays?}
+
+201 vehicle, status REGISTERED; default
+subscriptions created by C1 in the same
+transaction
+
+409 VIN or vehicleId exists;
+422 BR-C2-02 limit, BR-C203 format; 403 other roles
+
+GET /vehicles/{vehicleId}
+
+-
+
+200 vehicle + devices[] +
+provisioning{mqttUsername,
+credentialVersion, provisionedAt} +
+network{profiles, lastApplied}
+
+404 not in the caller's tenant
+
+PUT /vehicles/{vehicleId}
+
+{make?, model?, year?,
+label?}
+
+200 vehicle
+
+422 BR-C2-03 when vin or
+vehicleId is sent; 409 when
+RETIRED
+
+DELETE /vehicles/{vehicleId}
+
+{confirm: true}
+
+200 {status: RETIRED}; login and token
+revoked, devices DISABLED, open rides
+ended
+
+400 confirm missing; 409
+already RETIRED. Audit
+RETIRE_VEHICLE
+
+GET /vehicles/{vehicleId}/riders
+
+?active
+
+200 [{userId, name, validFrom, validTo?}]
+
+Owner, fleet, engineer (M)
+
+POST /vehicles/{vehicleId}/riders
+
+{userId, validFrom?,
+validTo?}
+
+201 ride
+
+422 BR-C2-26 user not a
+RIDER of the tenant,
+overlapping ride (M)
+
+DELETE
+/vehicles/{vehicleId}/riders/{userId}
+
+-
+
+200 ride with validTo = now (trip ended)
+
+404 no open ride (M)
+
+Example: the engineer adds AV-02 to Tenant A (scenario SC1).
+POST /api/v1/vehicles?tenantId=1
+{ "vehicleId": "AV-02", "vin": "7SAYGDEE5PA000202", "make": "Tesla", "model": "Model Y",
+"year": 2023, "label": "Anh's second car" }
+HTTP/1.1 201 Created
+{ "vehicleId": "AV-02", "status": "REGISTERED", "connection": "NEVER", "retentionDays": 90,
+"deviceSummary": { "total": 0, "online": 0, "offline": 0, "fault": 0, "disabled": 0 } }
+
+2.2 Devices
+Table 40 is the API of M2. A device's type cannot change; its status is never written through the API except by enable and
+disable, because it comes from the car (Section 4.5).
+Table 40: Device API
+Method and endpoint
+
+Request
+
+Response
+
+GET
+/vehicles/{vehicleId}/devices
+
+?includeDeleted
+
+200 [{deviceId, type, position, serialNo,
+404 vehicle; C1 calls it with
+firmwareVersion, status, muted, lastSeenAt?, the service token for the
+faultReason?, config{version, state, values,
+device summary
+pending?}}]
+
+POST
+/vehicles/{vehicleId}/devices
+
+{type MIC_INTERIOR or
+MIC_EXTERIOR or CAMERA or
+EDGE_GATEWAY, position,
+serialNo, firmwareVersion?}
+
+201 device, status PROVISIONING, config
+v1 defaults (mics: +6 dB, 0.40)
+
+409 serialNo exists; 422 BRC2-05 mix, vehicle RETIRED
+
+GET /devices/{deviceId}
+
+-
+
+200 device as above
+
+PUT /devices/{deviceId}
+
+{position?, serialNo?,
+firmwareVersion?, enabled?}
+
+200 device; enabled false gives DISABLED
+and a MUTE command, true gives
+PROVISIONING and UNMUTE (BR-C210)
+
+422 BR-C2-05 type change;
+409 vehicle RETIRED
+
+DELETE /devices/{deviceId}
+
+-
+
+204; soft delete, open commands
+SUPERSEDED
+
+422 BR-C2-06 gateway of a
+car that is not retired
+
+Errors and rules
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+
+2.3 Provisioning, configuration, and commands
+Table 41 is the API of M3 and M4. Provisioning returns the secrets once: the MQTT password is stored only as a salted hash
+inside Mosquitto's dynamic security file, and the device token is a signed JWT, so neither can be shown again; a lost agent.yaml
+is replaced by rotating.
+Table 41: Provisioning, configuration, and command API
+Method and endpoint
+
+Request
+
+Response
+
+Errors and rules
+
+POST
+/vehicles/{vehicleId}/provision
+
+{rotate?: false}
+
+201 {mqtt{host, port 8883, username,
+password, clientId, topicRoot},
+api{baseUrl, ingestToken}, devices[],
+agentYaml}; vehicle PROVISIONED (or
+stays ACTIVE when rotating)
+
+409 already provisioned and rotate
+false; 422 BR-C2-07 RETIRED; 502
+broker did not answer in 5 s. Audit
+PROVISION
+
+DELETE
+/vehicles/{vehicleId}/provision
+
+-
+
+200; login removed, token version raised,
+vehicle back to REGISTERED
+
+409 not provisioned (M)
+
+PUT /devices/{deviceId}/config
+
+{micGainDb?,
+detectionThreshold?}
+
+202 {commandId, configVersion, state
+PENDING or SENT}
+
+422 BR-C2-11 not a mic, disabled;
+BR-C2-12 out of range
+
+POST
+/devices/{deviceId}/commands
+
+{command MUTE or
+UNMUTE or
+RESTART_AGENT or
+FIRMWARE_UPDATE,
+params?}
+
+202 {commandId, state}
+
+422 BR-C2-11; 501
+FIRMWARE_UPDATE (design
+only)
+
+GET /devices/{deviceId}/commands ?limit (default 20)
+
+200 [{commandId, command, params,
+status, attempts, issuedBy, createdAt,
+sentAt?, ackedAt?, result?}]
+
+Newest first
+
+GET /commands/{commandId}
+
+200 one command
+
+Polling fallback when the WebSocket
+is down
+
+-
+
+Example: the configuration change of scenario SC3, with the request, the immediate answer, and the MQTT message it
+produces.
+PUT /api/v1/devices/dev-0112/config
+{ "micGainDb": 12 }
+HTTP/1.1 202 Accepted
+{ "commandId": 8841, "configVersion": 4, "state": "SENT" }
+topic scicp/v1/tA/AV-01/config (QoS 1)
+{ "commandId": 8841, "type": "SET_CONFIG", "deviceId": "dev-0112", "version": 4,
+"settings": { "micGainDb": 12, "detectionThreshold": 0.40 }, "ts": "2026-11-04T20:41:07.120Z" }
+
+2.4 Network settings
+Table 42 is the API of M8. A car keeps up to three Wi-Fi profiles in priority order. Passwords are write-only: GET returns
+passwordSet, and a PUT that omits a password keeps the stored one.
+Table 42: Network API
+Method and endpoint
+
+Request
+
+Response
+
+Errors and
+rules
+
+GET
+/vehicles/{vehicleId}/network
+
+-
+
+200 {profiles[{priority, ssid, securityType, passwordSet}], 404
+cellularApn?, lastApplied{commandId, status, at}?,
+current{type WIFI or CELLULAR or ETHERNET, ssid?,
+rssiDbm?} from the latest telemetry}
+
+PUT
+/vehicles/{vehicleId}/network
+
+{profiles[{priority 1 to 3, ssid,
+securityType OPEN or WPA2_PSK or
+WPA3_SAE, password?}]}
+
+202 {commandId, state}; a SET_NETWORK command
+for the whole car
+
+422 BR-C2-25
+
+2.5 Clips and per-car data
+Table 43 is the API of M6 and M7. The upload is the one call the edge agent makes over HTTPS; it uses the device token and a
+multipart body, so a 160 KB clip needs one request. The list is built from the clip table, which C2 owns and which also holds
+clips that are not yet classified or were deleted, enriched with the class, confidence, and alert of the matching audio_events
+document (read with the index {tenantId, vehicleId, ts} of the C3 design).
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+
+Table 43: Clip and per-car data API
+Method and endpoint
+
+Request
+
+Response
+
+Errors and rules
+
+POST /ingest/clips
+
+Device token; multipart: file
+(audio/wav), deviceId, eventId
+(UUID), ts; header IdempotencyKey = eventId
+
+201 {clipId, s3Key, durationMs, sampleRate,
+expireAt}; 200 with the stored clip when
+eventId was already uploaded
+
+401 token; 413; 415; 422
+BR-C2-15; 429 BR-C2-17;
+502 S3 (FC1)
+
+GET /vehicles/{vehicleId}/clips
+
+?from, ?to (default last 7 days), ?
+class, ?deviceId, ?alertOnly, ?
+page, ?size
+
+200 {items[{clipId, eventRef?, ts, deviceId,
+Owner, fleet own cars;
+channel, topClass?, confidence?, alert{alertId, engineer, staff with tenantId
+type}?, state STORED or DELETED or
+EXPIRED, expireAt, deletedBy?}], page, size,
+total}
+
+GET /clips/{clipId}/url
+
+-
+
+200 {url, expiresAt} presigned GET, 15 min
+
+410 GONE when deleted or
+expired
+
+DELETE /clips/{clipId}
+
+-
+
+204; object deleted, row kept as DELETED
+with the user and time
+
+410 already gone; 403 staff.
+Audit DELETE_CLIP
+
+PUT /vehicles/{vehicleId}/retention
+
+{retentionDays 7 to 365}
+
+200 {retentionDays, appliesFrom}
+
+422 BR-C2-23
+
+200 [{ts, speedKph, driveMode, ignition,
+location, network}]
+
+Newest first (M)
+
+GET /vehicles/{vehicleId}/telemetry ?from, ?to, ?limit (default 60)
+
+The answer to the upload of scenario SC4 is the clip part of the audio event that the agent then publishes; the event format is
+Table 86 in Part III.
+POST /api/v1/ingest/clips
+
+(Authorization: Bearer <device token of AV-01>)
+
+Content-Type: multipart/form-data; file=crash.wav (160,044 bytes), deviceId=dev-0112,
+eventId=3f1c0b1e-8f27-4d62-9c1a-5e7a4f2d90aa, ts=2026-11-04T21:42:07.312Z
+HTTP/1.1 201 Created
+{ "clipId": "c41e8d2b", "s3Key": "tenants/tA/vehicles/AV-01/2026/11/04/c41e8d2b.wav",
+"durationMs": 5000, "sampleRate": 16000, "expireAt": "2027-02-02T21:42:07.312Z" }
+
+2.6 Error behavior specific to C2
+Table 44 adds the C2 cases to the error codes of the C1 design.
+Table 44: Error cases of C2
+Code
+
+HTTP
+
+When in C2
+
+BUSINESS_RULE
+
+A rule of Section 4 refuses the request: vehicle limit, VIN format, device mix, range of a setting,
+command not allowed for the device type, network profile invalid, retention out of range;
+details.rule names it
+
+CONFLICT
+
+Duplicate VIN, vehicle code, serial number; vehicle already provisioned without rotate; change to a
+RETIRED vehicle
+
+GONE
+
+Clip deleted or expired (playback URL, internal fetch, delete)
+
+PAYLOAD_TOO_LARGE
+
+Clip larger than 512 KB
+
+UNSUPPORTED_MEDIA
+
+Not RIFF WAVE PCM 16-bit, mono, 16 kHz; details give the format found
+
+RATE_LIMIT
+
+More than 12 clips in one minute for one car; Retry-After header
+
+BAD_GATEWAY
+
+S3 or the broker's dynamic security did not answer within 5 s; nothing is kept
+
+NOT_IMPLEMENTED
+
+FIRMWARE_UPDATE and the cellular APN (design only)
+
+2.7 Internal API
+Table 45 is the one internal endpoint of C2, agreed with the C3 design (Table 86 in Part III). Like the internal result call of C3, it
+uses the service token (role SERVICE, HS256, 24 hours), and nginx does not route /internal/ from the Internet, so only
+containers on the Docker network reach it. The worker retries twice with a 5 s timeout; if C2 does not answer at all (timeout or
+connection error) it reads the s3Key directly with its IAM role, so C2 being down does not lose the event, while a 404 or 410
+from C2 is final and the worker records the event without a result (Part III, Table 106).
+Table 45: Internal clip API (worker to C2)
+Method and endpoint
+
+Request
+
+Response
+
+Errors
+
+GET /internal/clips/{clipId}
+
+Service token
+
+200 audio/wav, 5 s, mono, 16 kHz; headers XTenant-Id, X-Vehicle-Id, X-Captured-At
+
+401 token; 404 unknown clipId; 410 deleted
+or expired; 502 S3
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+
+2.8 MQTT connectivity API
+The cars and the platform exchange JSON over MQTT 3.1.1 [6] on Mosquitto 2 with TLS on port 8883. Every car has one login,
+username {tenantId}-{vehicleId} (tA-AV-01) and client id the same, and an ACL role that limits it to its own topic root
+scicp/v1/{tenantId}/{vehicleId}/ (BR-C2-08). The platform uses three logins: svc-api (the API container; reads
+telemetry and status, writes config and command, and is the only login allowed to publish under scicp/v1/platform/), svc-worker
+(the C4 worker; reads audio events and subscribes to scicp/v1/platform/model/activated), and the dynamic security admin that
+only ProvisioningService uses. Every message carries an ID (eventId or commandId), so the QoS 1 redeliveries are ignored as
+duplicates. The platform topic scicp/v1/platform/model/activated that C1 publishes for the worker (C1 and C3
+designs) lies outside every car's topic root, so no car login can read or write it. Table 46 lists the topics.
+Table 46: MQTT topics under scicp/v1/{tenantId}/{vehicleId}/
+Topic
+
+Direction
+
+QoS
+
+Retained
+
+Payload
+
+audio/event
+
+Car to worker
+
+No
+
+{eventId, deviceId, channel, ts, clip{clipId, s3Key, durationMs, sampleRate},
+edge{class, score, priority}, location, context{speedKph, driveMode, ignition}};
+Table 86 in Part III
+
+telemetry
+
+Car to C2
+
+No
+
+Every 10 s: {ts, speedKph, driveMode, ignition, location, network{type, ssid?,
+rssiDbm?}, agent{version, uptimeS, cpuPct, outboxDepth}, devices[{deviceId,
+ok, muted, levelDb?, reason?}]}
+
+status
+
+Car to C2
+
+type agent only
+
+{type: agent, state online or offline, agentVersion, configVersions{}} on
+connect and as last will; {type: ack, commandId, result APPLIED or
+REJECTED or FAILED, reported?, reason?}; {type: device, deviceId, ok,
+reason?} at once on a fault
+
+config
+
+C2 to car
+
+No
+
+{commandId, type SET_CONFIG or SET_NETWORK, deviceId?, version?,
+settings?or profiles?, ts}
+
+command
+
+C2 to car
+
+No
+
+{commandId, type MUTE or UNMUTE or RESTART_AGENT, deviceId, ts}
+
+alert
+
+C3 to car
+
+No
+
+In-car alerts, full design of C3 only
+
+The status message of type agent is retained and is also the last will: when the car connects it publishes {state: online}, and if the
+TCP connection drops without a clean disconnect, the broker publishes the last will {state: offline} for it, so C2 learns of a lost
+car within the keep-alive of 30 s instead of waiting for the sweep. The acknowledgement of scenario SC3 looks like this:
+topic scicp/v1/tA/AV-01/status (QoS 1)
+{ "type": "ack", "commandId": 8841, "result": "APPLIED", "deviceId": "dev-0112",
+"reported": { "version": 4, "micGainDb": 12, "detectionThreshold": 0.40 },
+"ts": "2026-11-04T20:41:08.034Z" }
+
+Broker administration. ProvisioningService talks to Mosquitto's dynamic security plugin [4] by publishing JSON commands
+to $CONTROL/dynamic-security/v1 and reading the answer on $CONTROL/dynamic-security/v1/response.
+Provisioning a car sends createRole car-tA-AV-02 with the six ACL entries of BR-C2-08, then createClient tA-AV-02 with the
+password and that role; rotating sends setClientPassword; retiring sends deleteClient. The plugin keeps its state in dynamicsecurity.json on a Docker volume, so logins survive a broker restart.
+
+2.9 Events published by C2
+C2 publishes one event on the C1 EventBus, the device.status topic that the C1 design already subscribes to (Table 16 of Part I),
+after every committed status change of a device and after every confirmed or failed setting. C1's WsHub strips tenantId and
+pushes it to the tenant room and the staff room. We add two optional fields, muted and config, beside the faultReason field of
+Deliverable #1, so that the device editor can show "car confirmed" without polling; C1 forwards unknown fields unchanged, so
+this needs no change in C1 other than the WebSocket message type, which is in Table 15 of Part I.
+Table 47: Event produced by C2
+Event
+
+Payload
+
+Published when
+
+device.status
+
+{tenantId, vehicleId, deviceId, status, lastSeenAt, faultReason?,
+muted?, config?{version, state CONFIRMED or REJECTED or
+TIMED_OUT}}
+
+Status changed (FC2), setting acknowledged or timed out,
+device enabled, disabled, or deleted
+
+2.10 API analysis
+Table 48 states which role may call each API group; it derives from BR-01 of the C1 design and BR-C2-01. Every router has
+RbacGuard and TenantContext from C1, so a tenant role that passes another tenant's vehicleId gets 404, never 403, and a test
+with two seeded tenants checks every C2 endpoint for that (Deliverable #1, FR-C5-03).
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+
+Table 48: API groups and the roles that may call them
+API group
+
+OWNER
+
+FLEET_
+MANAGER
+
+RIDER
+
+IOT_
+ENGINEER
+
+SERVICE_
+STAFF
+
+SYS_
+ADMIN
+
+Device token Service token
+
+2.1 Vehicles
+
+read own
+
+read own
+
+-
+
+Y
+
+read
+
+read
+
+-
+
+read
+
+2.1 Riders (M)
+
+Y own
+
+Y own
+
+-
+
+Y
+
+read
+
+read
+
+-
+
+-
+
+2.2 Devices
+
+read own
+
+read own
+
+-
+
+Y
+
+read
+
+read
+
+-
+
+read
+
+2.3 Provisioning,
+config, commands
+
+-
+
+-
+
+-
+
+Y
+
+read history
+
+read history
+
+-
+
+-
+
+2.4 Network
+
+-
+
+-
+
+-
+
+Y
+
+read
+
+read
+
+-
+
+-
+
+2.5 Clip list, URL
+
+Y own
+
+Y own
+
+-
+
+Y
+
+Y
+
+Y
+
+-
+
+-
+
+2.5 Delete clip,
+retention
+
+Y own
+
+Y own
+
+-
+
+Y
+
+-
+
+-
+
+-
+
+-
+
+2.5 POST /ingest/clips
+
+-
+
+-
+
+-
+
+-
+
+-
+
+-
+
+Y
+
+-
+
+2.7 GET /internal/clips
+
+-
+
+-
+
+-
+
+-
+
+-
+
+-
+
+-
+
+Y
+
+Security. Users authenticate with the C1 JWT (HS256, 15 minutes). The device token is a JWT [8] signed with a separate key,
+with the claims role DEVICE, tenantId, vehicleId, ver (the vehicle's credential_version), and an expiry of 180 days; it is
+accepted only by POST /ingest/clips and is refused as soon as the vehicle is rotated or retired (BR-C2-09). The service token is
+the one of the C3 design. MQTT passwords are 24 random URL-safe characters; Wi-Fi passwords are encrypted with Fernet
+(AES-128-CBC with HMAC) under a key from the environment (SecretBox) and are sent to a car only inside its TLS
+connection. Rate limits: the 60 requests per minute per user of the C1 design, and 12 clips per minute per car. Versioning: the
+URL prefix /api/v1 and the MQTT prefix scicp/v1 change together; added optional fields do not change the version, and the
+agent ignores unknown fields.
+
+3. Component Function Design, Data and DB Design, and Behavior Analysis
+Section 3 is the white-box design of C2 and the edge agent, drawn and written so that each class, table, and transition can be
+traced to a requirement of Section 1.3 and a rule of Section 4. We followed the usual parts of a software component design [5]:
+the logic design (classes and their responsibilities), the program functions (tables, pseudocode, flowcharts), the data design, and
+the behavior (state and sequence diagrams).
+
+3.1 Logic design
+3.1.1 Back-end classes
+The cloud side of C2 is the module app/c2 of the one FastAPI service of Deliverable #1. Figure 23 shows its classes in four
+layers: routers that parse and validate requests, services that hold the rules, background classes driven by MQTT and timers, and
+repositories and clients. Table 49 gives each class its responsibility. The services are the only classes that change state, and each
+owns one rule set of Section 4, so a rule can be unit-tested without HTTP or MQTT.
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+
+Figure 23: Class diagram of the C2 back end
+
+Table 49: Back-end classes of C2
+Class
+
+Responsibility
+
+Key operations
+
+Collaborators
+
+VehicleRouter, DeviceRouter,
+ProvisionRouter, ClipRouter
+
+Map the REST calls of Sections 2.1 to 2.5 to
+services; Pydantic request and response
+models; RbacGuard and TenantContext on
+every route
+
+One method per endpoint
+
+The matching service
+
+InternalRouter
+
+GET /internal/clips/{clipId}; accepts the
+service token only
+
+get_clip(clipId)
+
+ClipService
+
+VehicleService
+
+Vehicle create, update, retire; vehicle limit;
+identity rules; riders; calls C1's
+SubscriptionService.defaults in the same
+transaction
+
+create(scope, dto), update(),
+retire(), check_limit(tenant),
+add_rider(), end_ride()
+
+VehicleRepo, RiderRepo,
+DeviceService,
+ProvisioningService, C1
+SubscriptionService, AuditLogger
+
+DeviceService
+
+Device add, update, enable, disable, soft
+delete; device mix per car; default config
+
+add(vehicle, dto), update(),
+set_enabled(device, on), remove(),
+check_type_limit()
+
+DeviceRepo, CommandService,
+StatusTracker
+
+ProvisioningService
+
+Broker login and ACL role, device token,
+agent.yaml; rotate and revoke
+
+provision(vehicle, rotate),
+revoke(vehicle),
+agent_yaml(vehicle, secrets)
+
+BrokerAdmin, DeviceTokenIssuer,
+VehicleRepo, DeviceService,
+AuditLogger
+
+CommandService
+
+Every message to a car: create the command,
+supersede older ones, send or keep pending,
+handle acks and timeouts, resend on
+reconnect
+
+set_config(device, values),
+send(command), on_ack(msg),
+on_timeout(),
+resend_pending(vehicle)
+
+CommandRepo, DeviceRepo,
+MqttGateway, EventBus
+
+NetworkService
+
+Validate and store Wi-Fi profiles encrypted;
+build the SET_NETWORK command
+
+get(vehicle), put(vehicle, profiles)
+
+NetworkRepo, SecretBox,
+CommandService
+
+ClipService
+
+Upload checks and storage (FC1); list for a
+car; presigned URL; delete; internal fetch
+
+ingest(token, form), list(vehicle,
+filters), presign(clip), delete(clip,
+user), fetch(clipId)
+
+ClipRepo, DeviceRepo,
+EventReadRepo, StorageClient,
+AuditLogger
+
+RetentionJob
+
+Retention setting; daily deletion of expired
+clips at 03:15 UTC in batches of 500
+
+set_retention(vehicle, days), run()
+
+ClipRepo, VehicleRepo,
+StorageClient
+
+MqttGateway
+
+One paho-mqtt client (login svc-api) started
+with the API; subscribes to telemetry and
+status with a shared subscription; publishes
+config and command
+
+subscribe(), publish(topic, msg,
+qos), on_message()
+
+TelemetryIngestor, StatusTracker,
+CommandService
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+Class
+
+Responsibility
+
+Key operations
+
+Collaborators
+
+TelemetryIngestor
+
+Writes vehicle_telemetry; turns the devices[]
+list into heartbeats
+
+on_telemetry(topic, msg),
+touch_devices(vehicle, list)
+
+TelemetryRepo, StatusTracker
+
+StatusTracker
+
+The device state machine (FC2): heartbeats,
+last will, faults, sweep; vehicle ACTIVE on
+first contact; history and events
+
+on_status(msg), heartbeat(device,
+ok, reason), evaluate(device, now),
+sweep()
+
+DeviceRepo, VehicleRepo,
+StateHistoryRepo, EventBus,
+CommandService
+
+BrokerAdmin
+
+Client of Mosquitto dynamic security
+
+create_car(user, password, acl),
+set_password(), delete_car()
+
+MqttGateway (admin login)
+
+DeviceTokenIssuer
+
+Issues and verifies device tokens (BR-C2-09)
+
+issue(vehicle), verify(token)
+
+VehicleRepo
+
+SecretBox
+
+Encrypts and decrypts Wi-Fi passwords
+
+seal(text), open(blob)
+
+Key from the environment
+
+VehicleRepo, RiderRepo,
+DeviceRepo, CommandRepo,
+NetworkRepo, ClipRepo
+
+SQLAlchemy access to the C2 tables; every
+query filtered by tenant_id
+
+get, list, insert, update with row
+locks where noted
+
+C5 session
+
+TelemetryRepo,
+StateHistoryRepo,
+EventReadRepo
+
+Motor access to vehicle_telemetry and
+device_state_history (writes) and
+audio_events (read only)
+
+insert(doc), find(tenant, vehicle,
+range)
+
+C5 MongoDB client
+
+3.1.2 Edge agent and simulator classes
+Figure 24 shows the edge agent. The same EdgeAgent class runs as the live car on the laptop (MicSource) and as each simulated
+car (DatasetSource), so the simulator exercises the code we demonstrate. Table 50 gives each class its responsibility.
+
+Figure 24: Class diagram of the edge agent and the car simulator
+
+Table 50: Classes of the edge agent and the simulator
+Class
+
+Responsibility
+
+Key operations
+
+Notes
+
+EdgeAgent
+
+Reads agent.yaml, starts the threads, routes control messages,
+stops cleanly
+
+run(), stop()
+
+One per car
+
+AudioSource,
+MicSource,
+DatasetSource
+
+Deliver 0.1 s blocks of 16 kHz mono audio; MicSource reads
+the microphone with sounddevice into a 10 s ring buffer;
+DatasetSource replays a random file of datasets/<class>/ every
+20 to 60 s with silence between
+
+frames()
+
+The class folder becomes
+edge.class in the simulator
+
+PreFilter
+
+Keeps a running noise baseline (median level of the last 30 s)
+and fires when a block is more than threshold above it; the
+margin in dB is 30 × detectionThreshold, so 0.40 means 12 dB
+
+level_db(block), trigger()
+
+No ML on the edge this semester
+(Table 1 of Deliverable #1)
+
+ClipCutter
+
+Takes 2 s before the trigger and 3 s after, applies micGainDb,
+writes a 5 s WAV (PCM16, mono, 16 kHz)
+
+cut(buffer, t)
+
+2 s pre-roll as in Table 78 in Part
+III
+
+Uploader
+
+POST /ingest/clips with the device token and IdempotencyKey; retries after 1, 2, 4 s; on 401 stops and asks for reprovisioning
+
+post(clip, eventId)
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+Class
+
+Responsibility
+
+Key operations
+
+Notes
+
+MqttLink
+
+paho-mqtt client with TLS, keep-alive 30 s, last will {state:
+offline}; reconnect with back-off 1 to 30 s
+
+publish(), subscribe(),
+on_connect()
+
+Publishes status online on
+connect
+
+Telemetry
+
+Every 10 s publishes speed, drive mode, ignition, location,
+tick()
+network, agent health, and the devices[] list with ok, muted, and
+level
+
+ControlHandler
+
+Applies SET_CONFIG, SET_NETWORK, MUTE, UNMUTE,
+RESTART_AGENT; saves agent.yaml; publishes the ack with
+the reported values
+
+on_config(msg),
+Rejects values out of range itself
+on_command(msg), ack() as a second check
+
+ContextSource,
+RouteContext
+
+Vehicle context for events and telemetry; the live car reads a
+command-line flag (parked or driving); simulated cars drive a
+loop around SJSU
+
+context()
+
+Outbox (M)
+
+SQLite table (seq, kind, topic, payload_json, clip_path,
+attempts) that keeps events and clips while offline and sends
+them in order on reconnect
+
+put(), drain()
+
+FR-C2-08, Deliverable #1
+Section 4.1.2
+
+CarSimulator
+
+Starts n EdgeAgent threads with their own agent.yaml files;
+scenario files script events for the demo (for example AV-12
+parked at 23:10 with a scream)
+
+start(n), scenario(file)
+
+Section 7 of Deliverable #1
+
+AgentConfig
+
+The agent.yaml written by provisioning; saved again after each
+applied setting
+
+load(), save()
+
+The heartbeat of BR-C2-18
+
+3.1.3 Entity and front-end classes
+Table 51 lists the domain classes the services pass around. Vehicle, Device, DeviceCommand, NetworkProfile, Clip, and Ride
+map to the MySQL tables of Section 3.3; TelemetrySample and StateChange are MongoDB documents; DeviceStatus,
+CommandStatus, and VehicleStatus are the enumerations of the state machines of Section 3.4.
+Table 51: Entity classes
+Class
+
+Attributes
+
+Relations
+
+Vehicle
+
+vehicleId (code), tenantId, vin, make, model, year, label, status,
+retentionDays, mqttUsername, credentialVersion, provisionedAt
+
+Has many Device, NetworkProfile, Ride, Clip
+
+Device
+
+deviceId (code), vehicleId, type, position, serialNo, firmwareVersion,
+status, muted, lastSeenAt, faultReason, config, desiredConfig,
+configVersion, configState
+
+Belongs to Vehicle; has many
+DeviceCommand
+
+DeviceCommand
+
+commandId, vehicleId, deviceId?, command, params, status, attempts,
+issuedBy, sentAt, ackedAt, result
+
+Belongs to Device or, for SET_NETWORK,
+to Vehicle
+
+NetworkProfile
+
+priority, ssid, securityType, passwordSet (the sealed password stays in the Belongs to Vehicle
+repository)
+
+Clip
+
+clipId, eventId, vehicleId, deviceId, s3Key, sizeBytes, durationMs,
+sampleRate, capturedAt, expireAt, state, deletedBy
+
+Belongs to Vehicle and Device; matched to an
+audio event by clipId
+
+Ride
+
+vehicleId, userId, validFrom, validTo
+
+Rider of a trip (C3 reads it for notifications)
+
+TelemetrySample,
+StateChange
+
+The documents of Table 56
+
+MongoDB only
+
+The C2 pages are React components inside the C1 shell (React 18, TypeScript, Material UI, as in Table 17 of Deliverable #1).
+Table 52 lists them; VehicleDataPanel is exported so that the C1 owner vehicle page can embed the Data tab.
+Table 52: Front-end classes of C2
+Component or hook
+
+Responsibility
+
+API and events used
+
+VehiclesPage
+
+Tenant selector (staff), vehicle list with connection chips, Add
+vehicle dialog
+
+GET, POST /vehicles; device.status
+
+VehicleDetailPage
+
+Header with status, Provision and Retire; Devices, Network,
+Data tabs
+
+GET /vehicles/{id}; DELETE /vehicles/{id}
+
+DeviceTable, DeviceEditor
+
+Device rows with Edit, Disable, Delete; editor with gain,
+threshold, Apply, Mute, and the command state
+
+/devices, PUT config, POST commands; device.status
+
+ProvisionDialog
+
+Shows the one-time result, Download agent.yaml, Rotate
+
+POST /vehicles/{id}/provision
+
+NetworkTab
+
+Profiles table, Save network, last applied, current link
+
+GET, PUT /vehicles/{id}/network
+
+VehicleDataPanel
+
+Filters, clip table, Play, Delete, retention; used by C2 and
+embedded by C1
+
+GET /vehicles/{id}/clips, /clips/{id}/url, DELETE
+/clips/{id}, PUT retention
+
+useDeviceStatus, useCommand Subscribe to device.status through the C1 WsHub; poll GET
+/commands/{id} every 2 s while the socket is down
+
+/ws; GET /commands/{id}
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+
+3.2 Program function descriptions
+Table 53 lists the functions that carry the business rules, with their inputs, outputs, and the rules of Section 4 they enforce. Each
+runs in one database transaction; calls to S3 and the broker happen before the commit, so a failure leaves nothing half written (S3
+objects without a row are removed by the same request on rollback).
+Table 53: Rule-carrying functions
+Function
+
+Input
+
+Output
+
+Rules and errors
+
+VehicleService.create
+
+scope, {vehicleId, vin, make,
+model, year, label?,
+retentionDays?}
+
+Vehicle REGISTERED; default
+subscriptions
+
+BR-C2-02, -03; 409, 422
+
+VehicleService.retire
+
+vehicle, user
+
+Vehicle RETIRED
+
+BR-C2-04; revoke login and token,
+disable devices, supersede commands,
+end rides
+
+DeviceService.add
+
+vehicle, {type, position, serialNo,
+firmwareVersion?}
+
+Device PROVISIONING, config v1
+
+BR-C2-05; 409 serial
+
+DeviceService.set_enabled
+
+device, on
+
+Device DISABLED or
+PROVISIONING; MUTE or
+UNMUTE command
+
+BR-C2-10
+
+ProvisioningService.provision
+
+vehicle, rotate
+
+Secrets once; vehicle
+PROVISIONED
+
+BR-C2-07, -08, -09; 409, 422, 502
+
+CommandService.set_config
+
+device, {micGainDb?,
+detectionThreshold?}, user
+
+Command SENT or PENDING;
+device config_state PENDING
+
+BR-C2-11, -12, -13
+
+CommandService.on_ack
+
+status message of type ack
+
+Command APPLIED, REJECTED, or BR-C2-13; unknown commandId
+FAILED; device config confirmed;
+ignored
+device.status
+
+CommandService.on_timeout,
+resend_pending
+
+timer every 5 s; vehicle back online TIMED_OUT; resend once
+
+BR-C2-13
+
+NetworkService.put
+
+vehicle, profiles[]
+
+Profiles stored sealed;
+SET_NETWORK command
+
+BR-C2-25
+
+ClipService.ingest
+
+device token, multipart form
+
+Clip STORED; 201 or 200
+
+BR-C2-14 to -17 (FC1)
+
+ClipService.fetch
+
+clipId, service token
+
+WAV bytes
+
+BR-C2-22; 404, 410
+
+ClipService.delete
+
+clip, user
+
+Clip DELETED; object removed
+
+BR-C2-22, -24; 410
+
+StatusTracker.heartbeat, evaluate,
+sweep
+
+telemetry list, status message, timer Device status; history; device.status
+every 10 s
+
+BR-C2-18 to -21 (FC2)
+
+RetentionJob.run
+
+daily 03:15 UTC
+
+Expired clips removed
+
+BR-C2-23, -24
+
+PreFilter.trigger (agent)
+
+0.1 s block, threshold
+
+Trigger time or none
+
+Margin = 30 × detectionThreshold dB
+over the 30 s median; at most one
+trigger per 5 s
+
+ControlHandler.on_config (agent)
+
+config message
+
+Applied settings; ack
+
+Same ranges as BR-C2-12; REJECTED
+with reason otherwise
+
+3.2.1 Pseudocode of the rule-carrying functions
+The pseudocode below is close to the Python we will write; repository calls stand for single SQL statements, and tx is the
+request transaction.
+def ClipService.ingest(token, form):
+
+# FC1, BR-C2-14..17
+
+claims = DeviceTokenIssuer.verify(token)
+
+# 401 on bad signature or expiry
+
+v = VehicleRepo.get(claims.tenantId, claims.vehicleId)
+if v is None or v.status == RETIRED or claims.ver != v.credential_version:
+raise Unauthorized()
+d = DeviceRepo.get_by_code(v, form.deviceId)
+if d is None or d.type not in (MIC_INTERIOR, MIC_EXTERIOR) or d.status == DISABLED or d.muted:
+raise BusinessRule('BR-C2-15', field='deviceId')
+old = ClipRepo.by_event(v, form.eventId)
+if old: return 200, old.view()
+
+# idempotent repeat (BR-C2-16)
+
+if ClipRepo.count_since(v, now() - 60s) >= 12: raise RateLimit(retry_after=10)
+wav = WavInfo.parse(form.file)
+
+# reads the RIFF header only
+
+if form.file.size > 512 KB: raise PayloadTooLarge()
+if not (wav.pcm16 and wav.channels == 1 and wav.rate == 16000): raise UnsupportedMedia(wav)
+if not 4500 <= wav.duration_ms <= 5500: raise Validation('durationMs')
+if not now() - 24h <= form.ts <= now() + 5min: raise Validation('ts')
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+clip_id = new_hex_id(8)
+
+# retried on a unique-key clash
+
+key = f'tenants/{v.tenant_code}/vehicles/{v.code}/{form.ts:%Y/%m/%d}/{clip_id}.wav'
+StorageClient.put(key, form.file, timeout=5s)
+
+# 502 if S3 fails, nothing kept
+
+ClipRepo.insert(clip_id, v, d, form.eventId, key, wav, captured_at=form.ts,
+expire_at=form.ts + v.retention_days days, state=STORED)
+return 201, {clipId, s3Key: key, durationMs, sampleRate: 16000, expireAt}
+def ProvisioningService.provision(v, rotate):
+
+# BR-C2-07..09
+
+if v.status == RETIRED: raise BusinessRule('BR-C2-07')
+if v.status in (PROVISIONED, ACTIVE) and not rotate: raise Conflict('already provisioned')
+VehicleRepo.lock(v)
+
+# SELECT ... FOR UPDATE
+
+DeviceService.ensure_gateway(v)
+user = f'{v.tenant_code}-{v.code}'; pw = token_urlsafe(18)
+
+# 24 characters
+
+if v.mqtt_username: BrokerAdmin.set_password(user, pw)
+else: BrokerAdmin.create_car(user, pw, acl=car_acl(v))
+
+# role car-{user}, Section 2.8
+
+v.mqtt_username = user; v.credential_version += 1
+
+# old token stops working
+
+if v.status == REGISTERED: v.status = PROVISIONED
+v.provisioned_at = now(); AuditLogger.write('PROVISION', v, rotate=rotate)
+token = DeviceTokenIssuer.issue(v)
+
+# role DEVICE, ver, 180 days
+
+return {mqtt: {host, 8883, user, pw, clientId: user, topicRoot}, api: {baseUrl, token},
+devices: DeviceRepo.codes(v), agentYaml: agent_yaml(v, user, pw, token)}
+def CommandService.set_config(d, values, user):
+
+# BR-C2-11..13
+
+if d.type not in MICS or d.status == DISABLED or d.vehicle.status in (REGISTERED, RETIRED):
+raise BusinessRule('BR-C2-11')
+check_ranges(values)
+
+# gain -12..24 integer, threshold 0.10..0.95
+
+new = {**d.desired_config, **values}; d.config_version += 1
+CommandRepo.supersede_open(d, SET_CONFIG)
+
+# PENDING, SENT, TIMED_OUT -> SUPERSEDED
+
+c = CommandRepo.insert(d, SET_CONFIG, params={version: d.config_version, settings: new}, by=user)
+d.desired_config = new; d.config_state = PENDING
+send(c); return c
+def CommandService.send(c):
+gw = DeviceRepo.gateway(c.vehicle)
+if gw.status in (ONLINE, FAULT):
+MqttGateway.publish(topic(c), c.message(), qos=1)
+c.status = SENT; c.sent_at = now(); c.attempts += 1
+# otherwise the command stays PENDING until the car is back (resend_pending)
+def CommandService.on_ack(msg):
+c = CommandRepo.get(msg.commandId)
+if c is None or c.status not in (SENT, TIMED_OUT): return
+
+# late or duplicate ack
+
+c.status = {APPLIED: APPLIED, REJECTED: REJECTED, FAILED: FAILED}[msg.result]
+c.acked_at = now(); c.result = msg
+if c.command == SET_CONFIG:
+d = c.device
+if c.status == APPLIED: d.config = msg.reported; d.config_state = CONFIRMED
+else: d.config_state = REJECTED
+if c.command in (MUTE, UNMUTE) and c.status == APPLIED: c.device.muted = (c.command == MUTE)
+EventBus.publish('device.status', status_payload(c.device, config=c))
+def CommandService.on_timeout():
+
+# every 5 s
+
+for c in CommandRepo.sent_before(now() - 30s):
+c.status = TIMED_OUT
+if c.command == SET_CONFIG: c.device.config_state = TIMED_OUT
+EventBus.publish('device.status', status_payload(c.device, config=c))
+def CommandService.resend_pending(v):
+
+# called when the gateway turns ONLINE
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+for c in CommandRepo.open_for(v, statuses=(PENDING, TIMED_OUT)):
+if c.attempts < 2: send(c)
+
+# each command at most twice
+
+def StatusTracker.heartbeat(vehicle, devices_list, at):
+
+# from telemetry, BR-C2-18, -20
+
+gw = DeviceRepo.gateway(vehicle); gw.last_seen_at = at; evaluate(gw, at)
+for item in devices_list:
+d = DeviceRepo.get_by_code(vehicle, item.deviceId)
+if d is None or d.deleted_at: continue
+d.last_seen_at = at; d.reported_ok = item.ok; d.fault_reason = item.reason
+d.muted = item.muted; evaluate(d, at)
+def StatusTracker.evaluate(d, now):
+
+# FC2, BR-C2-19..21
+
+if d.status == DISABLED: new = DISABLED
+elif gateway_lost(d) or d.last_seen_at is None or now - d.last_seen_at > 30s:
+new = PROVISIONING if d.last_seen_at is None else OFFLINE
+elif d.reported_ok is False: new = FAULT
+else: new = ONLINE
+if new != d.status:
+old, d.status = d.status, new
+StateHistoryRepo.insert(tenantId, vehicleId, deviceId, ts=now, from=old, to=new, reason=why)
+EventBus.publish('device.status', status_payload(d))
+
+# after commit
+
+if d.type == EDGE_GATEWAY and new == ONLINE:
+if d.vehicle.status == PROVISIONED: d.vehicle.status = ACTIVE
+CommandService.resend_pending(d.vehicle)
+def StatusTracker.sweep():
+
+# every 10 s
+
+for d in DeviceRepo.stale(now() - 30s, statuses=(ONLINE, FAULT)): evaluate(d, now())
+def RetentionJob.run():
+
+# daily 03:15 UTC, BR-C2-23, -24
+
+while batch := ClipRepo.expired(now(), limit=500):
+
+# state STORED and expire_at < now
+
+for clip in batch:
+StorageClient.delete(clip.s3_key)
+
+# a missing object counts as deleted
+
+clip.state = EXPIRED
+commit()
+
+The agent's main loop, which is the same for the live car and a simulated car:
+def EdgeAgent.run():
+cfg = AgentConfig.load('agent.yaml'); link = MqttLink(cfg); link.connect()
+
+# LWT offline
+
+link.publish(status_topic, {type: 'agent', state: 'online', configVersions}, qos=1, retain=True)
+start_thread(Telemetry(cfg, link).every(10s))
+for block in source.frames():
+
+# MicSource or DatasetSource
+
+ring.append(block)
+if prefilter.trigger(block, cfg.threshold):
+wait_until(t_trigger + 3s); wav = ClipCutter.cut(ring, t_trigger, cfg.gain)
+event_id = uuid4(); clip = Uploader.post(wav, cfg.device, event_id)
+
+# retries 1, 2, 4 s
+
+event = {eventId: event_id, deviceId, channel, ts, clip, edge, location, context}
+if clip: link.publish(event_topic, event, qos=1)
+else: Outbox.put(event, wav)
+
+# M: sent again on reconnect
+
+3.2.2 Flowcharts
+Figure 25 is the flowchart of the upload (FC1), and Figure 26 the flowchart of the status evaluation (FC2). They are the two
+functions that run for every car all the time, so their order of checks matters: the cheap token and device checks come before any
+work on the file, and a status that does not change writes nothing but last_seen_at.
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+
+Figure 25: Flowchart FC1, the clip upload
+
+Figure 26: Flowchart FC2, the device status evaluation
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+
+3.3 Data and DB design
+C2 keeps what needs transactions and foreign keys in MySQL (vehicles, devices, commands, network profiles, clips), writes the
+two high-volume time series to MongoDB (telemetry and device state changes), and keeps the audio in S3. Figure 27 is the part
+of the Deliverable #1 ERD that C2 owns, with the changes of this design, and Table 54 describes each table. Every table carries
+tenant_id and every index that a tenant query uses starts with it (FR-C5-03).
+
+Figure 27: ERD of the MySQL tables owned by C2
+
+3.3.1 MySQL tables owned by C2
+Table 54: MySQL tables owned by C2
+Table
+
+Columns
+
+Keys and indexes
+
+Rows at our scale
+
+vehicle
+
+vehicle_id, tenant_id, vehicle_code, vin, make, model,
+model_year, label, retention_days (default 90), iot_thing_name
+(MQTT username), credential_version, status, provisioned_at,
+created_at, updated_at, retired_at
+
+PK vehicle_id; UQ (tenant_id, vehicle_code);
+UQ vin; UQ iot_thing_name; IX (tenant_id,
+status)
+
+6 seeded + test cars
+
+vehicle_rider
+
+vehicle_id, user_id, valid_from, valid_to, tenant_id
+
+PK (vehicle_id, user_id, valid_from); IX
+(tenant_id, vehicle_id, valid_to)
+
+A few
+
+device
+
+device_id, tenant_id, vehicle_id, device_code, device_type,
+position, serial_no, firmware_version, status, muted,
+last_seen_at, fault_reason, config_json, desired_config_json,
+config_version, config_state, created_at, updated_at, deleted_at
+
+PK device_id; UQ device_code; UQ
+serial_no; IX (tenant_id, vehicle_id); IX
+(status, last_seen_at) for the sweep
+
+About 20
+
+device_comman
+d
+
+command_id, tenant_id, vehicle_id, device_id (null for
+SET_NETWORK), issued_by, command, params_json, status,
+attempts, created_at, sent_at, acked_at, result_json
+
+PK command_id; IX (tenant_id, device_id,
+created_at); IX (status, sent_at) for the
+timeout
+
+Hundreds
+
+network_config
+
+network_id, tenant_id, vehicle_id, priority, ssid, security_type,
+password_enc, cellular_apn, updated_by, updated_at
+
+PK network_id; UQ (vehicle_id, priority)
+
+A few
+
+clip
+
+clip_id, tenant_id, vehicle_id, device_id, event_id, s3_key,
+size_bytes, duration_ms, sample_rate, captured_at, uploaded_at,
+expire_at, state, deleted_by, deleted_at
+
+PK clip_id; UQ (vehicle_id, event_id); UQ
+s3_key; IX (tenant_id, vehicle_id,
+captured_at); IX (state, expire_at) for the job
+
+Thousands in the
+load test
+
+The DDL below is what the C2 migration creates (MySQL 8, InnoDB, utf8mb4, timestamps in UTC). Foreign keys to the C1
+tables tenant and app_user are declared because C5 owns one schema; C2 never writes those tables.
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+CREATE TABLE vehicle (
+vehicle_id BIGINT AUTO_INCREMENT PRIMARY KEY,
+tenant_id BIGINT NOT NULL REFERENCES tenant(tenant_id),
+vehicle_code VARCHAR(16) NOT NULL, vin CHAR(17) NOT NULL,
+make VARCHAR(40) NOT NULL, model VARCHAR(40) NOT NULL, model_year SMALLINT NOT NULL,
+label VARCHAR(64) NULL, retention_days SMALLINT NOT NULL DEFAULT 90,
+iot_thing_name VARCHAR(64) NULL, credential_version INT NOT NULL DEFAULT 0,
+status ENUM('REGISTERED','PROVISIONED','ACTIVE','RETIRED') NOT NULL DEFAULT 'REGISTERED',
+provisioned_at DATETIME(3) NULL, retired_at DATETIME(3) NULL,
+created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+UNIQUE KEY uq_vehicle_code (tenant_id, vehicle_code), UNIQUE KEY uq_vin (vin),
+UNIQUE KEY uq_thing (iot_thing_name), KEY ix_vehicle_status (tenant_id, status),
+CONSTRAINT ck_retention CHECK (retention_days BETWEEN 7 AND 365));
+CREATE TABLE device (
+device_id BIGINT AUTO_INCREMENT PRIMARY KEY,
+tenant_id BIGINT NOT NULL, vehicle_id BIGINT NOT NULL REFERENCES vehicle(vehicle_id),
+device_code VARCHAR(16) NOT NULL,
+device_type ENUM('MIC_INTERIOR','MIC_EXTERIOR','CAMERA','EDGE_GATEWAY') NOT NULL,
+position VARCHAR(32) NOT NULL, serial_no VARCHAR(64) NOT NULL, firmware_version VARCHAR(32) NULL,
+status ENUM('PROVISIONING','ONLINE','OFFLINE','FAULT','DISABLED') NOT NULL DEFAULT 'PROVISIONING',
+muted BOOLEAN NOT NULL DEFAULT FALSE, last_seen_at DATETIME(3) NULL, fault_reason VARCHAR(120) NULL,
+config_json JSON NULL, desired_config_json JSON NULL, config_version INT NOT NULL DEFAULT 1,
+config_state ENUM('NONE','PENDING','CONFIRMED','REJECTED','TIMED_OUT') NOT NULL DEFAULT 'NONE',
+created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3), updated_at DATETIME(3) NULL,
+deleted_at DATETIME(3) NULL,
+UNIQUE KEY uq_device_code (device_code), UNIQUE KEY uq_serial (serial_no),
+KEY ix_device_vehicle (tenant_id, vehicle_id), KEY ix_device_sweep (status, last_seen_at));
+CREATE TABLE device_command (
+command_id BIGINT AUTO_INCREMENT PRIMARY KEY,
+tenant_id BIGINT NOT NULL, vehicle_id BIGINT NOT NULL REFERENCES vehicle(vehicle_id),
+device_id BIGINT NULL REFERENCES device(device_id),
+issued_by BIGINT NOT NULL REFERENCES app_user(user_id),
+command ENUM('SET_CONFIG','SET_NETWORK','MUTE','UNMUTE','RESTART_AGENT','FIRMWARE_UPDATE') NOT NULL,
+params_json JSON NULL,
+status ENUM('PENDING','SENT','APPLIED','REJECTED','FAILED','TIMED_OUT','SUPERSEDED') NOT NULL,
+attempts TINYINT NOT NULL DEFAULT 0, sent_at DATETIME(3) NULL, acked_at DATETIME(3) NULL,
+result_json JSON NULL, created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+KEY ix_cmd_device (tenant_id, device_id, created_at), KEY ix_cmd_timeout (status, sent_at));
+CREATE TABLE clip (
+clip_id CHAR(8) PRIMARY KEY, tenant_id BIGINT NOT NULL,
+vehicle_id BIGINT NOT NULL REFERENCES vehicle(vehicle_id),
+device_id BIGINT NOT NULL REFERENCES device(device_id),
+event_id CHAR(36) NOT NULL, s3_key VARCHAR(255) NOT NULL,
+size_bytes INT NOT NULL, duration_ms INT NOT NULL, sample_rate INT NOT NULL,
+captured_at DATETIME(3) NOT NULL, uploaded_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+expire_at DATETIME(3) NOT NULL, state ENUM('STORED','DELETED','EXPIRED') NOT NULL DEFAULT 'STORED',
+deleted_by BIGINT NULL REFERENCES app_user(user_id), deleted_at DATETIME(3) NULL,
+UNIQUE KEY uq_clip_event (vehicle_id, event_id), UNIQUE KEY uq_clip_key (s3_key),
+KEY ix_clip_list (tenant_id, vehicle_id, captured_at), KEY ix_clip_expiry (state, expire_at));
+-- vehicle_rider and network_config follow the columns of the table above.
+
+Changes to the Deliverable #1 schema. Table 55 lists what this design adds to the C2 part of the ERD, so that the ERD of
+Deliverable #1 and the C5 migrations stay in step. None of them changes a table another component writes; C1 and C3 read
+vehicle and vehicle_rider and gain only columns.
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+
+Table 55: Changes to the C2 tables of Deliverable #1
+Table
+
+Change
+
+Reason
+
+vehicle
+
+Add vehicle_code (the public AV-01 that the C1 and C3 designs use),
+label, credential_version, provisioned_at, retired_at; status values
+REGISTERED, PROVISIONED, ACTIVE, RETIRED
+
+Public id in topics and keys; token revocation (BR-C209); lifecycle (Section 3.4)
+
+device
+
+Add device_code (dev-0112), muted, fault_reason, desired_config_json,
+config_version, config_state, deleted_at
+
+Public id in events; MUTE command; confirmed versus
+pending settings (O4); soft delete
+
+device_command
+
+Add vehicle_id, attempts, sent_at, result_json; device_id nullable; status
+values of Section 3.4
+
+SET_NETWORK is per car; timeout and resend
+
+network_config
+
+Add tenant_id and UQ (vehicle_id, priority); password column named
+password_enc
+
+Tenant filter; three ordered profiles; encryption
+
+clip
+
+New table
+
+clipId lookup for the worker, idempotent upload, deletion
+and retention of S3 objects, clips not yet classified
+
+3.3.2 MongoDB documents written by C2
+C2 writes the two collections that Table 97 in Part III specifies with their indexes, shard keys, and retention (vehicle_telemetry,
+a time-series collection [7] kept 30 days, and device_state_history, kept 60 days). We do not redefine them; Table 56 gives the
+fields C2 fills. C2 also reads audio_events, which the worker writes, to show the class, confidence, and alert of each clip.
+Table 56: Fields of the MongoDB documents written by C2
+Collection
+
+Fields C2 writes
+
+Written by
+
+vehicle_telemetry
+
+ts (timeField); meta {tenantId, vehicleId} (metaField); speedKph, driveMode,
+ignition, location (GeoJSON point), network {type, ssid?, rssiDbm?}, agent
+{version, uptimeS, cpuPct, outboxDepth}, devices [{deviceId, ok, muted,
+levelDb?}]
+
+TelemetryIngestor, one document per
+telemetry message (every 10 s per car)
+
+device_state_history
+
+tenantId, vehicleId, deviceId, ts, from, to, reason (HEARTBEAT, TIMEOUT,
+LAST_WILL, FAULT, ADMIN), lastSeenAt
+
+StatusTracker, one document per status
+change
+
+audio_events (read only) clip.clipId, ts, deviceId, channel, inference.topK, decision.alert,
+decision.alertId, decision.alertType
+
+Written by the C4 worker and C3; C2 reads
+with the index {tenantId, vehicleId, ts}
+
+// vehicle_telemetry document (example values, AV-01 driving)
+{ "ts": ISODate("2026-11-04T21:42:00Z"), "meta": { "tenantId": "tA", "vehicleId": "AV-01" },
+"speedKph": 48, "driveMode": "AUTONOMOUS", "ignition": true,
+"location": { "type": "Point", "coordinates": [-121.8811, 37.3352] },
+"network": { "type": "WIFI", "ssid": "Nguyen-Home", "rssiDbm": -58 },
+"agent": { "version": "0.4.1", "uptimeS": 5321, "cpuPct": 14, "outboxDepth": 0 },
+"devices": [ { "deviceId": "dev-0111", "ok": true, "muted": false, "levelDb": 41.2 },
+{ "deviceId": "dev-0112", "ok": true, "muted": false, "levelDb": 55.8 } ] }
+// device_state_history document
+{ "tenantId": "tB", "vehicleId": "AV-13", "deviceId": "dev-1320", "ts": ISODate("2026-11-04T22:10:31Z"),
+"from": "ONLINE", "to": "OFFLINE", "reason": "LAST_WILL",
+"lastSeenAt": ISODate("2026-11-04T22:10:12Z") }
+
+Table 57 shows which index serves each query of C2, which is also how we will check the indexes with explain() during the load
+test.
+Table 57: Query patterns of C2 and the index that serves each
+Query
+
+Store
+
+Index
+
+Vehicle list of a tenant by status
+
+MySQL vehicle
+
+ix_vehicle_status (tenant_id, status)
+
+Devices of a car; device summary for C1
+
+MySQL device
+
+ix_device_vehicle (tenant_id, vehicle_id)
+
+Sweep: devices ONLINE or FAULT not seen for
+30 s
+
+MySQL device
+
+ix_device_sweep (status, last_seen_at)
+
+Commands SENT more than 30 s ago
+
+MySQL device_command
+
+ix_cmd_timeout (status, sent_at)
+
+Clips of a car in a time range (Data tab)
+
+MySQL clip
+
+ix_clip_list (tenant_id, vehicle_id, captured_at)
+
+Clips to expire
+
+MySQL clip
+
+ix_clip_expiry (state, expire_at)
+
+Upload repeat check
+
+MySQL clip
+
+uq_clip_event (vehicle_id, event_id)
+
+Class and alert of the clips shown
+
+MongoDB audio_events
+
+{tenantId, vehicleId, ts} (Table 97, Part III); match on clip.clipId
+in the same range
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+Query
+
+Store
+
+Index
+
+Latest telemetry of a car (network tab, telemetry
+API)
+
+MongoDB vehicle_telemetry
+
+Time-series bucket on meta, ts descending
+
+Status history of a device
+
+MongoDB device_state_history
+
+{tenantId, deviceId, ts}
+
+3.3.3 Object storage and secrets
+Clips are stored in the scicp-clips bucket under
+tenants/{tenantId}/vehicles/{vehicleId}/YYYY/MM/DD/{clipId}.wav, the key format that the C1 and C3
+
+designs already use. The date is the capture date in UTC, so the daily retention job and a manual cleanup can work by prefix.
+Objects are private; the browser plays them through a presigned GET [9] that is valid for 15 minutes, and the worker reads
+them through C2. An S3 lifecycle rule deletes any clip object older than 400 days as a backstop in case a job run is missed. A
+5 s mono 16 kHz WAV is about 160 KB; at our scale (one live car and ten simulated cars uploading one clip a minute during
+work sessions) this is well under 1 GB for the semester.
+Secrets. The MQTT passwords live only in Mosquitto's dynamic-security.json as salted PBKDF2 hashes; C2 keeps the
+username and the credential version. The device-token signing key, the SecretBox key for Wi-Fi passwords, and the dynamic
+security admin password come from the instance's .env file, which is not in Git; in the full design they move to AWS Secrets
+Manager (Deliverable #1, Table 6).
+
+3.4 Behavior analysis
+3.4.1 State diagrams
+Figure 28 shows the three state machines of C2. The device status is the one the brief and Deliverable #1 (FR-C2-05) ask for,
+driven by what the car reports; the vehicle lifecycle follows provisioning; and every message C2 sends to a car is a command
+with its own life, which is what lets the page tell a pending setting from a confirmed one. Table 58 lists each state and the events
+that leave it.
+
+Figure 28: State diagrams of the device, the vehicle, and the command
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+
+Table 58: States and the events that leave them
+Machine
+
+State
+
+Leaves on
+
+To
+
+Device
+
+PROVISIONING
+
+First heartbeat with ok; disabled
+
+ONLINE; DISABLED
+
+Device
+
+ONLINE
+
+30 s without heartbeat or the car's last will; device reported
+not ok; disabled
+
+OFFLINE; FAULT; DISABLED
+
+Device
+
+OFFLINE
+
+Heartbeat with ok (or not ok); disabled
+
+ONLINE (FAULT); DISABLED
+
+Device
+
+FAULT
+
+Reported ok again; 30 s without heartbeat; disabled
+
+ONLINE; OFFLINE; DISABLED
+
+Device
+
+DISABLED
+
+Engineer enables it
+
+PROVISIONING until the next
+heartbeat
+
+Vehicle
+
+REGISTERED
+
+Provision; retire
+
+PROVISIONED; RETIRED
+
+Vehicle
+
+PROVISIONED
+
+First status online from the agent; rotate (stays); revoke;
+retire
+
+ACTIVE; PROVISIONED;
+REGISTERED; RETIRED
+
+Vehicle
+
+ACTIVE
+
+Rotate (stays); retire
+
+ACTIVE; RETIRED
+
+Vehicle
+
+RETIRED
+
+None (final)
+
+-
+
+Command
+
+PENDING
+
+Car online and the message published; newer
+SET_CONFIG for the device; device or car disabled,
+deleted, retired
+
+SENT; SUPERSEDED;
+SUPERSEDED
+
+Command
+
+SENT
+
+Ack APPLIED; ack REJECTED or FAILED; 30 s without
+ack; newer SET_CONFIG
+
+APPLIED; REJECTED or FAILED;
+TIMED_OUT; SUPERSEDED
+
+Command
+
+TIMED_OUT
+
+Car reconnects and attempts is 1: sent again; late ack
+APPLIED; newer SET_CONFIG
+
+SENT; APPLIED; SUPERSEDED
+
+Command
+
+APPLIED, REJECTED,
+FAILED, SUPERSEDED
+
+None (final)
+
+-
+
+3.4.2 Sequence diagrams
+Figure 29 is scenario SC2, provisioning a new car and its first connection. The two things to note are that the secrets travel to the
+browser once and never back, and that it is the car's own status message, not the engineer's click, that makes the car ACTIVE and
+its devices ONLINE.
+
+Figure 29: Sequence diagram SQ1, provisioning AV-02 and connecting its agent (scenario SC2)
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+
+Figure 30 is scenario SC3. The answer to the browser is 202 with the command in state SENT; the "car confirmed" mark appears
+only when the agent's acknowledgement has been stored and pushed back through the C1 WebSocket. If the car is offline when
+the engineer presses Apply, the same diagram starts with the command PENDING and the publish happens in resend_pending
+when the gateway turns ONLINE.
+
+Figure 30: Sequence diagram SQ2, changing a microphone setting (scenario SC3)
+
+Figure 31 is scenario SC4 and joins this design to the C3 design: the clip goes to C2 by HTTPS, the event goes from the car to the
+worker by MQTT, and the worker gets the clip back from C2 by clipId. C2 is not on the path of the event, so an outage of the API
+delays the clip fetch (the worker retries and then reads S3 directly) but never loses the event.
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+
+Figure 31: Sequence diagram SQ3, from capture to the worker (scenario SC4)
+
+3.4.3 Design decisions
+Table 59 records the decisions that shape the component, each with the alternative we did not take.
+Table 59: Design decisions
+Decision
+
+Choice and reason
+
+Alternative not taken
+
+How cars authenticate to the
+broker
+
+One username and password per car, created through
+Mosquitto dynamic security with an ACL role per car;
+works on one instance, revocable at once
+
+A shared login for all cars (no isolation); X.509 per car in
+AWS IoT Core (full design, needs IoT Core)
+
+How cars authenticate uploads
+
+A device JWT bound to the vehicle and its credential
+version
+
+Reusing the MQTT password over HTTPS (would put it
+in every request); pre-signed S3 PUT per clip (full
+design; two calls per clip)
+
+How the worker gets audio
+
+GET /internal/clips/{clipId} from C2, with the s3Key as
+fallback
+
+The worker reads S3 only (works, but C2 could not
+refuse deleted clips or log access)
+
+Where clip metadata lives
+
+A MySQL clip table owned by C2
+
+Only in audio_events (owned by C3, written after
+classification, so unclassified and deleted clips could not
+be listed)
+
+What counts as a heartbeat
+
+The telemetry message every 10 s, plus the broker's last will
+
+A separate heartbeat topic (more traffic for the same
+information)
+
+How settings reach the car
+
+A command row per message with acknowledgement and
+one resend; the device keeps confirmed and desired config
+separately
+
+Retained config messages per device (the car would
+apply them on reconnect, but C2 could not tell what the
+car really has)
+
+What happens to old data on
+retention change
+
+New retention applies to clips captured from now on;
+expire_at is fixed at upload, as expireAt in audio_events
+
+Recomputing every existing clip (two stores to update,
+and a shorter period would delete clips at once without
+warning)
+
+Delete or retire vehicles
+
+Retire only; rows stay for alerts and history
+
+Hard delete with cascades (would break alerts and audit)
+
+4. Component Business Logics
+Table 60 states the 26 business rules of C2 and the class that enforces each. The decision tables after it cover the rules with more
+than one condition; a rule with one condition (a range, a format) is stated in Table 60 only. Each column of a decision table is one
+unit test, so the tables are also the test plan of the services: about fifty cases in all, run with pytest against the seeded data.
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+
+Table 60: Business rules of C2
+Rule
+
+Statement
+
+Enforced by
+
+BR-C2-01
+
+Tenant roles act on their own tenant only; IOT_ENGINEER, SERVICE_STAFF, and SYS_ADMIN
+pass tenantId; only IOT_ENGINEER writes vehicles, devices, provisioning, settings, commands, and
+networks; owners and fleet managers may delete clips, set retention, and manage riders of their own
+cars
+
+RbacGuard, TenantContext
+(C1)
+
+BR-C2-02
+
+A tenant may have at most tenant.max_vehicles cars that are not RETIRED (BASIC 3, FLEET 50,
+ENTERPRISE 500; BR-06 of the C1 design)
+
+VehicleService
+
+BR-C2-03
+
+vehicleId matches ^[A-Z]{2}-[0-9]{2,4}$ and is unique in the tenant and never reused; the VIN has
+17 characters without I, O, Q and is unique on the platform; both are fixed after creation; model year
+1990 to next year
+
+VehicleService
+
+BR-C2-04
+
+Retiring a car is final: the broker login is deleted, the credential version is raised, all devices become
+DISABLED, open commands SUPERSEDED, open rides end; data stays until its retention ends
+
+VehicleService
+
+BR-C2-05
+
+A car has at most one EDGE_GATEWAY, four microphones, and four cameras; a device type never
+changes; serial numbers are unique on the platform; no device is added to a RETIRED car
+
+DeviceService
+
+BR-C2-06
+
+Devices are soft-deleted; the gateway of a car that is not RETIRED cannot be deleted (replace it by
+editing its serial number)
+
+DeviceService
+
+BR-C2-07
+
+A REGISTERED car may be provisioned; a PROVISIONED or ACTIVE car only with rotate; a
+RETIRED car never; provisioning creates the gateway if missing and returns the password and token
+once
+
+ProvisioningService
+
+BR-C2-08
+
+A car's login may publish only to its own audio/event, telemetry, and status topics and subscribe only
+to its own config, command, and alert topics
+
+BrokerAdmin (ACL role)
+
+BR-C2-09
+
+A device token is valid only for POST /ingest/clips, only while its ver equals the car's
+credential_version and the car is not RETIRED, and for at most 180 days
+
+DeviceTokenIssuer
+
+BR-C2-10
+
+Disabling a device sets DISABLED and, for a microphone, sends MUTE; enabling sets
+PROVISIONING and sends UNMUTE; heartbeats do not change a DISABLED device
+
+DeviceService, StatusTracker
+
+BR-C2-11
+
+SET_CONFIG, MUTE, and UNMUTE apply to microphones only, RESTART_AGENT to the
+gateway only, and none to a DISABLED device or a car that is REGISTERED or RETIRED;
+FIRMWARE_UPDATE is design only
+
+CommandService
+
+BR-C2-12
+
+micGainDb is a whole number from -12 to +24; detectionThreshold is 0.10 to 0.95 in steps of 0.01; at
+least one is given; sample rate and clip length are fixed
+
+CommandService
+
+BR-C2-13
+
+One open SET_CONFIG per device (a new one supersedes the older); send now if the gateway is
+ONLINE or FAULT, else keep PENDING; 30 s without ack is TIMED_OUT; a command is sent at
+most twice
+
+CommandService
+
+BR-C2-14
+
+An upload needs a valid device token for a car that is not RETIRED (BR-C2-09)
+
+ClipService
+
+BR-C2-15
+
+The uploading device must belong to the car, be a microphone, and be neither DISABLED nor muted
+
+ClipService
+
+BR-C2-16
+
+A repeated upload with the same eventId for the same car returns the stored clip and stores nothing
+
+ClipService
+
+BR-C2-17
+
+At most 12 clips per minute per car; at most 512 KB; RIFF WAVE PCM 16-bit mono 16 kHz; 4.5 to
+5.5 s; capture time between 24 h ago and 5 min ahead
+
+ClipService
+
+BR-C2-18
+
+A telemetry message is the heartbeat of the gateway and of every device it lists
+
+StatusTracker
+
+BR-C2-19
+
+A device is OFFLINE when its car's last will arrives or it has no heartbeat for 30 s; a device never
+heard from stays PROVISIONING
+
+StatusTracker
+
+BR-C2-20
+
+A device the agent reports not ok is FAULT with the reported reason; it returns to ONLINE when
+reported ok
+
+StatusTracker
+
+BR-C2-21
+
+Only a change of status is stored in device_state_history and published as device.status; the first
+ONLINE gateway makes a PROVISIONED car ACTIVE and resends its open commands
+
+StatusTracker
+
+BR-C2-22
+
+Clips are read by the car's tenant roles and by staff; the worker reads them through the internal call
+with the service token, and from S3 with its IAM role only when C2 does not answer; a DELETED or
+EXPIRED clip answers 410
+
+ClipService
+
+BR-C2-23
+
+Retention is 7 to 365 days per car (default 90) and applies to clips captured after the change; expire_at RetentionJob
+is fixed at upload
+
+BR-C2-24
+
+Deleting a clip removes the S3 object at once and keeps the row as DELETED with the user and time; ClipService, RetentionJob
+the daily job removes expired clips; the audio event keeps its classification
+
+BR-C2-25
+
+A car has one to three Wi-Fi profiles with distinct priorities 1 to 3; SSID 1 to 32 bytes; WPA2_PSK
+and WPA3_SAE need a password of 8 to 63 characters, OPEN none; passwords are stored encrypted,
+never returned, and sent only to that car
+
+NetworkService
+
+BR-C2-26
+
+A rider must be a RIDER user of the same tenant; validFrom is before validTo; a user has at most one
+open ride per car
+
+VehicleService
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+
+4.1 Vehicle registration and retirement
+Table 61 is the decision table of POST /vehicles. Worked example: SC1 adds AV-02 to Tenant A, which then has 2 of 3 cars, so
+V5 applies; a fourth car would be V4.
+Table 61: Decision table for adding a vehicle (BR-C2-02, BR-C2-03)
+Condition / action
+
+V1
+
+V2
+
+V3
+
+V4
+
+V5
+
+V6
+
+Caller is IOT_ENGINEER with a
+valid tenantId
+
+N
+
+Y
+
+Y
+
+Y
+
+Y
+
+Y
+
+vehicleId and VIN formats valid,
+year in range
+
+-
+
+N
+
+Y
+
+Y
+
+Y
+
+Y
+
+vehicleId or VIN already used
+
+-
+
+-
+
+Y
+
+N
+
+N
+
+N
+
+Cars not RETIRED < max_vehicles -
+
+-
+
+-
+
+N
+
+Y
+
+Y
+
+C1 default subscriptions created
+
+-
+
+-
+
+-
+
+-
+
+Y
+
+N
+
+Answer
+
+422 BR-C2-03
+
+422 BR-C2-02
+
+REGISTERED
+
+500, rolled back
+
+Table 62: Decision table for retiring a vehicle (BR-C2-04)
+Condition / action
+
+R1
+
+R2
+
+R3
+
+R4
+
+confirm is true
+
+N
+
+Y
+
+Y
+
+Y
+
+Vehicle already RETIRED
+
+-
+
+Y
+
+N
+
+N
+
+Vehicle was provisioned (has a broker login)
+
+-
+
+-
+
+N
+
+Y
+
+Delete broker login, raise credential version
+
+-
+
+-
+
+-
+
+X
+
+Devices DISABLED, commands SUPERSEDED, rides ended, status RETIRED
+
+-
+
+X
+
+X
+
+Answer
+
+200 (502 if the broker fails; nothing
+changed)
+
+4.2 Devices
+Table 63: Decision table for device changes (BR-C2-05, BR-C2-06, BR-C2-10)
+Condition / action
+
+D1
+
+D2
+
+D3
+
+D4
+
+D5
+
+D6
+
+Request
+
+add
+
+add
+
+add
+
+disable mic
+
+enable
+
+delete
+
+Car RETIRED
+
+Y
+
+N
+
+N
+
+N
+
+N
+
+N
+
+Type count already at its limit, or serial used
+
+Y
+
+N
+
+-
+
+-
+
+-
+
+Device is the gateway of a car
+not RETIRED
+
+-
+
+-
+
+-
+
+-
+
+-
+
+Y
+
+Status becomes
+
+-
+
+-
+
+PROVISIONING
+
+DISABLED
+
+PROVISIONING
+
+-
+
+Command sent
+
+-
+
+-
+
+-
+
+MUTE
+
+UNMUTE
+
+-
+
+Answer
+
+422 BR-C2-05
+
+422 or 409
+
+422 BR-C2-06
+
+4.3 Provisioning
+Table 64: Decision table for provisioning (BR-C2-07 to BR-C2-09)
+Condition / action
+
+P1
+
+P2
+
+P3
+
+P4
+
+P5
+
+Vehicle status
+
+RETIRED
+
+REGISTERED
+
+PROVISIONED or
+ACTIVE
+
+PROVISIONED or
+ACTIVE
+
+any other
+
+rotate
+
+-
+
+-
+
+N
+
+Y
+
+-
+
+Broker answers within 5 s
+
+-
+
+Y
+
+-
+
+Y
+
+N
+
+Create login and ACL role
+
+-
+
+X
+
+-
+
+-
+
+-
+
+New password; old token and
+password stop working
+
+-
+
+-
+
+-
+
+X
+
+-
+
+Vehicle status after
+
+-
+
+PROVISIONED
+
+unchanged
+
+unchanged
+
+unchanged
+
+Answer
+
+422 BR-C2-07
+
+201 secrets once
+
+201 secrets once
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+
+4.4 Settings and commands
+Table 65 decides what happens to a settings request and to the command it creates; SC3 is case C4, and the same request with the
+car switched off is C5.
+Table 65: Decision table for a setting or command (BR-C2-11 to BR-C2-13)
+Condition / action
+
+C1
+
+C2
+
+C3
+
+C4
+
+C5
+
+C6
+
+Command allowed for the device N
+type and state
+
+Y
+
+Y
+
+Y
+
+Y
+
+Y
+
+Values in range
+
+-
+
+N
+
+Y
+
+Y
+
+Y
+
+Y
+
+Open SET_CONFIG exists for
+the device
+
+-
+
+-
+
+Y
+
+N
+
+N
+
+-
+
+Gateway ONLINE or FAULT
+
+-
+
+-
+
+Y
+
+Y
+
+N
+
+-
+
+Ack within 30 s
+
+-
+
+-
+
+-
+
+Y
+
+-
+
+N, first attempt
+
+Older command becomes
+
+-
+
+-
+
+SUPERSEDED
+
+-
+
+-
+
+-
+
+New command becomes
+
+-
+
+-
+
+SENT, then by ack
+
+APPLIED
+
+PENDING
+
+TIMED_OUT, sent again on
+reconnect
+
+Answer
+
+422 BR-C2-11
+
+422 BR-C2-12
+
+202 (then device.status
+TIMED_OUT)
+
+Table 66: Decision table for an acknowledgement from the car
+Condition / action
+
+A1
+
+A2
+
+A3
+
+A4
+
+commandId known and status SENT or TIMED_OUT
+
+N
+
+Y
+
+Y
+
+Y
+
+result
+
+-
+
+APPLIED
+
+REJECTED
+
+FAILED
+
+Command status
+
+ignored
+
+APPLIED
+
+REJECTED
+
+FAILED
+
+Device config_json = reported, config_state
+CONFIRMED (SET_CONFIG)
+
+-
+
+X
+
+-
+
+-
+
+Device muted set (MUTE, UNMUTE)
+
+-
+
+X
+
+-
+
+-
+
+device.status published with config state
+
+-
+
+X
+
+X
+
+X
+
+4.5 Device status
+Table 67 is FC2 as a table; the rows are checked from the top, and the first column that matches decides. SC5 is case S3 for the
+gateway of AV-13 and then for each of its microphones.
+Table 67: Decision table for the device status (BR-C2-18 to BR-C2-21)
+Condition / action
+
+S1
+
+S2
+
+S3
+
+S4
+
+S5
+
+S6
+
+Disabled by an engineer
+
+Y
+
+N
+
+N
+
+N
+
+N
+
+N
+
+Ever heard from (last_seen_at set)
+
+-
+
+N
+
+Y
+
+Y
+
+Y
+
+Y
+
+Car's last will received, or no
+heartbeat for 30 s
+
+-
+
+-
+
+Y
+
+N
+
+N
+
+N
+
+Agent reports the device not ok
+
+-
+
+-
+
+-
+
+Y
+
+N
+
+N
+
+Status before was the same as the
+result
+
+-
+
+-
+
+-
+
+-
+
+N
+
+Y
+
+Result
+
+DISABLED
+
+PROVISIONING
+
+OFFLINE
+
+FAULT
+
+ONLINE
+
+ONLINE
+
+History document and device.status
+
+if changed
+
+if changed
+
+if changed
+
+if changed
+
+X
+
+-
+
+4.6 Clip upload
+Table 68 is FC1 as a table; SC4 is case U6, and a retry of the same upload after a lost answer is U3.
+Table 68: Decision table for an upload (BR-C2-14 to BR-C2-17)
+Condition / action
+
+U1
+
+U2
+
+U3
+
+U4
+
+U5
+
+U6
+
+U7
+
+Device token valid, version current, N
+car not RETIRED
+
+Y
+
+Y
+
+Y
+
+Y
+
+Y
+
+Y
+
+Device on the car, a microphone,
+not DISABLED or muted
+
+-
+
+N
+
+Y
+
+Y
+
+Y
+
+Y
+
+Y
+
+eventId already stored for the car
+
+-
+
+-
+
+Y
+
+N
+
+N
+
+N
+
+N
+
+Fewer than 12 clips in the last
+minute
+
+-
+
+-
+
+-
+
+N
+
+Y
+
+Y
+
+Y
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+Condition / action
+
+U1
+
+U2
+
+U3
+
+U4
+
+U5
+
+U6
+
+U7
+
+Size, format, and duration valid
+
+-
+
+-
+
+-
+
+-
+
+N
+
+Y
+
+Y
+
+S3 PUT succeeds
+
+-
+
+-
+
+-
+
+-
+
+-
+
+Y
+
+N
+
+Answer
+
+200 stored clip
+
+413 or 415
+
+4.7 Clip access, deletion, and retention
+Table 69: Decision table for clip access and deletion (BR-C2-22 to BR-C2-24)
+Condition / action
+
+K1
+
+K2
+
+K3
+
+K4
+
+K5
+
+K6
+
+Request
+
+play
+
+play
+
+delete
+
+delete
+
+internal fetch
+
+daily job
+
+Caller may see the car (BRC2-01)
+
+N
+
+Y
+
+Y
+
+Y
+
+service
+
+system
+
+Clip state STORED
+
+-
+
+Y
+
+Y
+
+N
+
+Y
+
+Y, expire_at passed
+
+Caller role is staff
+
+-
+
+-
+
+Y
+
+-
+
+-
+
+-
+
+S3 object removed, state
+
+-
+
+-
+
+-
+
+-
+
+-
+
+EXPIRED
+
+Answer
+
+200 URL 15 min
+
+200 WAV
+
+-
+
+Worked example for retention: in SC6 Anh sets AV-01 to 30 days on November 5. The crash clip of November 4 keeps
+expire_at February 2, 2027, because it was captured under 90 days; a clip captured on November 6 gets December 6, 2026. The
+audio event of each clip gets the same expireAt from the worker, so MongoDB and S3 drop them on the same day.
+
+4.8 Network settings
+Table 70: Decision table for saving Wi-Fi profiles (BR-C2-25)
+Condition / action
+
+N1
+
+N2
+
+N3
+
+N4
+
+N5
+
+1 to 3 profiles with distinct priorities 1 to 3
+
+N
+
+Y
+
+Y
+
+Y
+
+Y
+
+SSID 1 to 32 bytes
+
+-
+
+N
+
+Y
+
+Y
+
+Y
+
+Security needs a password and none is stored
+or sent
+
+-
+
+-
+
+Y
+
+N
+
+N
+
+Password length 8 to 63 when given
+
+-
+
+-
+
+-
+
+N
+
+Y
+
+Store sealed passwords; create
+SET_NETWORK
+
+-
+
+-
+
+-
+
+-
+
+X
+
+Answer
+
+5. Component Graphic User Interface Design
+5.1 GUI style
+Table 71 gives the style rules shared by all C2 pages. They extend the shell style of the C1 design (left menu, top bar, cards,
+Material UI) with what device pages need: a status chip that always looks the same, and a clear difference between a value the
+car has confirmed and a value that is still on its way.
+Table 71: GUI style of the C2 pages
+Element
+
+Rule
+
+Layout
+
+C1 shell; the Vehicle and device manager is a two-column page: vehicle list (fixed 260 px) on the left, vehicle detail
+with tabs on the right; the device editor opens under the device table, not in a modal, so the table stays visible
+
+Status chips
+
+ONLINE green, OFFLINE amber, FAULT red, PROVISIONING and REGISTERED gray, DISABLED gray with
+strike-through; muted is a separate gray chip; the color is never the only signal (text is always shown)
+
+Settings state
+
+Confirmed values in normal text with a check mark and time; pending values in an amber chip "v4 SENT hh:mm:ss"
+with "waiting for the car (30 s)"; REJECTED and TIMED_OUT in red with the reason and a Retry button
+
+Live updates
+
+The device.status event updates chips and the editor in place, with a short highlight of the changed row; the "live" chip
+in the top bar turns gray when the WebSocket is down and the page polls instead
+
+Secrets
+
+The provisioning result is shown once in a dialog with Download agent.yaml and Copy; the dialog warns that it cannot
+be shown again; Wi-Fi passwords are input-only fields showing "set"
+
+Destructive actions
+
+Retire, Delete device, Delete clip, and Rotate open a confirmation dialog that names the object (for example "Retire
+AV-13? Its login stops working now.")
+
+Forms
+
+Inline validation with the same ranges as Section 4 and the rule id from details.rule under the field; Apply is disabled
+until a value changes
+
+Accessibility
+
+WCAG AA contrast, labels on every field, keyboard order left to right, Esc closes dialogs; the clip player has keyboard
+controls
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+
+5.2 Function partition tree
+Figure 32 shows the C2 pages under the single IoT/device entry that C2 adds to the C1 shell, with the priority and the roles of
+each and what each page holds. The Data tab is the one page owners see; C1 embeds the same VehicleDataPanel in the owner's
+vehicle detail.
+
+Figure 32: Function partition tree of the C2 pages
+
+5.3 Storyboards
+The storyboards follow the scenarios of Table 37. Each row is one screen state: what the user does, what the page shows, and the
+call behind it.
+Table 72: Storyboard SB1, an engineer adds and provisions a car (SC1, SC2)
+Step
+
+User action
+
+Screen
+
+API or event
+
+Picks Tenant A in the top bar, opens Vehicles
+
+List with AV-01 ONLINE; "1 of 3" next to Add
+vehicle
+
+GET /vehicles?tenantId=1
+
+Add vehicle: AV-02, VIN, Tesla, Model Y,
+2023, label; Save
+
+Dialog closes; AV-02 row with chip REGISTERED,
+connection "never"
+
+POST /vehicles
+
+Opens AV-02, Devices tab, Add device twice
+Two rows PROVISIONING
+(MIC_INTERIOR cabin roof, MIC_EXTERIOR
+front bumper)
+
+POST
+/vehicles/AV-02/devices
+
+Provision agent
+
+Dialog with agent.yaml, Download, Copy, and the
+one-time warning; header shows PROVISIONED and
+the gateway row dev-0220
+
+POST
+/vehicles/AV-02/provision
+
+Copies the file to the laptop and starts the agent
+
+Within a few seconds the header turns ACTIVE and
+the three rows turn ONLINE with "3 s"
+
+device.status (gateway, then
+each mic)
+
+Table 73: Storyboard SB2, an engineer changes a microphone setting (SC3)
+Step
+
+User action
+
+Screen
+
+API or event
+
+Opens AV-01, Devices, Edit on
+dev-0112
+
+Editor under the table: gain +6 dB, threshold 0.40,
+"Confirmed v3 at 09:12:44"
+
+GET /devices/dev-0112
+
+Sets gain to +12, presses Apply
+
+Apply disabled; amber chip "v4 SENT 12:41:07, waiting for PUT /devices/dev-0112/config,
+the car"
+
+Waits
+
+About 1 s later: green "v4 confirmed 12:41:08", values
+shown as confirmed; row shows "v4" with a check
+
+device.status with config
+CONFIRMED
+
+3a
+
+(Car is off)
+
+Chip stays "v4 PENDING, car offline"; it turns SENT and
+then confirmed when the car comes back
+
+resend_pending, device.status
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+Step
+
+User action
+
+Screen
+
+API or event
+
+3b
+
+(No answer in 30 s)
+
+Red "v4 not confirmed (timed out)" with Retry; confirmed
+values unchanged
+
+device.status with config
+TIMED_OUT
+
+Table 74: Storyboard SB3, an owner reviews and cleans up a car's clips (SC6)
+Step
+
+User action
+
+Screen
+
+API or event
+
+In C1, opens My vehicles, AV-01,
+Data tab
+
+Clip table for the last 7 days: time, device, channel, class,
+confidence, alert, Play, expiry
+
+GET /vehicles/AV-01/clips
+
+Plays the crash clip of 13:42
+
+Player under the row plays the 5 s WAV
+
+GET /clips/c41e8d2b/url
+
+Deletes an interior honking clip;
+confirms
+
+Row stays with "deleted by Anh", no Play
+
+DELETE /clips/{clipId}, 204
+
+Sets retention to 30 days, Save
+
+Note "applies to clips captured from now on"; new rows
+show the shorter expiry
+
+PUT /vehicles/AV-01/retention
+
+5.4 UI markup diagram
+Figure 33 marks the eight regions of the Vehicle and device manager, the page the IoT engineer uses most; Table 75 says what
+each region holds and which data it shows.
+
+Figure 33: UI markup diagram of the Vehicle and device manager
+
+Table 75: Regions of the Vehicle and device manager
+No.
+
+Region
+
+Content and behavior
+
+Data
+
+Shell menu (C1)
+
+IoT and devices entries for the engineer; AI models read-only
+
+Role in the JWT
+
+Top bar
+
+Tenant selector (staff roles only), live indicator, user
+
+GET /admin/tenants (C1); WebSocket
+state
+
+Vehicle list
+
+Add vehicle, count against the plan limit, search, rows with the
+agent connection chip
+
+GET /vehicles; device.status
+
+Vehicle header
+
+Code, label, status, VIN, MQTT login and credential version,
+retention; Provision agent and Retire
+
+GET /vehicles/{id}
+
+Tabs
+
+Devices, Network, Data
+
+-
+
+Device table
+
+Rows with type, status, muted, last seen, config version and
+state; Edit, Disable, Delete; Add device
+
+GET /vehicles/{id}/devices;
+device.status
+
+Device editor
+
+Gain and threshold with their ranges, fixed values, Apply,
+Cancel, Mute
+
+PUT /devices/{id}/config; POST
+commands
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+No.
+
+Region
+
+Content and behavior
+
+Data
+
+Command state
+
+Pending, confirmed, rejected, or timed-out chip with time;
+confirmed values below
+
+device.status; GET /commands/{id}
+
+5.5 GUI templates
+Figure 34 gives the templates of the three views that differ from the main page: the one-time provisioning dialog, the Network
+tab, and the Data tab that C1 also embeds. Table 76 lists how each C2 page behaves while it loads, when it is empty, and when a
+call fails, so a page is never blank or silent.
+
+Figure 34: GUI templates of the provisioning dialog, the Network tab, and the Data tab
+
+Table 76: Loading, empty, and error behavior of the pages
+Page or panel
+
+Loading
+
+Empty
+
+Error
+
+Vehicle list
+
+Skeleton rows
+
+"No vehicles yet" with Add vehicle
+(engineer)
+
+Banner with Retry; 400 shows "Pick a tenant" for
+staff
+
+Device table
+
+Skeleton rows
+
+"No devices; add a microphone and
+provision the agent"
+
+Banner with Retry
+
+Device editor
+
+Fields disabled until loaded
+
+-
+
+422 shows the rule under the field; 409 "car
+retired"
+
+Provision dialog
+
+Spinner "Creating login"
+
+-
+
+502 "Broker did not answer; nothing was
+changed" with Retry
+
+Network tab
+
+Skeleton
+
+"No Wi-Fi profiles; the car uses its current
+link"
+
+422 under the field; REJECTED from the car
+shows its reason
+
+Data tab
+
+Skeleton rows
+
+"No clips in this period" with the period
+selector
+
+410 on Play shows "Clip deleted or expired" and
+refreshes the row
+
+References
+[1] Group 2 (A. Myadala, B. Rivera Venegas, R. Zhao), "Smart Car Intelligent Cloud Platform (SCICP): System Analysis and
+Design Document," CMPE 281 Project Option #2, Deliverable #1, San Jose State University, Oct. 4, 2026.
+[2] A. Myadala, "SCICP component design: C1 Cloud Platform Dashboard and System Admin," Part I of this document.
+[3] R. Zhao, "SCICP component design: C3 Alert Tracking and Monitoring, with the C4 classifier worker and the MongoDB
+collections," Part III of this document.
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+
+[4] Eclipse Foundation, "Mosquitto Dynamic Security Plugin" and "mosquitto.conf," Eclipse Mosquitto documentation,
+mosquitto.org, 2026.
+[5] I. Sommerville, Software Engineering, 10th ed., Pearson, 2015, Chapters 5 to 7 (system modeling, architectural design, and
+design and implementation).
+[6] OASIS, "MQTT Version 3.1.1," OASIS Standard, 2014.
+[7] MongoDB, Inc., "Time Series Collections," MongoDB 7.0 Manual, 2026.
+[8] M. Jones, J. Bradley, and N. Sakimura, "JSON Web Token (JWT)," RFC 7519, IETF, 2015.
+[9] Amazon Web Services, "Sharing objects with presigned URLs" and "Managing your storage lifecycle," Amazon S3 User
+Guide, 2026.
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)

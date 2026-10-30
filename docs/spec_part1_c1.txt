@@ -1,0 +1,3986 @@
+Part I. C1 Cloud Platform Dashboard and System Admin
+Component owner: Anukrithi Myadala (anukrithi.myadala@sjsu.edu). Includes the C4 model registry pages and APIs.
+
+1. Component Overview
+This part is the detailed design of component C1, the Cloud Platform Dashboard and System Admin of the Smart Car Intelligent
+Cloud Platform (SCICP), together with the C4 model registry pages and APIs that the same author builds. It is task T7 of the
+schedule in our Deliverable #1 (its Table 19) and keeps the system design of that document [1] unchanged (component
+boundaries, the REST and WebSocket APIs of its Table 9, the MySQL and MongoDB schemas, the role-based views), filling in
+what is inside C1: from the black-box view of the component to its white-box design [2].
+
+1.1 Purpose
+C1 is the single web entry point of the platform. Every user, whatever the role, signs in through C1, and C1 decides which view
+that role sees. For car owners and fleet managers it shows what is happening to their cars: vehicles, open alerts, recent event
+counts, and the subscriptions that decide who is notified. For service staff it shows statistics across tenants and produces CSV
+reports. For the system administrator it manages tenants, users, roles, and the platform-wide alert types. Through the C4 registry
+pages it lets staff register a classifier version with its file and held-out test results, choose the active version, roll back, and export
+feedback labels for retraining. C1 does not create alerts, does not talk to cars, and does not run inference; those are C3, C2, and
+the C4 worker. Figure 1 places C1 among the other components, the users, and the AWS services it depends on, and labels every
+arrow with the interface it uses. As in Deliverable #1, we design C1 for the full-scale platform (four portals behind CloudFront
+and an Application Load Balancer, WebSocket rooms in Redis, separate services per component) and build what the demo
+needs (one React application and one FastAPI service on one EC2 instance with an in-process event bus); the APIs, tables,
+classes, and rules are the same in both.
+
+Figure 1: Context diagram of C1: users, neighboring components, and the interfaces between them
+
+1.2 Objectives
+Table 3 lists the six objectives we set for the component this semester and how the design in Sections 2 to 4 meets each one. O2
+and O5 are the ones we will measure during testing; the others are checked by the API and tenancy tests in the Deliverable #1
+test plan.
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+
+Table 3: Objectives of the component
+ID
+
+Objective
+
+How the design meets it
+
+O1
+
+One login and one shell for all six roles
+
+AuthService issues one JWT with role and tenant; RoleRouter builds the menu from the
+permissions list of BR-01
+
+O2
+
+Overview within 2 s of login; live within 1 s of an
+alert, with a polling fallback of 10 s
+
+One GET /dashboard/overview call aggregates C2, C3, and MongoDB data; WsHub
+pushes alert.created on /ws; WsClient polls when the socket is down
+
+O3
+
+Every write audited
+
+AuditLogger writes an audit_log row with before and after values for every
+administration, registry, and subscription write and for every login and lock (BR-12)
+
+O4
+
+Tenant isolation enforced in one place
+
+TenantContext resolves the scope of every request from the JWT (BR-03); no page or
+repository receives a tenant id from the URL
+
+O5
+
+Statistics on up to 92 days of events without a
+reporting database
+
+EventQueryRepo runs MongoDB aggregation pipelines on audio_events; BR-08 bounds
+the range and picks the bucket size
+
+O6
+
+Safe model activation
+
+Upload through a presigned S3 URL with a SHA-256 computed in the browser and
+verified on complete; a metrics gate (BR-10); one-click rollback in the same transaction
+code path
+
+Non-functional requirements. The component inherits the our-build column of Table 6 of Deliverable #1: API reads within
+300 ms for every C1 endpoint except the overview aggregate, which gets the 2 s budget of O2 (the 1 s live update is C1's share of
+the 8 s p95 end-to-end alert latency); one instance that must run through the demo, so the overview falls back to its cached copy
+when C2 or C3 is down; HTTPS, JWT roles, argon2 password hashes, and login throttling; tenant_id filtering in every query
+with 404 for another tenant's ids (O4); and the nightly MySQL and MongoDB dumps to S3 of C5 (FR-C5-05), which cover
+every table because C1 keeps no state outside the two databases.
+
+1.3 Function scope
+We partition C1 into the eight modules of Table 4. The priority column is the one from Table 5 of Deliverable #1: H means the
+module works in the final demo and is tested, M means we build it if time allows, and L means it is designed here but not built
+this semester.
+Table 4: Modules of the component and the requirements they satisfy
+Module
+
+Functions
+
+Requirements
+
+Priority
+
+M1 Authentication and session
+
+Login, refresh, logout, password change, lockout after five failures
+
+FR-C1-01
+
+H
+
+M2 Role-based shell and
+navigation
+
+RoleRouter, menu filtered by role, WebSocket subscription, polling
+fallback banner
+
+FR-C1-01
+
+H
+
+M3 Owner dashboard
+
+Overview KPIs, vehicle cards, recent alerts, live highlight, polling
+fallback; the live vehicle map (2D) on the overview and the vehicle
+map page, with the trail of a selected car and the open alerts as pins
+
+FR-C1-02
+
+H
+
+M4 Subscriptions
+
+Per-vehicle service toggles, channels, quiet hours, notify riders; the
+default rows written when C2 creates a vehicle
+
+FR-C1-03
+
+H (quiet hours
+and notify riders
+M)
+
+M5 Statistics and reports
+
+Stats aggregations by hour or day, four report types, CSV export
+
+FR-C1-04
+
+M
+
+M6 System administration
+
+Tenants, users and roles, alert types, invitations, password reset; the
+tenant list that the staff pages of Parts II and III read
+
+FR-C1-05
+
+H (tenant list,
+tenant and user
+creation with the
+invitation
+email); M (alert
+types, password
+reset)
+
+M7 Model registry pages
+
+Models, versions, upload via presigned S3 URL, activate, roll back,
+feedback labels and export
+
+FR-C4-02 (H), FR-C4-04
+(M)
+
+H/M
+
+M8 Audit log
+
+Writer behind every write (built, needed by BR-12); viewer page,
+platform health, PDF export, per-tenant limits
+
+FR-C1-06
+
+L (viewer)
+
+Out of scope. The alert monitor, alert detail, and alert rule pages belong to C3 (Part III); the vehicle, device, and provisioning
+pages belong to C2 (Part II); the classifier worker that loads the active model and classifies clips is specified with C3 in Part III;
+backups and retention belong to C5. C1 hosts those pages in its shell and links to them, but their APIs and logic are specified in
+the other component designs. The shadow and canary deployment of model versions (model_deployment table) and the pertenant resource limits are full-scale design items and appear here only where a table or state needs a placeholder for them.
+
+1.4 Usage
+Table 5 shows which modules each of the six roles uses. OWNER and FLEET_MANAGER share the owner view; the statistics
+page for fleet managers (own tenant) and the read-only registry for IOT_ENGINEER are additions to the view table of
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+
+Deliverable #1 (its Table 16), and a fleet manager also gets the alert rules page of C3 (Deliverable #1, Table 2 and UC-08). A
+RIDER never opens the dashboard shell: C1 only authenticates the rider and scopes the request to the vehicles of the active trip
+(BR-03) for the read-only alert page of C3.
+Table 5: Roles and the modules they use
+Role
+
+M1
+
+M2
+
+M3
+
+M4
+
+M5
+
+M6
+
+M7
+
+M8
+
+OWNER
+
+Y
+
+Y
+
+Y
+
+Y
+
+Reports
+
+–
+
+–
+
+–
+
+FLEET_MANAGER
+
+Y
+
+Y
+
+Y
+
+Y
+
+Reports, statistics
+(own tenant)
+
+–
+
+–
+
+–
+
+RIDER
+
+Y
+
+–
+
+–
+
+–
+
+–
+
+–
+
+–
+
+–
+
+IOT_ENGINEER
+
+Y
+
+Y
+
+–
+
+–
+
+–
+
+Tenant
+list
+
+Read
+
+–
+
+SERVICE_STAFF
+
+Y
+
+Y
+
+Y (any tenant)
+
+Read
+
+Y
+
+Tenant
+list
+
+Y
+
+–
+
+SYS_ADMIN
+
+Y
+
+Y
+
+Y (any tenant)
+
+Read
+
+Y
+
+Y
+
+Y
+
+Viewer (design
+only)
+
+Table 6 gives the five usage scenarios that drive the sequence diagrams of Section 3.4 and the storyboards of Section 5.3. They
+build on the sample data of Deliverable #1 and name the two seeded tenants: Tenant A (tA) is the Nguyen household with one
+car AV-01, Tenant B (tB) is Bay Shuttle LLC with five cars AV-10 to AV-14, and the model sound-classifier has version 1.1.0
+active with a macro-F1 of 0.84 and version 1.2.0 registered with 0.86.
+Table 6: Usage scenarios
+ID
+
+Actor
+
+Scenario
+
+UC1
+
+Owner (Anh, Tenant A)
+
+SES email reports an ACCIDENT alert on AV-01 (crash, 0.91); Anh signs in, sees the alert M1, M2, M3
+on the overview and its pin next to AV-01 on the vehicle map, acknowledges it on the C3
+alert page; the row updates over the WebSocket
+
+Modules
+
+UC2
+
+Fleet manager (Maria,
+Tenant B)
+
+On the card of AV-12 turns SAFETY off, sets quiet hours 22:00 to 06:00 on SECURITY,
+turns notify riders on; save validates against BR-04 and C3 reads the rows at the next alert
+(BR-05)
+
+M4, M8
+
+UC3
+
+Service staff
+
+Selects Tenant B and the last seven days; bucketed by day (BR-08); Export CSV streams
+alerts-by-day; over 50,000 rows is refused (BR-09)
+
+M2, M5
+
+UC4
+
+System administrator
+
+Creates Tenant C, Campus Rides, FLEET plan (max_vehicles 50), invites maria2 as
+FLEET_MANAGER; SES sends the temporary password; change-password dialog at first
+login (BR-06, BR-07); both writes audited
+
+M6, M1, M8
+
+UC5
+
+Service staff
+
+Uploads sound-classifier 1.3.0 (browser SHA-256, PUT to presigned S3 URL, complete
+with macro-F1 0.87); activation passes BR-10 against 1.1.0, the C4 worker reloads;
+rollback reactivates 1.1.0
+
+M7, M8
+
+1.5 Interfaces to other components
+As Deliverable #1 (Section 3.2 and Table 8) requires, C1 calls C2 and C3 over internal REST with a service token, receives their
+events on the event bus, and never writes a row it does not own; the rows of C2 and C3 it reads (vehicle, vehicle_rider, alert)
+come through the read-only access of the C5 data access layer (a SELECT-only grant and the view v_alert_summary), and the
+rows C1 owns that C2 and C3 need (tenant.code, plan, max_vehicles, and time_zone; app_user role, email, and name;
+subscription; alert_type; the ACTIVE model_version row for the worker) are exposed the same way. Table 7 lists every
+interface; Section 2.8 gives the calls and topics.
+Table 7: Interfaces between C1 and the other components and services
+Counterpart
+
+Direction
+
+Interface
+
+Used for
+
+Browser (six roles)
+
+in
+
+HTTPS REST under /api/v1, JSON, JWT bearer;
+WebSocket /ws
+
+All pages; live alert and device updates
+
+C2 Edge Agent and IoT
+Device Management
+
+out
+
+VehicleClient: GET /vehicles, GET /vehicles/{id}/devices
+summary (service token)
+
+Vehicle cards and status on the overview
+
+C2
+
+in
+
+Event bus topic device.status; C2 reads tenant.max_vehicles
+through C5 (BR-06); C2 calls
+SubscriptionService.defaults(vehicleId) when a vehicle is
+created (direct call in our build; a vehicle.created event in the
+full-scale design)
+
+Live device status; vehicle limit; default
+subscriptions
+
+C3 Alert Tracking and
+Monitoring
+
+out
+
+AlertClient: GET /alerts?status=OPEN&tenantId, GET
+/alerts/{id}, GET /alerts/map?status=OPEN&tenantId (service
+token)
+
+Open alerts and recent alerts on the
+overview; alert pins on the vehicle map
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+Counterpart
+
+Direction
+
+Interface
+
+C3
+
+in
+
+Event bus topics alert.created, alert.updated; C3 reads the
+Live updates; notification recipients;
+subscription rows (BR-05) and the alert_type table through C5; severities; feedback labels
+the C3 alert page calls POST /events/{eventRef}/feedback
+
+Used for
+
+C4 classifier worker (Part
+III)
+
+out
+
+MQTT topic scicp/v1/platform/model/activated (QoS 1,
+retained, {modelId, version}), published after each activation
+or rollback; the worker also re-reads the ACTIVE
+model_version row every 30 s
+
+C5 Data Management
+
+out
+
+MySQL session (SQLAlchemy), MongoDB client (Motor),
+All persistence and statistics; car
+EventQueryRepo aggregations on audio_events and the newest positions for the vehicle map
+vehicle_telemetry document per car (read-only, written by C2),
+view v_alert_summary
+
+Amazon S3
+
+out
+
+StorageClient: presigned PUT and GET (15 min), HEAD
+
+Model artifact upload, download, and
+verification
+
+Amazon SES
+
+out
+
+MailSender: send_invitation, send_reset
+
+Invitation and password reset emails
+
+Model reload after activation or rollback
+
+2. Component Application Interface Design and Analysis
+Sections 2.1 to 2.6 specify the REST APIs of the six API groups, 2.7 the WebSocket connectivity API, 2.8 the internal interfaces
+to the other components and AWS services, and 2.9 who may call what and how the APIs are versioned and protected. Every C1
+and registry endpoint of Table 9 of Deliverable #1 is here; this design adds the session endpoints (/auth/refresh, /auth/logout,
+/auth/me, /auth/password/change), GET /intelligence-services, the admin list, reset-password, and design-only audit calls, and
+the registry versions, complete, rollback, download, feedback, and feedback export calls; PUT /subscriptions becomes PUT
+/subscriptions/{vehicleId} and the alert-type calls become GET, PUT /admin/alert-types/{code} because the six codes are
+fixed. The business rules BR-01 to BR-12 are stated in Section 4.
+Conventions. All endpoints are under /api/v1 and exchange JSON; dates are ISO 8601 in UTC. Every request except login
+carries Authorization: Bearer <accessToken>; the access token is a JWT [4] (HS256, 15 minutes) with the claims sub,
+tenantId, role, plan, name, and jti, and the tenant of a request always comes from the token, never from the URL (Deliverable #1,
+Section 3.3). Staff roles, which have no tenant, pass tenantId as a query parameter where a tenant scope is needed;
+TenantContext validates it, and tenant roles may pass it but it is ignored (BR-03). Errors use one envelope, {error: {code,
+message, details?}}, with the codes of Table 8; a business-rule refusal puts the rule id in details.rule and the failing
+field next to it so that the page can show the error inline. Bodies are Pydantic models validated by FastAPI, which publishes the
+OpenAPI [6] document our Postman tests and the C2 and C3 teams use. vehicleId is the public vehicle code (AV-01), the
+MongoDB tenantId is the tenant code (tA, tB) stored in tenant.code, and eventRef is the 24-character ObjectId of the audio
+event. In the tables a question mark marks an optional field, vertical bars an enumeration, and the last column names the rule
+enforced and the audit action written.
+Table 8: Error codes
+Code
+
+HTTP
+status
+
+When
+
+VALIDATION
+
+Body or query does not match the schema, or a field rule fails (weak password, tenant and role mismatch
+BR-07 on create)
+
+UNAUTHORIZED
+
+Missing, expired, or revoked token; wrong credentials on login (generic message)
+
+FORBIDDEN
+
+Role may not call the endpoint (BR-01); tenant suspended on login
+
+NOT_FOUND
+
+Entity does not exist or belongs to another tenant (never reveals which)
+
+CONFLICT
+
+Duplicate name or email; version not in the state the action needs; duplicate feedback label
+
+BUSINESS_RULE
+
+A rule in Section 4 refuses the request; details.rule names it (BR-04, BR-06, BR-07, BR-08, BR-09, BR10)
+
+LOCKED
+
+Account locked after five failed logins; details.lockedUntil
+
+RATE_LIMIT
+
+More than 10 login attempts per minute per IP, or more than 60 requests per minute per user
+
+BAD_GATEWAY
+
+C2 or C3 did not answer within 5 s and no cached overview exists (GET /dashboard/overview only)
+
+2.1 Authentication
+Table 9 lists the authentication endpoints (M1); login is the only one without a token. The refresh token is an opaque random
+value stored hashed in refresh_token and delivered as an HttpOnly cookie; the access token is kept in memory only. Login
+applies the decision table of Section 4.1 (an unknown email and a wrong password answer the same generic 401; the fifth failure
+in 15 minutes locks the account for 15 minutes), and the permissions list of GET /auth/me is the only input of RoleRouter in
+AppShell.
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+
+Table 9: Authentication API
+Method and endpoint
+
+Request
+
+Response
+
+Errors and rules
+
+POST /auth/login
+
+{email, password}
+
+200 {accessToken, refreshToken cookie (7
+days), mustChangePassword, user}
+
+401, 403
+TENANT_SUSPENDED, 423,
+429. BR-02
+
+POST /auth/refresh
+
+refresh cookie
+
+200 {accessToken}
+
+POST /auth/logout
+
+—
+
+401. Refresh revoked; audit
+LOGOUT
+
+GET /auth/me
+
+—
+
+200 user, permissions[] (BR-01 page keys)
+
+POST /auth/password/change
+
+{currentPassword,
+newPassword}
+
+400 weak (min 10 chars, not the
+email), 401. Clears
+mustChangePassword
+
+POST /api/v1/auth/login
+{ "email": "anh@example.com", "password": "********" }
+HTTP/1.1 200 OK
+Set-Cookie: refreshToken=5f1c...; HttpOnly; Secure; SameSite=Strict; Path=/api/v1/auth; Max-Age=604800
+{ "accessToken": "eyJhbGciOiJIUzI1NiJ9...", "mustChangePassword": false,
+"user": { "userId": 1001, "name": "Anh Nguyen", "role": "OWNER", "tenantId": 1,
+"tenantName": "Nguyen household" } }
+HTTP/1.1 423 Locked
+
+(fifth wrong password within a rolling 15-minute window)
+
+{ "error": { "code": "LOCKED", "message": "Account locked. Try again later.",
+"details": { "lockedUntil": "2026-11-04T21:57:07Z" } } }
+
+2.2 Dashboard
+Table 10 lists the three read endpoints behind the owner overview and the vehicle map (M3) and the statistics page (M5), all
+scoped by TenantContext. The overview is one call so that OverviewPage is usable within 2 s of login (O2), and asOf lets the
+polling fallback show how old the data is; the map endpoint returns one point per car from the newest telemetry sample that C2
+stores (Part II, every 10 s) and one point per open alert from C3, so the page re-reads it every 10 s and draws cars, pins, and the
+trail of the selected car on a 2D map; the stats endpoint computes the bucket size from the range when granularity=auto
+(BR-08) and refuses a longer range rather than truncating it, so the StatsPage chart always matches its filter.
+Table 10: Dashboard API
+Method and endpoint
+
+Request
+
+Response
+
+Errors and rules
+
+GET
+/dashboard/overview
+
+?tenantId (staff only)
+
+200 {tenant, kpis{vehicles, online,
+openAlerts, alerts24h, events24h},
+vehicles[], recentAlerts[last 10], asOf}
+
+403 RIDER,
+IOT_ENGINEER; 400
+staff without tenantId; 404.
+BR-03
+
+GET /dashboard/map
+
+?tenantId (staff only)
+
+200 {vehicles[{vehicleId, label, status,
+connection, lat, lon, headingDeg,
+speedKph, driveMode, ignition,
+sampleAt}], alerts[{alertId, vehicleId,
+lat, lon, severity, type, createdAt}],
+asOf}
+
+403 RIDER,
+IOT_ENGINEER; 400
+staff without tenantId; 404.
+A car without a sample has
+lat, lon, and sampleAt null;
+cached 10 s per tenant;
+alerts come from the cache
+with degraded true when
+C3 does not answer. BR-03
+
+GET /dashboard/stats
+
+?from&to&tenantId&granularity=auto|hour|day
+
+200 {granularity,
+alertsByTypePerPeriod[],
+eventsByClass[], deviceStatus{},
+falseAlarmRate, meanAckSeconds}
+
+422 BR-08 over 92 days;
+403 OWNER, RIDER,
+IOT_ENGINEER.
+FLEET_MANAGER own
+tenant
+
+2.3 Subscriptions
+Table 11 is the API of M4: one object per vehicle with one entry per service, which is how the SubscriptionCard is laid out. PUT
+replaces the whole card so that one save is one audit row and one validation (Section 4.3), and the services list comes from the
+intelligence_service table so that a service can be switched on later without a release of the front end.
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+
+Table 11: Subscriptions API
+Method and endpoint
+
+Request
+
+Response
+
+Errors and rules
+
+GET /subscriptions
+
+?vehicleId (all vehicles
+of the scope when
+absent)
+
+200 [{vehicleId, services[{serviceCode, enabled,
+channels[DASHBOARD|EMAIL|SMS|PUSH],
+quietFrom, quietTo}], notifyRiders}]
+
+404. OWNER,
+FLEET_MANAGER; staff
+read
+
+PUT /subscriptions/{vehicleId}
+
+{services[],
+notifyRiders}
+
+200 saved row (shape of GET)
+
+422 BR-04 {details.field}, 404,
+403 staff. Audit
+SUBSCRIPTION_SAVE
+
+GET /intelligence-services
+
+—
+
+200 [{serviceCode, name, available, description}];
+PASSENGER, VEHICLE_HEALTH available=false
+
+Any role
+
+2.4 Reports
+Table 12 is the report endpoint of M5; one endpoint with a type parameter keeps the ReportsPage generic. The CSV is streamed
+from a server-side cursor (ReportService.export_csv, Section 3.2) after a count query answers BR-09 with a 422 before
+any bytes are sent; the Export CSV button of the statistics page calls the same endpoint with format=csv.
+Table 12: Reports API
+Method and endpoint
+
+Request
+
+Response
+
+Errors and rules
+
+GET /reports/{type}
+
+type in alerts-by-day, events-by-class, vehicleactivity, false-alarms; ?
+from&to&vehicleId&tenantId&format=json|csv
+
+json: 200 {columns[], rows[][],
+total}; csv: 200 text/csv
+streamed, attachment
+
+422 BR-08, 422 BR-09, 404.
+OWNER, FLEET_MANAGER
+(own tenant), SERVICE_STAFF,
+SYS_ADMIN
+
+2.5 Administration
+Table 13 lists the endpoints of M6, restricted to SYS_ADMIN by RbacGuard except the read-only tenant list; lists are paged
+with page and size (default 25, maximum 100) and filtered with q. Tenants are never deleted (BR-06), and user creation takes
+no password: the server mails a temporary one through SES and sets must_change_password, which AuthProvider turns into the
+forced ChangePasswordDialog; the TenantsPage, UsersPage, and AlertTypesPage of Section 5.5 are the only callers of the
+write endpoints.
+Table 13: Administration API (SYS_ADMIN only, except the tenant list)
+Method and endpoint
+
+Request
+
+Response
+
+Errors and rules
+
+GET /admin/tenants
+
+?status&q&page&size
+
+200 page of {tenantId,
+name, tenantType, plan,
+maxVehicles, status,
+vehicles, users,
+createdAt}
+
+400 size over 100; 403 tenant
+roles (BR-01). The one
+administration call that
+IOT_ENGINEER and
+SERVICE_STAFF may also
+make (read only), because
+their pages need the tenant list
+for the tenant selector in the
+top bar (Part II, Section 1.4)
+
+POST /admin/tenants
+
+{name, tenantType OWNER|FLEET|
+SERVICE_PROVIDER, plan BASIC|FLEET|
+ENTERPRISE, timeZone? (IANA, default
+America/Los_Angeles)}
+
+201 tenant; maxVehicles
+from plan (3 / 50 / 500)
+
+409. Audit
+TENANT_CREATE
+
+PATCH /admin/tenants/{id}
+
+{name?, plan?, status? ACTIVE|SUSPENDED}
+
+200 tenant
+
+422 BR-06, 404. No DELETE.
+Audit TENANT_UPDATE
+
+GET /admin/users
+
+?tenantId&role&status&q&page&size
+
+200 page of {userId,
+email, name, role,
+tenantId, status,
+mustChangePassword,
+lastLoginAt}
+
+400, 403 (BR-01)
+
+POST /admin/users
+
+{email, name, role, tenantId?}
+
+201 {userId, status
+ACTIVE,
+mustChangePassword
+true}; SES invitation
+
+409, 400 BR-07, 404. Audit
+USER_CREATE
+
+PATCH /admin/users/{id}
+
+{name?, role?, status? ACTIVE|DISABLED,
+tenantId?}
+
+200 user
+
+422 BR-07 last admin, 400
+BR-07, 404. Audit
+USER_UPDATE
+
+POST /admin/users/{id}/resetpassword
+
+—
+
+202; temporary password 404. Audit USER_RESET
+emailed
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+Method and endpoint
+
+Request
+
+Response
+
+Errors and rules
+
+GET /admin/alert-types
+
+—
+
+200 [{code, name,
+defaultSeverity,
+escalationMinutes,
+description}]
+
+403 (BR-01)
+
+PUT /admin/alert-types/{code}
+
+{name?, defaultSeverity?, escalationMinutes?}
+
+404 (codes fixed; C3 reads the
+table). Audit
+ALERT_TYPE_UPDATE
+
+GET /admin/audit
+
+?actor&entity&from&to&page
+
+200 page of audit rows
+
+Design only (L)
+
+2.6 Model registry
+Table 14 is the C4 registry API hosted by C1 (M7): SERVICE_STAFF and SYS_ADMIN write, IOT_ENGINEER reads. The
+one-call registration of Table 9 of Deliverable #1 is split into begin (presigned S3 URL), the browser PUT to S3, and complete
+(checksum and metrics) so that the model file never passes through the API process. Activation re-checks the artifact, the
+metrics, and the 0.05 macro-F1 margin (BR-10); force with a note overrides the last check, the ModelsPage confirm dialog
+shows the two macro-F1 values, and rollback is the same code path on the previous version, so it cannot fail the gate.
+Table 14: Model registry API
+Method and endpoint
+
+Request
+
+Response
+
+Errors and rules
+
+GET /models
+
+—
+
+200 [{modelId,
+name, task,
+activeVersion,
+versions}]
+
+403 tenant roles (BR-01)
+
+POST /models
+
+{name, task}
+
+201 model
+
+409. Audit
+MODEL_CREATE
+
+GET /models/{id}/versions
+
+—
+
+200 [{versionId,
+version, status,
+metrics, artifactUri,
+sha256, sizeBytes,
+createdBy, createdAt,
+activatedAt, notes,
+labelCount}]
+
+POST /models/{id}/versions
+
+{version (semver), notes?}
+
+201 {versionId,
+upload{url
+(presigned PUT, 15
+min), key}};
+UPLOADING
+
+409, 400. Audit
+VERSION_UPLOAD
+
+POST .../versions/{v}/complete
+
+{sha256, sizeBytes, metrics{macroF1, accuracy,
+perClass}}
+
+200 version
+REGISTERED
+
+422 BR-10 (checksum or
+metrics; row set to FAILED),
+409 not UPLOADING. Audit
+VERSION_COMPLETE
+
+POST .../versions/{v}/activate
+
+{force?, note?}
+
+200 {active,
+previous}
+
+404, 409 not REGISTERED
+or INACTIVE, 422 BR-10
+{activeMacroF1,
+targetMacroF1}. Audit
+MODEL_ACTIVATE;
+publishes model.activated on
+the EventBus and the MQTT
+model topic
+
+POST /models/{id}/rollback
+
+{note}
+
+200 {active,
+previous}; activates
+the most recently
+INACTIVE version
+that was ACTIVE
+
+409 nothing to roll back to.
+Audit MODEL_ROLLBACK
+
+GET .../versions/{v}/download
+
+—
+
+302 to a presigned
+GET (15 min)
+
+POST
+/events/{eventRef}/feedback
+
+{label CONFIRMED|FALSE_ALARM|WRONG_CLASS,
+correctedClass?}
+
+201 label
+
+409 BR-11 duplicate per
+user, 404. Called from the C3
+alert detail page (its False
+alarm action posts
+FALSE_ALARM, its
+Resolve action
+CONFIRMED). Audit
+FEEDBACK_LABEL
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+Method and endpoint
+
+Request
+
+Response
+
+Errors and rules
+
+GET
+/models/{id}/feedback/export
+
+?versionId&format=csv
+
+200 text/csv:
+eventRef, versionId,
+predictedClass,
+confidence, label,
+correctedClass,
+userId, ts
+
+404 BR-11 no labels
+
+HTTP/1.1 422
+
+(activate a version with macro-F1 0.78 without force while 1.1.0 at 0.84 is active)
+
+{ "error": { "code": "BUSINESS_RULE", "message": "Macro-F1 is more than 0.05 below the active version",
+"details": { "rule": "BR-10", "activeMacroF1": 0.84, "targetMacroF1": 0.78 } } }
+
+2.7 WebSocket connectivity API
+Live updates reach the browser over one WebSocket [5] at /ws (M2), proxied by nginx as WSS; the client sends the JWT in its
+first message, the server verifies it (close code 4401 if invalid), joins the connection to its rooms, and from then on only sends the
+messages of Table 15: the three events of Deliverable #1 (alert.created, alert.updated, device.status) plus model.activated and
+the heartbeat pair that this design adds. Rooms are decided once from the verified claims (a tenant role joins tenant:{tenantId}
+only, a staff role joins staff) and no message carries a tenant id the client could change (O4). The server pings every 30 s; after
+three missed pings (90 s) WsClient closes the socket, retries with back-off from 2 s to 30 s, polls GET /dashboard/overview
+every 10 s, and shows the yellow LiveBanner until the socket is back and one overview reload catches up.
+Table 15: WebSocket messages
+Direction
+
+Message
+
+Fields
+
+When
+
+client → server
+
+auth
+
+{type: "auth", token}
+
+First message; the server closes with 4401
+if invalid
+
+client → server
+
+pong
+
+{type: "pong"}
+
+Every 30 s in answer to ping
+
+server → client
+
+ping
+
+{type: "ping"}
+
+Every 30 s; three missed pongs close the
+connection
+
+server → client
+
+alert.created
+
+{type, alert{alertId, vehicleId, type, severity, status,
+topClass, confidence, createdAt}}
+
+C3 created an alert in the room's tenant
+
+server → client
+
+alert.updated
+
+{type, alertId, status, by} (by is the display name of the
+user)
+
+Acknowledge, resolve, or false-alarm
+action
+
+server → client
+
+device.status
+
+{type, vehicleId, deviceId, status, lastSeenAt,
+faultReason?, muted?, config?{version, state}}
+
+C2 changed a device status, or a setting
+was confirmed, rejected, or timed out (Part
+II, Section 2.9); the optional fields let the
+device editor show "car confirmed"
+without polling
+
+server → client
+
+model.activated
+
+{type, modelId, version}
+
+Staff room only; ModelsPage refreshes the
+ACTIVE chip
+
+2.8 Internal connectivity interfaces
+Table 16 lists the interfaces C1 uses that are not public; each is wrapped in one class (Section 3.1) so that the full-scale design
+can replace the implementation, for example the in-process event bus by Redis, without touching the services.
+Table 16: Internal interfaces
+Interface
+
+Class in C1
+
+Direction and transport
+
+Contract
+
+Event bus alert.created,
+alert.updated
+
+EventBus, WsHub
+
+C3 publishes; C1 subscribes (inprocess pub/sub, Redis in the full
+design)
+
+Alert summary of Table 15 plus
+tenantId as routing key, stripped by
+WsHub before fan-out
+
+Event bus device.status
+
+EventBus, WsHub
+
+C2 publishes; C1 subscribes
+
+{vehicleId, deviceId, status,
+lastSeenAt, tenantId, faultReason?,
+muted?, config?}; WsHub forwards
+the optional fields unchanged
+
+Event bus model.activated
+
+EventBus, ModelRegistryService
+
+C1 publishes; WsHub subscribes
+
+{modelId, version}; forwarded to the
+staff room
+
+MQTT topic
+scicp/v1/platform/model/activated
+
+MqttPublisher,
+ModelRegistryService
+
+C1 publishes after the commit;
+the C4 classifier worker
+subscribes (Part III)
+
+{modelId, version}, QoS 1, retained
+so that a restarted worker receives the
+current version; the Mosquitto ACL
+lets only the API login publish under
+scicp/v1/platform/; the worker also
+polls the ACTIVE row every 30 s
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+Interface
+
+Class in C1
+
+Direction and transport
+
+Contract
+
+C2 vehicle list
+
+VehicleClient.list(tenantId)
+
+Internal REST GET /vehicles,
+service token
+
+Vehicles with vin, label, status,
+device summary; 5 s timeout, cached
+cards on failure
+
+C3 open alerts
+
+AlertClient.openAlerts(tenantId,
+limit)
+
+Internal REST GET /alerts?
+status=OPEN&tenantId, service
+token
+
+Newest open alerts (OPEN = NEW
+and ACKNOWLEDGED) and total;
+same timeout rule
+
+C5 MySQL
+
+DataAccess session (SQLAlchemy),
+repositories
+
+Pool, one session per request,
+transaction per service call
+
+Tables of Section 3.3; read-only
+vehicle, vehicle_rider (SELECT
+grant) and alert (view
+v_alert_summary)
+
+C5 MongoDB
+
+EventQueryRepo (Motor)
+
+Aggregation pipelines on
+audio_events
+
+events_by_class, alerts_by_period,
+false_alarm_rate; every $match starts
+with tenantId
+
+Amazon S3
+
+StorageClient
+
+AWS SDK over HTTPS;
+presigned URLs used by the
+browser
+
+presign_put(key, 15 min),
+presign_get(key), head(key) -> (size,
+sha256 verified by S3); key
+models/{modelId}/{version}/model.p
+t
+
+Amazon SES
+
+MailSender
+
+AWS SDK over HTTPS
+
+send_invitation, send_reset(user,
+tempPassword); failures logged, API
+still answers 201 / 202
+
+2.9 API analysis
+Table 17 derives from BR-01 (Section 4.2) which role may call each API group; RbacGuard applies it as a FastAPI dependency
+on every router, and the same table, returned by GET /auth/me as page keys, drives RoleRouter, so a page a role cannot see has
+no route and a direct call is refused with 403.
+Table 17: API groups and the roles that may call them
+API group
+
+OWNER
+
+FLEET_
+MANAGER
+
+RIDER
+
+IOT_
+ENGINEER
+
+SERVICE_
+STAFF
+
+SYS_
+ADMIN
+
+2.1 Authentication
+
+Y
+
+Y
+
+Y
+
+Y
+
+Y
+
+Y
+
+2.2 /dashboard/overview,
+/dashboard/map
+
+Y
+
+Y
+
+–
+
+–
+
+Y (any tenant)
+
+Y (any tenant)
+
+2.2 /dashboard/stats
+
+–
+
+Y (own tenant)
+
+–
+
+–
+
+Y
+
+Y
+
+2.3 Subscriptions
+
+write
+
+write
+
+–
+
+–
+
+read
+
+read
+
+2.4 Reports
+
+Y
+
+Y
+
+–
+
+–
+
+Y
+
+Y
+
+2.5 Administration
+
+–
+
+–
+
+–
+
+read (tenant list)
+
+read (tenant list)
+
+Y
+
+2.6 Model registry
+
+–
+
+–
+
+–
+
+read
+
+write
+
+write
+
+2.6
+/events/{eventRef}/feedback
+
+Y
+
+Y
+
+–
+
+–
+
+Y
+
+Y
+
+2.7 WebSocket /ws
+
+tenant room tenant room
+
+–
+
+staff room
+
+staff room
+
+staff room
+
+Versioning: the path prefix /api/v1 is the version, fields are only added within v1, and a breaking change would add /api/v2
+next to it. Pagination: the administration lists use page, size, and a total; the overview and version lists are bounded by design
+and reports by BR-09. Idempotency: GET, PUT, and PATCH are idempotent by construction, a second activate of the active
+version answers 409 while SELECT ... FOR UPDATE serializes concurrent activations, and a version left in UPLOADING
+can be completed again. Rate limits: 10 login attempts per minute per IP plus the account lock of BR-02, 60 requests per minute
+per user, and one concurrent CSV stream per user, with counters in process memory in our build and in Redis in the full-scale
+design.
+
+3. Component Function Design, Data and DB Design, and Behavior Analysis
+Section 3 is the white-box design of C1, drawn in UML 2.5 [3]: 3.1 the classes of the back end and the front end, 3.2 the
+functions that carry the business rules with pseudocode and flowcharts, 3.3 the data design (MySQL tables, MongoDB queries,
+S3 key layout), and 3.4 the behavior analysis with state diagrams, sequence diagrams, and the design decisions we made. The
+names used here are the names we will use in the code.
+
+3.1 Logic design
+The back end is one FastAPI module per component inside one service (Deliverable #1, Section 3.4); C1 is the package app/c1
+and the registry pages are app/c4registry, with SQLAlchemy and Motor as drivers, Pydantic for validation, argon2 for
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+
+password hashes, and TanStack Query as the browser cache. Each module has three layers: routers that only parse the request
+and call one service method, services that hold the rules and the transactions, and repositories and clients that hold the SQL, the
+MongoDB pipelines, and the HTTP calls to C2, C3, S3, and SES. Services receive their repositories and clients through the
+constructor (dependency injection through the FastAPI dependency system [7]), so a unit test of BR-10 can run with an inmemory ModelVersionRepo and a fake StorageClient; repositories hold all SQL, one class per table; the report types are
+strategies behind the ReportType interface; RbacGuard and TenantContext are FastAPI dependencies declared on the routers,
+so a rule that applies to every endpoint is written once.
+
+3.1.1 Back-end classes
+Figure 2 and Figure 3 show the service layer in two parts: the guards, authentication, dashboard, and subscription classes first,
+then the report, administration, and registry classes. Table 18 specifies every back-end class, including the repositories, clients,
+and infrastructure classes (EventBus, WsHub, StorageClient, MailSender) that the services use; repositories are the only classes
+that contain SQL or MongoDB pipelines, and each MySQL repository takes the tenant id from the scope rather than from the
+request.
+
+Figure 2: Class diagram of the back-end routers, services, and guards
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+
+Figure 3: Class diagram of the report, administration, and model registry services
+
+Table 18: Back-end classes: routers, services, guards, repositories, clients, and infrastructure
+Class
+
+Responsibility
+
+AuthRouter, DashboardRouter,
+SubscriptionRouter, ReportRouter,
+AdminRouter, ModelRouter,
+WsRouter
+
+One router per API group of Section 2: validate, resolve
+One route handler per endpoint; WS /ws ->
+RbacGuard and TenantContext, call one service method,
+WsHub.connect(ws, claims)
+map exceptions to the error envelope; WsRouter verifies the
+auth message (4401 on a bad token)
+
+Key methods
+
+AuthService
+
+Login, refresh, logout, current user, password change (BR02)
+
+login(email, password, ip) -> TokenPair; refresh;
+logout(jti); me(userId) -> UserDto +
+permissions[]; changePassword
+
+LoginThrottle
+
+Owns failed_logins, last_failed_at, locked_until on
+app_user; 5 failures in 15 min lock for 15 min
+
+record_failure(user) -> locked?; reset(user);
+is_locked(user)
+
+TokenService
+
+Issues and verifies the access JWT (HS256, 15 min) and the
+opaque refresh token (hashed, 7 days)
+
+issue(user) -> TokenPair; verify(jwt) -> Claims;
+revoke(jti)
+
+RbacGuard, TenantContext
+
+Dependencies that enforce BR-01 on every route and
+resolve the tenant scope from the claims (BR-03)
+
+requires(*roles); page_permissions(role);
+resolve(claims, requested_tenant_id?) -> scope
+
+DashboardService
+
+Overview aggregation (cached 30 s per tenant), vehicle map overview(scope) -> OverviewDto; map(scope) ->
+(positions cached 10 s per tenant), and statistics (BR-08)
+MapDto; stats(scope, from, to, granularity) ->
+StatsDto
+
+SubscriptionService
+
+Reads and saves subscription cards (BR-04); defaults for a
+new vehicle
+
+list(scope, vehicleId?); save(scope, vehicleId,
+dto, actor); defaults(vehicleId)
+
+ReportService; ReportType;
+AlertsByDayReport,
+EventsByClassReport,
+VehicleActivityReport,
+FalseAlarmReport
+
+Runs a report and streams CSV (BR-08, BR-09); each
+report type is a strategy class
+
+run(type, scope, from, to, vehicleId?);
+export_csv(...); ReportType.query(...,
+batch_size), count(...)
+
+AdminService
+
+Tenant, user, and alert-type administration (BR-06, BR-07)
+
+list_, create_, update_tenant; list_, create_,
+update_user; reset_password; list_,
+update_alert_type
+
+ModelRegistryService
+
+Model and version lifecycle, upload, activation (BR-10),
+rollback, feedback (BR-11)
+
+list_models; create_model; list_versions;
+begin_upload; complete_upload; activate;
+rollback; record_feedback; export_feedback
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+Class
+
+Responsibility
+
+Key methods
+
+AuditLogger
+
+One audit_log row per audited action with before and after
+values (BR-12); the actions are the audit names in the API
+tables of Section 2 plus LOGIN, LOGIN_FAIL,
+LOGIN_LOCK, PASSWORD_CHANGE; the class is
+shared with C2 and C3, which write RETIRE_VEHICLE,
+PROVISION, DELETE_CLIP (Part II) and RULE_SAVE,
+RULE_DELETE (Part III) through it
+
+write(actor, tenantId, action, entity, entityId,
+before, after)
+
+WsHub
+
+WebSocket connections and rooms tenant:{tenantId} and
+staff; fans out bus events; heartbeat
+
+connect(ws, claims); broadcast(room, message);
+on_event(topic, payload); heartbeat()
+
+EventBus
+
+In-process publish and subscribe (Redis in the full design);
+topics alert.created, alert.updated, device.status,
+model.activated
+
+publish(topic, payload); subscribe(topic, handler)
+
+TenantRepo, UserRepo,
+RefreshTokenRepo,
+SubscriptionRepo,
+IntelligenceServiceRepo,
+AlertTypeRepo, AuditRepo,
+ModelRepo, ModelVersionRepo,
+FeedbackRepo
+
+SQLAlchemy repositories, one per table of Section 3.3,
+scoped by tenant_id where the table has one
+
+get, page, save; find_by_email,
+count_active_admins; by_vehicle, upsert; find,
+active_for_update, last_previously_active;
+FeedbackRepo.insert (UQ event_ref, user_id)
+
+EventQueryRepo
+
+MongoDB aggregations on audio_events (Motor) and the
+events_by_class; alerts_by_period(scope, from,
+newest vehicle_telemetry document per car (one pipeline:
+to, granularity); false_alarm_rate;
+$match meta.tenantId, $sort ts descending, $group by
+latest_positions(tenantId) -> {vehicleId: sample}
+meta.vehicleId with $first); alert counts through the C5 view
+v_alert_summary
+
+VehicleClient, AlertClient
+
+Internal REST clients to C2 and C3 with a service token; 5 s list(tenantId); device_summary(vehicleId);
+timeout
+openAlerts(tenantId, limit) -> alerts, total;
+get(alertId); map_points(tenantId) -> alerts[]
+
+StorageClient
+
+S3 access for model artifacts; key
+models/{modelId}/{version}/model.pt
+
+presign_put(key, 15 min); presign_get(key);
+head(key) -> (size, sha256)
+
+MqttPublisher
+
+Publishes platform messages to the Mosquitto broker over
+TLS with the API service login (paho-mqtt)
+
+publish(topic, payload, qos = 1, retain = False)
+
+MailSender, PasswordHasher
+
+SES invitation and reset emails (failure logged, not raised);
+Argon2 hashing and temporary passwords
+
+send_invitation, send_reset(user, tempPassword);
+hash; verify; random_password(length)
+
+DataAccess (C5); DTOs (TokenPair, MySQL session factory and Motor client, one session per
+mysql_session(); mongo_client()
+Claims, OverviewDto, MapDto,
+request; typed data crossing the router and service boundary
+StatsDto, SubscriptionDto,
+ReportResult, TenantDto, UserDto,
+VersionDto, UploadTicket)
+
+3.1.2 Entity and front-end classes
+Figure 4 is the entity class diagram: one class per MySQL table that C1 or the C4 registry owns, with attributes, keys, and
+multiplicities (tenant 1 to many app_user and subscription, vehicle 1 to many subscription, intelligence_service 1 to many
+subscription, ai_model 1 to many model_version, model_version 1 to many feedback_label and model_deployment, app_user 1
+to many refresh_token, feedback_label, and audit_log); the vehicle and vehicle_rider classes belong to C2 and are drawn as
+read-only references that anchor subscription and the rider scope of BR-03, and model_deployment (PRIMARY, SHADOW, or
+CANARY with a traffic percentage) is full design only. The role, columns, and indexes of each entity are in Table 21. Figure 5
+shows the React and TypeScript side: the shell and hooks every page uses, the pages of the owner, staff, and admin views, and
+the reusable components; pages hold no business rules, they call the API, render the response, and show the inline errors the API
+returns. Table 19 lists the front-end classes with their props and state.
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+
+Figure 4: Entity class diagram of the tables owned by C1 and the C4 registry
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+
+Figure 5: Class diagram of the React pages, hooks, and components
+
+Table 19: Front-end classes
+Class
+
+Responsibility
+
+Props, state, key methods
+
+AppShell
+
+Left menu filtered by role, top bar, outlet for the page
+
+state: menuCollapsed, searchText, open-alert
+count; uses useAuth, useLiveEvents
+
+RoleRouter
+
+Route table and menu from the permissions list of GET props: permissions[]; routes(), menuItems(role);
+/auth/me
+forbidden routes redirect to the first allowed page
+
+AuthProvider / useAuth
+
+Access token in memory, refresh timer at 13 min,
+mustChangePassword gate
+
+state: user, accessToken, mustChangePassword;
+login(), logout(), refresh()
+
+ApiClient
+
+fetch wrapper: bearer header, on 401 refreshes once
+then logs out, maps the error envelope to ApiError
+
+get, post, put, patch(path, body); download(path)
+for CSV
+
+WsClient / useLiveEvents
+
+Opens /ws, sends auth, answers ping, dispatches
+messages, polls after three missed pings
+
+state: connected, missedPings, polling;
+subscribe(type, handler)
+
+QueryCache
+
+TanStack Query cache for GET responses; invalidated
+by live messages
+
+staleTime 10 s overview and map (the map query
+refetches every 10 s), 60 s lists; invalidate(key)
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+Class
+
+Responsibility
+
+Props, state, key methods
+
+LoginPage, ChangePasswordDialog
+
+Login form with the three error states; forced password
+change
+
+state: email, password, error (401/403/423); props:
+open, forced
+
+OverviewPage, VehicleMapPage,
+VehiclesPage, SubscriptionsPage,
+ReportsPage, StatsPage; TenantsPage,
+UsersPage, AlertTypesPage
+
+Owner, staff, and admin pages of Section 5.5; admin
+tables with an edit panel and confirm dialogs;
+VehicleMapPage keeps the selected car and fetches its
+trail
+
+filters, data from QueryCache, live handlers; state:
+selected row, dialog open; VehicleMapPage:
+selectedVehicleId, follow, showAlerts
+
+ModelsPage, UploadVersionDialog
+
+Model list, VersionTable, activate and roll back with
+state: selected model and version; file, progress,
+ConfirmDialog; upload dialog computes SHA-256 with sha256, metrics form; listens to model.activated
+SubtleCrypto, PUTs to the presigned URL, calls
+complete
+
+VehicleMap
+
+Leaflet map [12] with one marker per car (colored by
+connection, heading arrow, car code label), one pin per
+open alert in its severity color, and the trail polyline of
+the selected car; keeps zoom and center between
+refreshes unless follow is on
+
+props: vehicles[], alerts[], trail[],
+selectedVehicleId, follow; onSelectVehicle,
+onOpenAlert
+
+KpiTile, VehicleCard,
+RecentAlertsTable, SubscriptionCard,
+ServiceToggleRow, QuietHoursPicker,
+ChartCard, DataTable, FilterBar,
+ConfirmDialog, Toast, LiveBanner,
+VersionTable, MetricsTable
+
+Presentational components shared by the pages;
+ChartCard wraps Recharts
+
+props only; no API calls
+
+AuditLogPage, HealthPage
+
+Design only (FR-C1-06)
+
+—
+
+3.2 Program function descriptions
+Table 20 specifies the public methods in which a business rule or a transaction lives, with their inputs, outputs, rules, and the
+error codes of Table 8; the remaining service methods are plain reads whose contracts are the API rows of Section 2. Pseudocode
+follows for the four functions with the most branches, and Figure 6 and Figure 7 draw the two decisions as flowcharts.
+Table 20: Rule-carrying functions
+Function
+
+Inputs
+
+Outputs
+
+Rules and errors
+
+AuthService.login
+
+email, password, ip
+
+TokenPair,
+mustChangePassword
+
+BR-02; audit LOGIN, LOGIN_FAIL,
+LOGIN_LOCK; 401, 403, 423, 429
+
+LoginThrottle.record_failure
+
+user
+
+locked (bool)
+
+Counter resets 15 min after the last failure;
+5th failure sets LOCKED and locked_until
+= now + 15 min
+
+TenantContext.resolve
+
+claims,
+requested_tenant_id?
+
+scope{tenantId, vehicleIds?} BR-03: tenant roles own tenant; RIDER the
+vehicles with an active vehicle_rider row;
+staff the requested tenant; 400 staff without
+tenantId, 404
+
+DashboardService.overview
+
+scope
+
+OverviewDto
+
+VehicleClient and AlertClient concurrently
+plus EventQueryRepo; cached 30 s per
+tenant; 502 when C2 or C3 is down and no
+cache
+
+DashboardService.map
+
+scope
+
+MapDto
+
+EventQueryRepo.latest_positions joined
+with the vehicle rows of the scope (label,
+status, connection) and
+AlertClient.map_points; a car without a
+sample keeps null coordinates; cached 10 s
+per tenant; the alert list falls back to the last
+cached answer with degraded true when C3
+is down
+
+DashboardService.stats
+
+scope, from, to, granularity StatsDto
+
+BR-08 range and bucket size; 422
+
+SubscriptionService.save
+
+scope, vehicleId,
+SubscriptionDto, actor
+
+SubscriptionDto
+
+BR-04 per service, DASHBOARD added;
+upsert and audit SUBSCRIPTION_SAVE
+in one transaction; 422, 404
+
+ReportService.export_csv
+
+type, scope, from, to,
+vehicleId?
+
+streaming text/csv
+
+BR-08; BR-09 count check before
+streaming; batches of 1,000 rows; 422
+
+AdminService.update_tenant
+
+id, fields, actor
+
+TenantDto
+
+BR-06: ACTIVE and SUSPENDED only,
+never delete; plan change updates
+max_vehicles; audit TENANT_UPDATE;
+404, 422
+
+AdminService.create_user
+
+email, name, role,
+tenantId?, actor
+
+UserDto
+
+BR-07; temporary password hashed
+(Argon2), SES invitation after commit,
+must_change_password; audit
+USER_CREATE; 409, 400, 404
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+Function
+
+Inputs
+
+Outputs
+
+Rules and errors
+
+AdminService.update_user
+
+id, fields, actor
+
+UserDto
+
+BR-07 including the last SYS_ADMIN;
+audit USER_UPDATE; 404, 400, 422
+
+ModelRegistryService.begin_upload
+
+modelId, version, notes,
+actor
+
+UploadTicket{versionId, url, semver, unique per model; row
+key}
+UPLOADING; presigned PUT 15 min;
+audit VERSION_UPLOAD; 404, 400, 409
+
+ModelRegistryService.complete_upload
+
+modelId, version, sha256,
+size, metrics, actor
+
+VersionDto REGISTERED
+
+head(key) must exist with the same size and
+the SHA-256 S3 verified; metrics required;
+else FAILED; audit
+VERSION_COMPLETE; 409 not
+UPLOADING, 422
+
+ModelRegistryService.activate
+
+modelId, version, force,
+note, actor
+
+{active, previous}
+
+BR-10 in one transaction with SELECT ...
+FOR UPDATE; audit
+MODEL_ACTIVATE; after commit
+publish model.activated on the EventBus
+and the MQTT model topic; 404, 409, 422
+
+ModelRegistryService.rollback
+
+modelId, note, actor
+
+{active, previous}
+
+Activates the most recently deactivated
+version with force; audit
+MODEL_ROLLBACK; 409 nothing to roll
+back to
+
+ModelRegistryService.record_feedback
+
+eventRef, userId, label,
+correctedClass?
+
+label
+
+BR-11 one per event and user; versionId
+from the event; audit
+FEEDBACK_LABEL; 404, 409
+
+WsHub.on_event
+
+topic, payload
+
+—
+
+Strips tenantId; tenant events to tenant:
+{tenantId} and staff, model.activated to
+staff; a closed connection is dropped and
+the client reconnects
+
+3.2.1 Pseudocode of the rule-carrying functions
+AuthService.login implements the decision table of Section 4.1; the lock check comes before the password check so that a
+
+locked account does not leak whether the password was right, and the counters live on the app_user row so the lock survives a
+restart.
+def login(email, password, ip):
+user = UserRepo.find_by_email(email)
+if user is None or user.status == DISABLED: raise Unauthorized()
+
+# generic 401 (R1, BR-02)
+
+if user.tenant_id is not None and TenantRepo.get(user.tenant_id).status == SUSPENDED:
+raise Forbidden("TENANT_SUSPENDED")
+
+# R2
+
+if LoginThrottle.is_locked(user): raise Locked(locked_until=user.locked_until)
+
+# R3
+
+if not PasswordHasher.verify(password, user.password_hash):
+locked = LoginThrottle.record_failure(user)
+
+# R4 / R5: 5 in 15 min -> lock 15 min
+
+AuditLogger.write(user, user.tenant_id, "LOGIN_LOCK" if locked else "LOGIN_FAIL",
+"app_user", user.user_id, None, {"failed": user.failed_logins, "ip": ip})
+raise Locked(locked_until=user.locked_until) if locked else Unauthorized()
+LoginThrottle.reset(user)
+
+# R6
+
+user.last_login_at = now(); UserRepo.save(user)
+pair = TokenService.issue(user)
+AuditLogger.write(user, user.tenant_id, "LOGIN", "app_user", user.user_id, None, {"ip": ip})
+return pair, user.must_change_password
+
+SubscriptionService.save validates the whole card against the decision table of Section 4.3 before writing anything and
+
+reports the first failing field so that the SubscriptionCard can mark it inline.
+PLAN_CHANNELS = {BASIC: {DASHBOARD, EMAIL}, FLEET: {DASHBOARD, EMAIL, SMS, PUSH},
+ENTERPRISE: {DASHBOARD, EMAIL, SMS, PUSH}}
+def save(scope, vehicle_id, dto, actor):
+if vehicle_id not in {v.vehicle_id for v in VehicleClient.list(scope.tenant_id)}: raise NotFound()
+plan = TenantRepo.get(scope.tenant_id).plan
+available = {s.service_code for s in IntelligenceServiceRepo.list() if s.available}
+for s in dto.services:
+
+# decision table of 4.3
+
+if s.enabled and s.service_code not in available: raise BusinessRule("BR-04",
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+field=f"{s.service_code}.enabled")
+if not set(s.channels) <= PLAN_CHANNELS[plan]: raise BusinessRule("BR-04",
+field=f"{s.service_code}.channels")
+if (s.quiet_from is None) != (s.quiet_to is None) or (s.quiet_from and
+s.quiet_from == s.quiet_to):
+raise BusinessRule("BR-04", field=f"{s.service_code}.quietHours")
+s.channels = set(s.channels) | {DASHBOARD}
+
+# DASHBOARD always on
+
+with db.transaction():
+before = SubscriptionRepo.by_vehicle(vehicle_id)
+after = SubscriptionRepo.upsert(scope.tenant_id, vehicle_id, dto, actor.user_id)
+AuditLogger.write(actor, scope.tenant_id, "SUBSCRIPTION_SAVE", "subscription", vehicle_id,
+before, after)
+return after
+
+ReportService.export_csv is a streaming generator: the count query answers BR-09 with a 422 before the response starts,
+
+then the rows come from a server-side cursor in batches of 1,000, so the memory of the API process does not grow with the
+report.
+def export_csv(type, scope, from_, to, vehicle_id=None) -> StreamingResponse:
+if to - from_ > timedelta(days=92): raise BusinessRule("BR-08")
+report = REPORT_TYPES[type]()
+
+# range too long
+
+# AlertsByDayReport, EventsByClassReport, ...
+
+if report.count(scope, from_, to, vehicle_id) > 50_000:
+raise BusinessRule("BR-09", message="Narrow the range: more than 50,000 rows")
+def generate():
+yield csv_line(report.columns)
+for batch in report.query(scope, from_, to, vehicle_id, batch_size=1000):
+for row in batch: yield csv_line(row)
+name = f"{type}_{from_:%Y%m%d}_{to:%Y%m%d}.csv"
+return StreamingResponse(generate(), media_type="text/csv",
+headers={"Content-Disposition": f"attachment; filename={name}"})
+
+ModelRegistryService.activate is the transaction of Section 4.6. The current ACTIVE row is locked with SELECT ...
+FOR UPDATE (InnoDB locking reads [9]) before the target is read, which guarantees at most one ACTIVE version per model
+
+when two staff members click at the same time, and the event is published after the commit so that the C4 worker never reloads a
+version the database rolled back. Rollback reuses the same path with force set.
+def activate(model_id, version, force, note, actor):
+with db.transaction():
+current = ModelVersionRepo.active_for_update(model_id)
+
+# SELECT ... FOR UPDATE, may be None
+
+target = ModelVersionRepo.find(model_id, version)
+if target is None: raise NotFound()
+if target.status not in (REGISTERED, INACTIVE): raise Conflict(f"status {target.status}")
+head = StorageClient.head(target.artifact_key)
+if head is None or head.size != target.size_bytes or head.sha256 != target.sha256:
+raise BusinessRule("BR-10", rule="artifact missing or changed")
+if target.metrics_json is None: raise BusinessRule("BR-10", rule="metrics missing")
+if current and target.macro_f1 < current.macro_f1 - 0.05 and not (force and note):
+raise BusinessRule("BR-10", rule="macroF1", activeMacroF1=current.macro_f1,
+targetMacroF1=target.macro_f1)
+if current: current.status = INACTIVE; current.deactivated_at = now();
+ModelVersionRepo.save(current)
+target.status = ACTIVE; target.activated_at = now(); ModelVersionRepo.save(target)
+AuditLogger.write(actor, None, "MODEL_ACTIVATE", "model_version", target.version_id,
+# before / after
+{"active": current.version if current else None}, {"active": version,
+"force": force, "note": note})
+EventBus.publish("model.activated", {"modelId": model_id,
+"version": version})
+
+# after commit: staff room
+
+MqttPublisher.publish("scicp/v1/platform/model/activated",
+
+# after commit: worker
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+{"modelId": model_id, "version": version}, qos=1, retain=True)
+return {"active": version, "previous": current.version if current else None}
+def rollback(model_id, note, actor):
+prev = ModelVersionRepo.last_previously_active(model_id)
+
+# INACTIVE, newest deactivated_at
+
+if prev is None: raise Conflict("nothing to roll back to")
+result = activate(model_id, prev.version, force=True, note="rollback: " + note, actor=actor)
+AuditLogger.write(actor, None, "MODEL_ROLLBACK", "model_version", prev.version_id,
+{"active": result["previous"]}, {"active": prev.version, "note": note})
+return result
+
+3.2.2 Flowcharts
+Figure 6 is the flowchart of the login decision (FC1, BR-02), the same logic as the pseudocode of AuthService.login with
+the rule columns R1 to R6 of Table 25 written on the branches; R1 is the one refusal that writes no audit row, because the email
+may not belong to any user. Figure 7 is the flowchart of version activation (FC2, BR-10), including the force branch and the
+rollback entry that reuses the same path with force set.
+
+Figure 6: Flowchart FC1: login decision (BR-02)
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+
+Figure 7: Flowchart FC2: activate a model version (BR-10)
+
+3.3 Data and DB design
+C1 and the C4 registry own eleven MySQL tables, listed in Table 21; all are InnoDB with UTC timestamps, every tenant-owned
+table has an index that starts with tenant_id (Deliverable #1, Section 4.1), and vehicle, vehicle_rider (C2), and alert (C3) are read
+through C5 and never written. Figure 4 is the C1 part of the ERD of Deliverable #1 (its Figure 7), extended as follows:
+refresh_token and feedback_label (FR-C4-04, with WRONG_CLASS added to the confirmed and false-alarm labels) are new;
+the model_version status set of Table 12 of Deliverable #1 gains UPLOADING and FAILED for the two-step upload, and the
+SHADOW and CANARY states of the full design move to model_deployment.target. Columns added to the Table 12 tables are
+tenant.code, name, max_vehicles, status; app_user.name, status, failed_logins, last_failed_at, locked_until,
+must_change_password, last_login_at; intelligence_service.name, description, available; subscription.notify_riders,
+updated_by, updated_at; alert_type.name, description; model_version.sha256, size_bytes, notes, created_by, activated_at,
+deactivated_at; ai_model.created_by, created_at; and the detail columns of audit_log.
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+
+Table 21: MySQL tables owned by C1 and the C4 registry
+Table
+
+Columns
+
+tenant
+
+tenant_id, code (tA, tB), name, tenant_type
+PK tenant_id; UQ name
+ENUM(OWNER, FLEET, SERVICE_PROVIDER),
+plan ENUM(BASIC, FLEET, ENTERPRISE),
+max_vehicles, time_zone VARCHAR(40) DEFAULT
+'America/Los_Angeles' (C3 evaluates quiet hours in it),
+status ENUM(ACTIVE, SUSPENDED), created_at,
+updated_at
+
+Keys and indexes
+
+Notes
+max_vehicles from plan; read
+by C2 (BR-06)
+
+app_user
+
+user_id, tenant_id NULL, email, password_hash, name, PK user_id; FK tenant_id; UQ
+role ENUM(6 roles), status ENUM(ACTIVE,
+email; index (tenant_id, role)
+DISABLED, LOCKED), failed_logins, last_failed_at,
+locked_until, must_change_password, last_login_at,
+created_at
+
+Staff roles have tenant_id
+NULL (BR-07); lock counters
+owned by LoginThrottle
+
+refresh_token
+
+token_id, user_id, token_hash, expires_at, revoked_at
+
+PK token_id; FK user_id; UQ
+token_hash
+
+Only the SHA-256 of the
+token is stored; purged daily
+after expiry
+
+intelligence_service
+
+service_code, name, description, available
+
+PK service_code
+
+Six rows seeded; available =
+false for PASSENGER and
+VEHICLE_HEALTH
+
+subscription
+
+subscription_id, tenant_id, vehicle_id, service_code,
+enabled, channels SET(DASHBOARD, EMAIL, SMS,
+PUSH), quiet_from, quiet_to, notify_riders,
+updated_by, updated_at
+
+PK; FK tenant_id, vehicle_id,
+service_code, updated_by; UQ
+(vehicle_id, service_code); index
+(tenant_id, vehicle_id)
+
+One row per vehicle and
+service; vehicle_id is the
+BIGINT key of the vehicle
+table of Part II (the API uses
+the public code AV-01, which
+VehicleClient resolves); read
+by C3 at alert time (BR-05);
+tenant_id kept so C3 filters by
+tenant without a join (it
+resolves the vehicle code
+through its VehicleRepo) (FRC5-03)
+
+alert_type
+
+code, name, default_severity ENUM(LOW, MEDIUM, PK code
+HIGH, CRITICAL), escalation_minutes, description
+
+Six fixed codes, seeded with
+default severities ACCIDENT
+CRITICAL, EMERGENCY
+HIGH, SECURITY HIGH,
+SAFETY MEDIUM,
+PASSENGER LOW,
+VEHICLE_HEALTH LOW;
+C3 reads the default severity
+(Part III, Section 4.2)
+
+audit_log
+
+audit_id, actor_user_id NULL, tenant_id NULL,
+action, entity, entity_id, before_json JSON, after_json
+JSON, ip, ts
+
+PK audit_id; FK actor_user_id;
+index (tenant_id, ts), (entity,
+entity_id)
+
+Append only; password_hash
+removed before the row is
+written; partitioned by month
+in the full design
+
+ai_model
+
+model_id, name, task, created_by, created_at
+
+PK model_id; UQ name
+
+sound-classifier seeded
+
+model_version
+
+version_id, model_id, version (semver), status
+PK version_id; FK model_id,
+ENUM(UPLOADING, REGISTERED, ACTIVE,
+created_by; UQ (model_id,
+INACTIVE, FAILED), artifact_uri, sha256 CHAR(64), version); index (model_id, status)
+size_bytes, metrics_json JSON, notes, created_by,
+created_at, activated_at, deactivated_at
+
+At most one ACTIVE per
+model, enforced in the
+activate transaction with
+SELECT ... FOR UPDATE
+
+feedback_label
+
+label_id, event_ref CHAR(24), version_id, user_id,
+label ENUM(CONFIRMED, FALSE_ALARM,
+WRONG_CLASS), corrected_class, ts
+
+PK label_id; FK version_id,
+user_id; UQ (event_ref, user_id)
+
+event_ref is the MongoDB _id
+of the audio event (BR-11)
+
+model_deployment
+
+deployment_id, version_id, target ENUM(PRIMARY,
+SHADOW, CANARY), traffic_pct, started_at,
+ended_at
+
+PK deployment_id; FK version_id Full design only; not created
+this semester
+
+The DDL below is for model_version, the table with the most rules; the other tables follow the same conventions (BIGINT
+AUTO_INCREMENT keys, DATETIME(3) in UTC, named foreign keys).
+CREATE TABLE model_version (
+version_id
+
+BIGINT AUTO_INCREMENT PRIMARY KEY,
+
+model_id
+
+BIGINT NOT NULL,
+
+version
+
+VARCHAR(32) NOT NULL,
+
+status
+
+ENUM("UPLOADING","REGISTERED","ACTIVE","INACTIVE","FAILED") NOT NULL DEFAULT
+
+-- semver, e.g. 1.3.0
+
+"UPLOADING",
+artifact_uri
+
+VARCHAR(512) NOT NULL,
+
+-- s3://scicp-models/models/{modelId}/{version}/model.pt
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+sha256
+
+CHAR(64) NULL,
+
+size_bytes
+
+BIGINT NULL,
+
+metrics_json
+
+JSON NULL,
+
+notes
+
+VARCHAR(1000) NULL,
+
+created_by
+
+BIGINT NOT NULL,
+
+created_at
+
+DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+
+activated_at
+
+DATETIME(3) NULL,
+
+-- {macroF1, accuracy, perClass{...}}
+
+deactivated_at DATETIME(3) NULL,
+CONSTRAINT fk_mv_model FOREIGN KEY (model_id) REFERENCES ai_model(model_id),
+CONSTRAINT fk_mv_user
+
+FOREIGN KEY (created_by) REFERENCES app_user(user_id),
+
+CONSTRAINT uq_mv_model_version UNIQUE (model_id, version),
+INDEX ix_mv_model_status (model_id, status)
+) ENGINE=InnoDB;
+
+MongoDB. C1 writes nothing to MongoDB. EventQueryRepo runs aggregation pipelines [10] on the audio_events collection
+that C4 fills (Deliverable #1, Table 13) for the statistics page, the reports, and the overview counts; every pipeline starts with a
+$match on tenantId and a ts range, which uses the prefix of the {tenantId, vehicleId, ts} index. The inference.modelVersion
+string of the document (model name and version joined with a hyphen) is what record_feedback resolves to the model_version
+row. The pipeline below is events_by_class for Tenant B over one day; with per_vehicle=True the group key adds
+$vehicleId for the overview cards. false_alarm_rate and alerts_by_period work on the view v_alert_summary
+(FALSE_ALARM against all alerts by type; grouping by hour or day); we keep these as queries rather than the report_snapshots
+collection of the full design because our data stays well under 1 GB (O5) and the 92-day ceiling of BR-08 matches the default
+90-day retention of audio_events.
+db.audio_events.aggregate([
+{ "$match": { "tenantId": "tB", "ts": { "$gte": ISODate("2026-11-04T00:00:00Z"),
+"$lt": ISODate("2026-11-05T00:00:00Z") } } },
+{ "$project": { "vehicleId": 1, "ts": 1, "cls": { "$arrayElemAt": [ "$inference.topK.class", 0 ] },
+"conf": { "$arrayElemAt": [ "$inference.topK.conf", 0 ] } } },
+{ "$group": { "_id": "$cls", "count": { "$sum": 1 }, "meanConf": { "$avg": "$conf" },
+"lastEventAt": { "$max": "$ts" } } },
+{ "$sort": { "count": -1 } }
+])
+
+// [{_id: "traffic", count: 412, ...}, {_id: "honking", count: 37, ...}, {_id: "crash", count: 1,
+...}]
+
+S3 key layout. Model artifacts are stored under models/{modelId}/{version}/model.pt in the scicp-models bucket
+(clips live in scicp-clips, Part II), one immutable object per version that is never overwritten, which is why activation only
+needs to confirm that the object is still there. The presigned PUT [11] that begin_upload returns is bound to that exact key,
+content length, and an x-amz-checksum-sha256 value, so a client cannot write anywhere else and S3 rejects bytes whose
+SHA-256 does not match; StorageClient.head reads that checksum back for complete_upload and activate. Clips
+live under tenants/{tenantId}/vehicles/{vehicleId}/YYYY/MM/DD/{clipId}.wav, owned by C2 and the
+ingestion layer and presigned by the C3 alert page, never read by C1; nightly dumps go under backups/{date}/ (C5).
+
+3.4 Behavior analysis
+3.4.1 State diagrams
+Three objects have a lifecycle of their own. Figure 8 is the user session in the browser as AuthProvider implements it (the
+Locked state is server-side; the client learns of it through the 423 response). Figure 9 is the lifecycle of a model_version row,
+driven by the three registry calls and the gate of BR-10; Archived is a full-design state, and the semester build leaves INACTIVE
+rows in place so that rollback always has a target. Figure 10 combines the two small lifecycles the administrator and the owner
+control: a tenant is Active or Suspended, and a service subscription is Enabled or Disabled, with Quiet as a derived sub-state that
+C3 evaluates at alert time. Table 22 lists the transitions of all three.
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+
+Figure 8: State diagram of a user session
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+
+Figure 9: State diagram of a model version
+
+Figure 10: State diagram of a tenant and of a service subscription
+
+Table 22: States and transitions of the three state machines
+State machine
+
+From
+
+Event [guard]
+
+To
+
+Action
+
+Session
+
+Anonymous
+
+submit login form
+
+Authenticating
+
+POST /auth/login
+
+Session
+
+Authenticating
+
+200 [mustChangePassword =
+false]
+
+Active
+
+store access token; GET /auth/me;
+open /ws
+
+Session
+
+Authenticating
+
+200 [mustChangePassword =
+true]
+
+PasswordChangeRequired
+
+open ChangePasswordDialog,
+block navigation
+
+Session
+
+PasswordChangeRequired
+
+204 from /auth/password/change
+
+Active
+
+close dialog, load role view
+
+Session
+
+Authenticating
+
+401 wrong password, 403
+suspended / 423 [5th failure in 15
+min]
+
+Anonymous / Locked
+
+show the error inline / show
+lockedUntil, disable the form;
+Locked returns to Anonymous after
+the 15 min timer
+
+Session
+
+Active
+
+token near expiry (13 min)
+
+Refreshing
+
+POST /auth/refresh
+
+Session
+
+Refreshing
+
+200 / 401
+
+Active / Anonymous
+
+replace the token / clear state, close
+/ws
+
+Session
+
+Active,
+PasswordChangeRequired
+
+logout
+
+Anonymous
+
+POST /auth/logout; clear state
+
+Model version
+
+—
+
+POST /models/{id}/versions
+
+Uploading
+
+row created, presigned PUT; audit
+VERSION_UPLOAD
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+State machine
+
+From
+
+Event [guard]
+
+To
+
+Action
+
+Model version
+
+Uploading
+
+complete [object present, sha256
+and size match, metrics given]
+
+Registered
+
+sha256, size, metrics stored; audit
+VERSION_COMPLETE
+
+Model version
+
+Uploading
+
+complete [checksum or metrics
+fail]
+
+Failed
+
+422; reason in notes; re-created
+under a new version
+
+Model version
+
+Registered
+
+activate [BR-10 passes, or force
+with note]
+
+Active
+
+transaction of 3.2; previous Active
+becomes Inactive; model.activated
+
+Model version
+
+Active / Inactive
+
+another version activated /
+activate or rollback
+
+Inactive / Active
+
+deactivated_at set / same
+transaction, rollback note recorded
+
+Model version
+
+Registered, Inactive
+
+archive (design only)
+
+Archived
+
+artifact moved to Glacier by a
+lifecycle rule
+
+Tenant
+
+—
+
+POST /admin/tenants
+
+Active
+
+max_vehicles from plan; audit
+TENANT_CREATE
+
+Tenant
+
+Active / Suspended
+
+PATCH status = SUSPENDED
+[SYS_ADMIN] / = ACTIVE
+
+Suspended / Active
+
+logins answer 403, data kept (BR06), audit TENANT_UPDATE /
+logins allowed again
+
+Subscription
+
+—
+
+vehicle created (C2 hook)
+
+Enabled
+
+defaults: four available services,
+DASHBOARD and EMAIL
+
+Subscription
+
+Enabled / Disabled
+
+owner save [enabled = false] /
+[enabled = true, BR-04 passes]
+
+Disabled / Enabled
+
+C3 creates no alert for that service
+(BR-05) / audit
+SUBSCRIPTION_SAVE
+
+Subscription
+
+Enabled / Quiet
+
+now inside / outside quiet hours
+(derived)
+
+Quiet / Enabled
+
+alert created and shown, no email /
+email again
+
+3.4.2 Sequence diagrams
+The sequence diagrams follow the usage scenarios of Section 1.4; the lifelines are the classes of Section 3.1. Figure 11 is SQ1,
+login: AuthService.login loads the user, checks the tenant status, asks LoginThrottle whether the account is locked, verifies the
+password, and on success resets the throttle, asks TokenService for a token pair, and writes the LOGIN audit row; the outer alt
+frame shows the three refusals of Table 25 (generic 401 without an audit row, 403 suspended, 423 locked), the inner one
+record_failure with LOGIN_FAIL or LOGIN_LOCK, and LoginPage then calls GET /auth/me so that RoleRouter builds the
+menu (BR-01).
+Figure 12 is SQ5, the administrator creates a tenant and invites a user. AdminService.create_tenant checks the name (alt frame:
+409), sets max_vehicles from the plan, inserts the row, and writes TENANT_CREATE (BR-06); AdminService.create_user
+applies BR-07 (alt frame: 409 email exists, 400 tenant and role mismatch, as in Table 29), generates and hashes a temporary
+password, inserts the user with must_change_password set, writes USER_CREATE, and after the commit asks MailSender to
+send the SES invitation.
+Figure 13 is SQ8, activation and rollback: ModelsPage shows the ConfirmDialog with the two macro-F1 values and posts
+activate; the service locks the current ACTIVE row with SELECT ... FOR UPDATE, reads the target (first alt frame: 404 or
+409), applies the gate of Table 31 (second alt frame: 422 BR-10), swaps the statuses, writes MODEL_ACTIVATE, commits,
+and publishes model.activated twice: on the EventBus, which WsHub forwards to the staff room, and on the MQTT topic
+scicp/v1/platform/model/activated, from which the C4 classifier worker of Part III reloads the model between two clips; the last
+alt frame is the rollback, where the service finds the most recently deactivated version (409 when there is none), calls activate on
+it with force and the note, and writes a MODEL_ROLLBACK row in addition.
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+
+Figure 11: Sequence diagram SQ1: login
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+
+Figure 12: Sequence diagram SQ5: administrator creates a tenant and invites a user
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+
+Figure 13: Sequence diagram SQ8: activate a model version, with the rollback alternative
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+
+The overview load (SQ2; OverviewPage then calls GET /dashboard/map for the map card and repeats that call every 10 s), the
+live update of the overview (SQ3: C3 publishes alert.created, WsHub.on_event maps it to the tenant and staff rooms, WsClient
+dispatches it to OverviewPage, which inserts the row at the top of RecentAlertsTable, highlights it for 3 s, and increments the
+open-alert badge; a 30 s ping and pong heartbeat; after three missed pings polling GET /dashboard/overview every 10 s with the
+LiveBanner until the socket reconnects; alert.updated echoed after the acknowledge), statistics and CSV export (SQ4), first
+login with forced password change (SQ6), model upload through the presigned S3 URL (SQ7), and saving a subscription card
+(SQ9: scope, 404 for a vehicle outside the tenant, the loop over the services against Table 27, upsert and
+SUBSCRIPTION_SAVE in one transaction, and C3 reading the row at the next alert under Table 28) follow the same shape and
+are specified by Table 20 and Section 2. The write sequences share one order: the router resolves the guard and the scope, the
+service validates against the rule before touching the database, the write and its audit row go into one transaction, and anything
+that leaves the component (an SES email, an event on the bus) is sent only after the commit, which is what makes the audit log
+complete (BR-12) and keeps the C4 worker and the mail from acting on a write the database rolled back.
+
+3.4.3 Design decisions and alternatives
+Table 23 records the design decisions behind this section, the alternative we considered for each, and why we chose as we did;
+they are the ones we would revisit first in the full-scale design.
+Table 23: Design decisions and the alternatives considered
+Decision
+
+Chosen
+
+Session mechanism
+
+Stateless JWT access token (15 min) Server-side sessions in Redis or
+plus a hashed refresh token in
+MySQL
+MySQL
+
+Alternative
+
+Why
+No session store on the request path; the token carries
+tenant and role for every component; the refresh table
+still allows revocation on logout or reset. The cost is a
+15 min window after a disable, which we accept
+
+Live updates
+
+WebSocket /ws with rooms,
+heartbeat, and polling fallback
+
+Polling GET
+/dashboard/overview every 5 s
+
+The alert must be on the dashboard within about 1 s
+(O2); polling 2,000 users every 5 s would be most of
+the API load at full scale; the fallback keeps the page
+correct when a proxy drops the socket
+
+Vehicle map
+
+2D map (Leaflet with
+OpenStreetMap tiles [12]) fed by
+GET /dashboard/map every 10 s, the
+telemetry period of Part II: one
+marker per car from its newest
+vehicle_telemetry document, pins
+from GET /alerts/map of C3, the
+trail of the selected car from GET
+/vehicles/{id}/telemetry
+
+A 3D map (deck.gl or CesiumJS
+over terrain), or a
+vehicle.position WebSocket
+message per telemetry sample
+
+Positions change at most every 10 s, so a poll at that
+period is as fresh as an event and keeps the
+WebSocket for the alert and status messages; 2D tiles
+need no GPU and run on the demo instance; the 3D
+view is design only and would read the same endpoint
+
+Model upload path
+
+Presigned S3 PUT from the browser; Multipart upload through the
+API records checksum and metrics
+API
+
+Model files are hundreds of MB; passing them
+through FastAPI would hold a worker for minutes and
+double the transfer; the browser SHA-256 checked on
+complete gives the same integrity guarantee
+
+Activation gate
+
+Refuse when macro-F1 drops more
+than 0.05 unless force with a note
+(BR-10)
+
+No gate; or a hard rule with no
+override
+
+A small held-out set makes a one-point drop noise,
+and staff may need a version that fixes one class at a
+cost elsewhere; the override with a note keeps the
+decision in the audit log
+
+Deployment unit
+
+One FastAPI service with one
+module per component
+
+One microservice per
+component behind an ALB
+
+One service is what one EC2 instance and three
+developers can run this semester; the module
+boundaries, the EventBus class, and the internal
+clients are the seams along which the full-scale design
+splits it
+
+4. Component Business Logics
+The business rules BR-01 to BR-12 are referenced from the API tables, the pseudocode, and the flowcharts; Table 24 states each
+in one line, and the rules with more than one condition follow as decision tables, which is also how we will write their unit tests:
+one test per column.
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+
+Table 24: Business rules
+ID
+
+Rule
+
+Enforced in
+
+BR-01
+
+A role sees and may call only the pages and APIs of its view: OWNER and
+FLEET_MANAGER the owner view; RIDER a read-only alert page for the current trip;
+FLEET_MANAGER also the alert rules page of C3 for its fleet (Deliverable #1, Table 2 and
+UC-08); IOT_ENGINEER the IoT/device view and the registry (read); SERVICE_STAFF the
+staff view; SYS_ADMIN everything plus the admin pages
+
+RbacGuard, RoleRouter
+
+BR-02
+
+Login succeeds only for an ACTIVE user of an ACTIVE tenant (or a staff user) who is not
+locked and gives the right password; the fifth wrong password within a rolling 15-minute
+window (the counter resets 15 minutes after the last failure) locks the account for 15 minutes
+
+AuthService,
+LoginThrottle
+
+BR-03
+
+Data scope of every request: tenant roles see their own tenant; a RIDER (C3 alert page only,
+403 on the dashboard) sees only vehicles with an active vehicle_rider row; staff see the tenant
+they select
+
+TenantContext
+
+BR-04
+
+A subscription may enable only an available service, only channels the plan allows, with valid
+quiet hours; DASHBOARD is always on
+
+SubscriptionService
+
+BR-05
+
+Who is notified when C3 creates an alert: dashboard always; owner email if the service is
+enabled, not quiet, and EMAIL is on; rider email if notify_riders and a trip is active
+
+C3 reads the subscription
+row written by C1
+
+BR-06
+
+Tenants are created, suspended, and reactivated by SYS_ADMIN, never deleted; a suspended
+tenant cannot log in and keeps its data; the vehicle limit is max_vehicles by plan
+
+AdminService; C2
+checks the limit on POST
+/vehicles
+
+BR-07
+
+Staff roles have no tenant, tenant roles must have one; emails are unique platform-wide; the last
+SYS_ADMIN cannot be disabled
+
+AdminService
+
+BR-08
+
+Statistics granularity: a range of up to 2 days is bucketed by hour, up to 92 days by day; longer
+ranges are refused
+
+DashboardService,
+ReportService
+
+BR-09
+
+A CSV export is limited to 50,000 rows; owners export their own tenant, staff any tenant
+
+ReportService
+
+BR-10
+
+A version can be activated only if its artifact is present with a matching SHA-256 and its
+metrics are present, and its macro-F1 is not more than 0.05 below the active version unless
+force is set with a note; rollback is activation of the previous version
+
+ModelRegistryService
+
+BR-11
+
+One feedback label per event per user; labels are exported only for versions that have at least
+one
+
+ModelRegistryService
+
+BR-12
+
+Every administration and registry write, and every login and lock, writes an audit_log row with
+the before and after values
+
+AuditLogger
+
+4.1 Login decision (BR-02)
+Table 25 turns BR-02 into six rules; R1 answers the same generic 401 as a wrong password so the form cannot reveal which
+emails exist, and R2 applies to tenant roles only, because staff users have no tenant.
+Table 25: Decision table for login
+Condition / action
+
+R1
+
+R2
+
+R3
+
+R4
+
+R5
+
+R6
+
+User exists and status ≠ DISABLED
+
+N
+
+Y
+
+Y
+
+Y
+
+Y
+
+Y
+
+Tenant ACTIVE (or staff role)
+
+–
+
+N
+
+Y
+
+Y
+
+Y
+
+Y
+
+locked_until in the future
+
+–
+
+–
+
+Y
+
+N
+
+N
+
+N
+
+Password matches
+
+–
+
+–
+
+–
+
+N
+
+N
+
+Y
+
+failed_logins + 1 ≥ 5
+
+–
+
+–
+
+–
+
+N
+
+Y
+
+–
+
+→ Respond 401 (generic message)
+
+X
+
+→ Respond 403
+
+X
+X
+
+→ Respond 423 LOCKED
+
+X
+
+→ failed_logins + 1, last_failed_at = now; audit
+LOGIN_FAIL (R4)
+
+X
+X
+
+→ status LOCKED, locked_until = now + 15 min, audit
+LOGIN_LOCK
+
+X
+X
+
+→ failed_logins = 0, issue tokens, audit LOGIN
+
+X
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+
+4.2 Role and page access (BR-01)
+Table 26 is the access matrix that RbacGuard reads from one permissions file and returns to RoleRouter through GET /auth/me,
+so the menu and the API cannot disagree.
+Table 26: Decision table for page access (Y = page shown and API allowed)
+Page
+
+OWNER
+
+FLEET_
+MANAGER
+
+RIDER
+
+IOT_
+ENGINEER
+
+SERVICE_
+STAFF
+
+SYS_
+ADMIN
+
+Overview, Vehicle map, My
+vehicles
+
+Y
+
+Y
+
+–
+
+–
+
+Y (any tenant)
+
+Y (any tenant)
+
+Alert monitor and alert detail
+(C3 pages; staff see any tenant)
+
+Y
+
+Y
+
+read-only rider –
+page, own trip
+
+Y
+
+Y
+
+Subscriptions
+
+Y
+
+Y
+
+–
+
+–
+
+read
+
+read
+
+Reports
+
+Y
+
+Y
+
+–
+
+–
+
+Y
+
+Y
+
+Statistics dashboard
+
+–
+
+Y (own tenant)
+
+–
+
+–
+
+Y
+
+Y
+
+Vehicles, Devices, Provisioning Data tab of
+(C2 pages)
+My
+vehicles
+
+Data tab of My
+vehicles
+
+–
+
+Y
+
+Vehicles (read)
+
+Vehicles (read)
+
+Alert rules (C3 page; per-tenant
+thresholds, Deliverable #1 UC08)
+
+–
+
+Y (own fleet)
+
+–
+
+–
+
+Y
+
+Y
+
+AI models: versions, upload,
+activate
+
+–
+
+–
+
+–
+
+read
+
+Y
+
+Y
+
+Tenant list (GET
+/admin/tenants) for the staff
+tenant selector
+
+–
+
+–
+
+–
+
+read
+
+read
+
+Y
+
+Tenants, Users and roles, Alert
+types
+
+–
+
+–
+
+–
+
+–
+
+–
+
+Y
+
+Audit log, Platform health
+(design only)
+
+–
+
+–
+
+–
+
+–
+
+–
+
+Y
+
+4.3 Subscription validation (BR-04) and notification recipients (BR-05)
+Table 27 is applied once per service row of a PUT /subscriptions/{vehicleId} request and Table 28 by C3 when an alert is
+created, using the row C1 saved; quiet hours are evaluated in the tenant's time zone and may cross midnight (22:00 to 06:00,
+treated as wrapping around), and riders are a per-vehicle flag rather than a service because a rider is notified for whichever
+services the owner enabled.
+Table 27: Decision table for saving one service subscription
+Condition / action
+
+R1
+
+R2
+
+R3
+
+R4
+
+R5
+
+Service available (not design only) or enabled = false
+
+N
+
+Y
+
+Y
+
+Y
+
+Y
+
+All requested channels allowed by the plan (BASIC: DASHBOARD,
+EMAIL; others also SMS, PUSH in the full design)
+
+–
+
+N
+
+Y
+
+Y
+
+Y
+
+Quiet hours both given or both empty, and from ≠ to
+
+–
+
+–
+
+N
+
+Y
+
+Y
+
+DASHBOARD in channels
+
+–
+
+–
+
+–
+
+N
+
+Y
+
+→ 422 BR-04 with the failing field in details
+
+X
+
+X
+
+X
+
+→ Add DASHBOARD to channels
+
+X
+
+→ Upsert row, audit SUBSCRIPTION_SAVE
+
+X
+
+X
+
+Table 28: Decision table for alert recipients (applied by C3 using the C1 subscription row)
+Condition / action
+
+R1
+
+R2
+
+R3
+
+R4
+
+R5
+
+Subscription for the service enabled
+
+N
+
+Y
+
+Y
+
+Y
+
+Y
+
+Current time inside quiet hours
+
+–
+
+Y
+
+N
+
+N
+
+N
+
+EMAIL in channels
+
+–
+
+–
+
+N
+
+Y
+
+Y
+
+notify_riders and a vehicle_rider row is active now
+
+–
+
+–
+
+–
+
+N
+
+Y
+
+X
+
+X
+
+X
+
+X
+
+X
+
+X
+
+→ No alert created for this service (another enabled service may still fire) X
+→ Alert created and shown on the dashboard (WebSocket)
+→ Email to the owner (and fleet manager)
+→ Email to the active rider(s)
+
+X
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+
+4.4 Tenant and user administration (BR-06, BR-07)
+Table 29 covers POST and PATCH /admin/users; tenant creation needs no table, its only checks being a unique name and a
+known plan, whose limits (BASIC 3 vehicles, FLEET 50, ENTERPRISE 500) C1 stores in max_vehicles and C2 enforces on
+POST /vehicles.
+Table 29: Decision table for creating or updating a user
+Condition / action
+
+R1
+
+R2
+
+R3
+
+R4
+
+R5
+
+R6
+
+Email already exists
+
+Y
+
+N
+
+N
+
+N
+
+N
+
+N
+
+Role is a staff role (IOT_ENGINEER, SERVICE_STAFF,
+SYS_ADMIN)
+
+–
+
+Y
+
+Y
+
+N
+
+N
+
+Y
+
+tenantId given
+
+–
+
+Y
+
+N
+
+N
+
+Y
+
+N
+
+Update sets status DISABLED on the last ACTIVE
+SYS_ADMIN
+
+–
+
+–
+
+N
+
+–
+
+–
+
+Y
+
+→ 409 CONFLICT
+
+X
+
+→ 400 BR-07 (staff user must not have a tenant / tenant user
+must have one)
+
+X
+
+X
+
+→ 422 BR-07 (last administrator)
+
+X
+
+→ Write the row; on create generate a temporary password,
+hash it, send SES email, set must_change_password; audit
+
+X
+
+X
+
+4.5 Statistics and export (BR-08, BR-09)
+Table 30 is shared by GET /dashboard/stats and GET /reports/{type}; the range check runs before any query.
+Table 30: Decision table for the statistics and report range
+Condition / action
+
+R1
+
+R2
+
+R3
+
+R4
+
+to − from ≤ 2 days
+
+Y
+
+N
+
+–
+
+N
+
+to − from ≤ 92 days
+
+Y
+
+Y
+
+Y
+
+N
+
+Rows for CSV ≤ 50,000 (CSV only)
+
+Y
+
+Y
+
+N
+
+–
+
+→ 422 BR-08 (range too long)
+
+X
+
+→ 422 BR-09 (narrow the range)
+
+X
+
+→ granularity = hour
+
+X
+
+→ granularity = day
+
+X
+
+→ Run the three aggregations; stream CSV if requested
+
+X
+
+X
+
+4.6 Model activation and rollback (BR-10)
+Table 31 is the gate in ModelRegistryService.activate; the 0.05 margin exists because the held-out test set is small (a few
+hundred clips), so a one- or two-point drop can be noise, and a rollback calls the same method with the previous version and
+force = true, so it always passes.
+Table 31: Decision table for activating a version
+Condition / action
+
+R1
+
+R2
+
+R3
+
+R4
+
+R5
+
+R6
+
+Target status is REGISTERED or INACTIVE
+
+N
+
+Y
+
+Y
+
+Y
+
+Y
+
+Y
+
+Artifact present in S3 and SHA-256 matches
+
+–
+
+N
+
+Y
+
+Y
+
+Y
+
+Y
+
+metrics_json present
+
+–
+
+–
+
+N
+
+Y
+
+Y
+
+Y
+
+No active version, or macroF1 ≥ active macroF1 − 0.05
+
+–
+
+–
+
+–
+
+N
+
+N
+
+Y
+
+force = true and a note is given
+
+–
+
+–
+
+–
+
+N
+
+Y
+
+–
+
+→ 404 / 409
+
+X
+X
+
+X
+
+X
+X
+
+X
+
+→ 422 BR-10 with details.rule and the two macro-F1 values
+→ Transaction: current ACTIVE → INACTIVE, target →
+ACTIVE; audit MODEL_ACTIVATE; publish
+model.activated (EventBus and MQTT topic)
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+
+5. Component Graphic User Interface Design
+The user interface is the dashboard shell that all four views share plus the pages of the owner view (overview, vehicle map,
+vehicles, subscriptions, reports), the staff statistics and reports, the administration pages, and the AI model pages: 5.1 gives the
+style rules, 5.2 the function partition tree, 5.3 the storyboards, 5.4 the UI markup diagram, and 5.5 the page templates with the
+APIs behind each one; the alert and device pages are drawn in the C3 and C2 designs.
+
+5.1 GUI style
+Table 32 lists the rules every page follows, from the Deliverable #1 dashboard architecture and the Material UI defaults [8] (13–
+14 px body, 17 px titles, 24 px KPI numbers, 12 px tables with sticky headers; focus in reading order, dialogs trap focus and
+close with Esc, ARIA labels, WCAG AA contrast); the wireframes of all three parts are drawn with the same shell, palette, and
+type, and use the two seeded tenants and the seven sound classes.
+Table 32: GUI style guide
+Element
+
+Rule
+
+Layout
+
+One shell for every role: 200 px left menu filtered by role, 52 px top bar (page title, tenant selector for staff roles, global
+search, live indicator, open-alert badge, user menu), content area on a 12-column grid of cards; menu collapses to icons
+below 1024 px, grid to one column below 768 px
+
+Color
+
+Severity chips CRITICAL red, HIGH orange, MEDIUM yellow, LOW gray; device status ONLINE green, OFFLINE
+amber, FAULT red, PROVISIONING and REGISTERED gray, DISABLED gray with strike-through (Part II); alert
+status NEW blue and bold, ACKNOWLEDGED amber, RESOLVED green, FALSE_ALARM gray (Part III); model
+version ACTIVE green, INACTIVE gray; every chip carries its text
+
+Buttons
+
+Primary (filled blue) for the main action of a card, secondary (outlined) for the rest, destructive (red) for Suspend,
+Disable, Roll back, and Activate, which always open a confirm dialog first
+
+Feedback
+
+A toast at the bottom right for 4 s after a save, export, or activation; inline field errors from the 400 and 422 responses; a
+yellow banner when the WebSocket is down and the page is polling
+
+Live data
+
+Rows added by alert.created are highlighted for 3 s; the open-alert badge animates once; nothing moves under the mouse
+without the highlight
+
+Map
+
+One 2D map component (Leaflet, OpenStreetMap tiles [12]) on the overview card and the vehicle map page: one round
+marker per car labeled with the car code, green when its newest sample is under 30 s old, amber when older (OFFLINE,
+BR-C2-20 of Part II), with a heading arrow while the car moves; one pin per open alert in its severity color at the
+location of the event; the trail of the selected car as a blue line over its last 60 samples (10 min); markers move on each
+10 s refresh, the view keeps its zoom and center unless Follow is on; clicking a marker selects the car, clicking a pin
+opens the C3 alert page
+
+5.2 Function partition tree
+Figure 14 partitions the UI into its views and pages (the vehicle map is the page added after the GUI discussion of Oct. 28 so that
+the cars can be tracked on a map; the AI models sub-tree is the C4 registry hosted in the staff view; leaves with an asterisk are
+design only), drawn next to the UI markup diagram of Section 5.4.
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+
+Figure 14: UI function partition tree of the component
+
+Figure 15: UI markup diagram with the numbered regions of a page
+
+5.3 Storyboards
+Figure 16 and Figure 17 are the two demo scenarios, five screens each; arrows carry the user action, gray notes name the API
+calls and sequence diagrams. Storyboard A, the owner of Tenant A (UC1, then the subscription change of UC2 on her own car):
+sign in (A1), overview with the ACCIDENT alert 20482 on AV-01 in the alert list and as a pin next to the car on the map (A2),
+open and acknowledge it on the C3 alert page (A3), enable SECURITY with quiet hours on the card of AV-01 (A4), save (A5,
+toast). Storyboard B, the administrator then the service staff (UC4, UC5, UC3): sign in (B1), create Tenant C Campus Rides
+with the FLEET plan (B2), invite maria2 as its FLEET_MANAGER (B3), upload classifier 1.3.0 and activate it through the
+confirm dialog showing macro-F1 0.84 and 0.87 (B4), export the weekly statistics of Tenant B as CSV (B5).
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+
+Figure 16: Storyboard A: the owner checks the car after an alert and tunes the subscriptions (UC1, UC2)
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+
+Figure 17: Storyboard B: the administrator onboards a tenant, the service staff promotes a model version and exports statistics (UC4, UC5,
+UC3)
+
+5.4 UI markup diagram
+Figure 15 names the twelve regions every page is built from: gray regions 1–6 are the shell and never change; white regions 7–
+12 are filled by each page (7 KPI or filter row, 8 main content on 8 of 12 columns, 9 side or detail panel on 4 columns, 10 primary
+actions, 11 toast area, 12 dialog layer); the yellow LiveBanner of Section 2.7 appears between the top bar and region 7 when
+polling. A page is specified by regions 7 to 10, which is how Table 33 describes the templates; the wireframes carry the region
+numbers as gray tags.
+
+5.5 GUI templates
+Figure 18 is the owner overview, Figure 19 the vehicle map page, Figure 20 the administration pages, and Figure 21 the AI
+model pages; the overview and the model pages keep the layout of the Deliverable #1 wireframes (its Figure 11) with the map
+card added to the overview, the vehicle map and the administration pages are new here. Table 33 lists, for every page including
+login, subscriptions, reports, and statistics, the regions it fills, the APIs it calls, and the WebSocket messages it listens to.
+Table 33: Pages, regions, APIs, and live messages
+Page (view)
+
+Regions 7–10
+
+APIs
+
+Live messages
+
+Login
+
+No shell; centered form card
+
+POST /auth/login, GET /auth/me, POST
+/auth/password/change
+
+—
+
+Overview (owner)
+
+7 KPI tiles; 8 vehicle map card, vehicle cards,
+recent alerts; 9 subscriptions panel; 10 Open full
+map, Open vehicle, Play clip, Acknowledge,
+Open, Save settings, Cancel
+
+GET /dashboard/overview; GET
+alert.created,
+/dashboard/map every 10 s; GET, PUT
+alert.updated,
+/subscriptions; POST /alerts/{id}/actions (C3) device.status
+
+Vehicle map (owner, fleet
+manager)
+
+7 show filters (cars, open alerts, trail), Follow,
+refresh time; 8 full-width 2D map with markers,
+pins, and the trail of the selected car; 9 car list
+and the detail of the selected car; 10 Center,
+Open vehicle, Alerts of this car, Subscriptions
+
+GET /dashboard/map every 10 s; GET
+/vehicles/{id}/telemetry?limit=60 (C2) for the
+trail; GET /alerts/map (C3, through the map
+endpoint)
+
+alert.created,
+alert.updated (pins),
+device.status (marker
+color)
+
+My vehicles (owner)
+
+8 vehicle table with status and last event; 9
+vehicle detail with clip list
+
+GET /vehicles, GET /vehicles/{id}/clips (C2)
+
+device.status
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+Page (view)
+
+Regions 7–10
+
+APIs
+
+Live messages
+
+Subscriptions (owner)
+
+8 one card per vehicle with service toggles,
+channels, quiet hours; 10 Save, Cancel
+
+GET /subscriptions, GET /intelligenceservices, PUT /subscriptions/{vehicleId}
+
+—
+
+Reports (owner, staff)
+
+7 filter card; 8 chart and rows; 10 Run report,
+Export CSV, Export PDF (design only)
+
+GET /reports/{type}?format=json, GET
+/reports/{type}?format=csv
+
+—
+
+Statistics dashboard (staff,
+fleet manager)
+
+7 filters, KPI tiles; 8 alerts by type per day,
+events by class, device donut, top vehicles; 10
+Run, Export CSV
+
+GET /dashboard/stats, GET /reports/{type}?
+format=csv
+
+alert.created (KPI
+refresh)
+
+Tenants / Users and roles /
+Alert types (admin)
+
+8 tables in tabs; 9 edit panel; 10 New tenant,
+Invite user, Save, Reset password, Disable,
+Suspend, Edit (12 confirm for Suspend, Disable)
+
+GET, POST, PATCH /admin/tenants and
+/admin/users; POST .../reset-password; GET,
+PUT /admin/alert-types
+
+—
+
+AI models (staff; IoT
+engineer read-only)
+
+8 model list, versions table; 9 selected version:
+artifact, labels, held-out results; 10 Upload new
+version, Set as active, Roll back, Download,
+Export labels (12 confirm)
+
+GET, POST /models and .../versions;
+POST .../complete, .../activate,
+/models/{id}/rollback; GET .../download,
+.../feedback/export
+
+model.activated
+
+Alert monitor, alert detail, 8 alert header, spectrogram, top classes; 10
+alert rules (C3 pages hosted Acknowledge, Resolve, False alarm, feedback
+in the shell; Part III,
+label
+Section 5)
+
+GET, POST .../actions /alerts/{id} (C3);
+POST /events/{eventRef}/feedback
+
+alert.updated
+
+Figure 18: Owner overview template: KPI row (7), vehicle map card, vehicle cards, and recent alerts (8), subscriptions panel (9)
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+
+Figure 19: Vehicle map template: 2D map with one marker per car, alert pins, and the trail of the selected car; car list and detail panel
+
+Figure 20: System administration template: tenants, users and roles, alert types
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
+
+Figure 21: AI model management template: versions, activation, rollback, held-out results, feedback export
+
+Operation flow, fleet manager tracks a car: Vehicle map → the five cars of Tenant B appear at their newest positions (AV-14
+is listed without a position because it has never sent telemetry) → click AV-11 → its detail opens on the right and the trail of its
+last 10 minutes is drawn → Follow on → the map re-centers on AV-11 at every 10 s refresh → a SECURITY alert arrives on
+AV-12 over alert.created → a HIGH pin appears next to AV-12 at once and the open-alert badge goes to 2 → click the pin → the
+C3 alert page opens. Administrator invites a fleet manager: Tenants → select Tenant C → Users and roles → Invite user →
+email, name, role FLEET_MANAGER → Send → toast "Invitation sent" → SES email with a temporary password → first
+login → change-password dialog → the owner view of Tenant C opens. Staff activates a version: AI models → select 1.3.0
+(held-out macro-F1 0.87) → Set as active → confirm dialog "Active now 1.1.0 (macro-F1 0.84) → becomes INACTIVE; Target
+1.3.0 (macro-F1 0.87), BR-10 passes" → Activate → toast "Version 1.3.0 is active" → the ACTIVE chip moves and the
+classifier worker reloads within a few seconds, visible on the next alert detail, which prints the model version.
+
+References
+[1] Group 2 (A. Myadala, B. Rivera Venegas, R. Zhao), "Smart Car Intelligent Cloud Platform (SCICP): System Analysis and Design Document," CMPE
+281 Project Option #2, Deliverable #1, San Jose State University, Oct. 4, 2026.
+[2] C. Szyperski, D. Gruntz, and S. Murer, Component Software: Beyond Object-Oriented Programming, 2nd ed. Boston, MA, USA: Addison-Wesley,
+2002.
+[3] Object Management Group, "OMG Unified Modeling Language (OMG UML), Version 2.5.1," formal/2017-12-05, Dec. 2017.
+[4] M. Jones, J. Bradley, and N. Sakimura, "JSON Web Token (JWT)," IETF RFC 7519, May 2015.
+[5] I. Fette and A. Melnikov, "The WebSocket Protocol," IETF RFC 6455, Dec. 2011.
+[6] OpenAPI Initiative, "OpenAPI Specification v3.1.0," Feb. 2021.
+[7] FastAPI documentation, "Security, dependencies, and WebSockets," online documentation, 2026.
+[8] React documentation and Material UI documentation, online, 2026.
+[9] MySQL 8.0 Reference Manual, "InnoDB locking and transaction model," Oracle Corp., online documentation, 2026.
+[10] MongoDB, Inc., "Aggregation pipeline," MongoDB 7.0 Manual, online documentation, 2026.
+[11] Amazon Web Services, "Amazon S3 presigned URLs" and "Amazon SES Developer Guide," online documentation, 2026.
+[12] V. Agafonkin, "Leaflet: an open-source JavaScript library for mobile-friendly interactive maps," v1.9, online documentation, 2026; OpenStreetMap
+Foundation, "Tile usage policy," online, 2026.
+
+CMPE 281 Group 2 - SCICP Component Design Document (Deliverable #2)
