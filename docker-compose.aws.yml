@@ -3,19 +3,17 @@
 #   docker compose -f docker-compose.yml -f docker-compose.aws.yml up -d --build
 #
 # Differences from the laptop stack:
-#   * the model artifacts go to Amazon S3 (STORAGE_BACKEND=s3, bucket scicp-models in us-west-2)
-#     through the instance role, or AWS_S3_ACCESS_KEY / AWS_S3_SECRET_KEY in .env; the browser
-#     uploads and downloads with presigned S3 URLs (the bucket needs the CORS rule of README.md);
-#   * no MailHog: mail goes to the API log (MAIL_MODE=log) or to SES (MAIL_MODE=ses with a
-#     verified MAIL_FROM); MailHog is parked behind the "local" profile so it is not started;
+#   * the model artifacts stay on the instance's disk by default (AWS_STORAGE_BACKEND=local, the
+#     "objects" volume); set AWS_STORAGE_BACKEND=s3 in .env to use Amazon S3 instead (bucket
+#     scicp-models in us-west-2 through the instance role or AWS_S3_ACCESS_KEY / AWS_S3_SECRET_KEY;
+#     the bucket then needs the CORS rule of README.md);
+#   * mail goes to MailHog (web UI on port 8025, open it to your IP only in the security group),
+#     or to SES with AWS_MAIL_MODE=ses and a verified MAIL_FROM;
 #   * the web container is published on port 80 and CORS allows the public hostname;
 #   * MySQL, MongoDB and Mosquitto stay on the instance (no published database ports).
 # .env must set PUBLIC_HOST (the EC2 public DNS name or Elastic IP); deploy/ec2-bootstrap.sh does.
 
 services:
-  mailhog:
-    profiles: ["local"]
-
   mysql:
     ports: !override []
   mongo:
@@ -25,7 +23,7 @@ services:
 
   seed:
     environment:
-      STORAGE_BACKEND: s3
+      STORAGE_BACKEND: ${AWS_STORAGE_BACKEND:-local}
       S3_ENDPOINT_URL: ""
       S3_PUBLIC_ENDPOINT_URL: ""
       S3_ACCESS_KEY: ${AWS_S3_ACCESS_KEY:-}
@@ -35,27 +33,18 @@ services:
 
   api:
     environment:
-      STORAGE_BACKEND: s3
+      STORAGE_BACKEND: ${AWS_STORAGE_BACKEND:-local}
       S3_ENDPOINT_URL: ""
       S3_PUBLIC_ENDPOINT_URL: ""
       S3_ACCESS_KEY: ${AWS_S3_ACCESS_KEY:-}
       S3_SECRET_KEY: ${AWS_S3_SECRET_KEY:-}
       S3_REGION: ${S3_REGION:-us-west-2}
       AWS_DEFAULT_REGION: ${S3_REGION:-us-west-2}
-      MAIL_MODE: ${AWS_MAIL_MODE:-log}
+      MAIL_MODE: ${AWS_MAIL_MODE:-smtp}
       CORS_ORIGINS: http://${PUBLIC_HOST:-localhost},http://${PUBLIC_HOST:-localhost}:80,http://localhost:8080
       COOKIE_SECURE: "false"
     ports: !override
       - "127.0.0.1:8000:8000"   # API docs through an SSH tunnel only; the browser uses /api on port 80
-    depends_on: !override
-      mysql:
-        condition: service_healthy
-      mongo:
-        condition: service_healthy
-      seed:
-        condition: service_completed_successfully
-      mosquitto:
-        condition: service_started
 
   stubs:
     ports: !override

@@ -73,7 +73,7 @@ components reach the bus through `POST /internal/events` with a service token.
 ```
 README.md                 this file
 docker-compose.yml        local stack: mysql, mongo, mailhog, mosquitto, seed, api, stubs, web (+ volume objects)
-docker-compose.aws.yml    EC2 overrides (Amazon S3 for the artifacts, no MailHog, web on :80)
+docker-compose.aws.yml    EC2 overrides (web on :80, no published database ports, optional Amazon S3)
 .env.example              every variable with development defaults (copy to .env)
 c1/api/                   FastAPI backend (Python 3.11), package `app`, pytest suite in tests/
 c1/web/                   React 18 + TypeScript + Vite + MUI + Recharts + Leaflet + TanStack Query, Playwright smoke test
@@ -120,8 +120,8 @@ compose file). Without MailHog set `MAIL_MODE=log` and read the invitations in `
 ### Model artifacts and deployment
 
 The model artifacts (`models/{modelId}/{version}/model.pt`) are stored by the API itself on the
-named volume `objects` (`STORAGE_BACKEND=local`, `STORAGE_DIR=/data/objects`); on EC2 they go to
-Amazon S3 (`STORAGE_BACKEND=s3`, see below). The interface is the same in both cases: the API
+named volume `objects` (`STORAGE_BACKEND=local`, `STORAGE_DIR=/data/objects`), on the laptop and,
+by default, on EC2; set `AWS_STORAGE_BACKEND=s3` on EC2 to use Amazon S3 instead (see below). The interface is the same in both cases: the API
 hands out presigned URLs. Locally these are relative, HMAC-signed API paths
 (`/api/v1/storage/objects/<key>?op=put|get&exp=&sig=`, signed with `JWT_SECRET`, 15 min), so the
 browser uploads and downloads through nginx on whatever host name the page was opened with; each
@@ -199,13 +199,13 @@ the inline-stubs process above.
 
 ## AWS EC2 deployment
 
-1. Launch Ubuntu 24.04 LTS, `t3.small` or larger (the build needs ~2 GB RAM; add a 2 GB swap file on `t3.small`), 20 GB disk. Security group: 22 from your IP, 80 from anywhere. Attach an instance role with `s3:*` on `arn:aws:s3:::scicp-models*` (or put keys in `.env` as `AWS_S3_ACCESS_KEY` / `AWS_S3_SECRET_KEY`). Create the bucket `scicp-models` in `us-west-2` (private; the API only hands out presigned URLs) with a CORS rule allowing `PUT` and `GET` from `http://<public-host>`. `docker-compose.aws.yml` sets `STORAGE_BACKEND=s3` for the API and the seed (no endpoint URL: the regional S3 endpoint), so the seed uploads the two dummy artifacts to the bucket and the browser and the classifier worker use presigned S3 URLs.
+1. Launch Ubuntu 24.04 LTS (x86_64), `t3.medium` recommended (`t3.small` works: the bootstrap adds a 4 GB swap file because the image builds need about 3 GB of memory), 20 GB gp3 disk, a key pair, and a security group with 22 from your IP, 80 from anywhere, and 8025 (MailHog) from your IP. Nothing else is needed for the default setup: the model artifacts stay on the instance disk and the invitation emails go to MailHog. Optional Amazon S3 for the artifacts: set `AWS_STORAGE_BACKEND=s3` in `.env`, attach an instance role with `s3:*` on `arn:aws:s3:::scicp-models*` (or set `AWS_S3_ACCESS_KEY` / `AWS_S3_SECRET_KEY`), and create the private bucket `scicp-models` in `us-west-2` with a CORS rule allowing `PUT` and `GET` from `http://<public-host>`; the browser and the classifier worker then use presigned S3 URLs.
 2. SSH in and run the bootstrap (installs Docker, clones, writes `.env` with fresh secrets and the public hostname, starts the stack):
    ```bash
-   curl -fsSL https://raw.githubusercontent.com/<org>/<repo>/main/deploy/ec2-bootstrap.sh | bash -s -- https://github.com/<org>/<repo>.git
+   curl -fsSL https://raw.githubusercontent.com/anu-myadala/cmpe281_final_project_group2/main/deploy/ec2-bootstrap.sh | bash -s -- https://github.com/anu-myadala/cmpe281_final_project_group2.git
    ```
    or clone first and run `bash deploy/ec2-bootstrap.sh`. It ends with the URLs; the web app is `http://<public-host>/`.
-3. Operate: `docker compose -f docker-compose.yml -f docker-compose.aws.yml ps|logs -f|down`. After a stop/start of the instance the public DNS changes: run the bootstrap again (it rewrites `PUBLIC_HOST` and `CORS_ORIGINS`). Mail goes to the API log unless `AWS_MAIL_MODE=ses` with a verified `MAIL_FROM`. HTTPS is out of scope for the course demo; put an ALB or Caddy in front for a real deployment and set `COOKIE_SECURE=true`.
+3. Operate: `docker compose -f docker-compose.yml -f docker-compose.aws.yml ps|logs -f|down`. After a stop/start of the instance the public DNS changes: run the bootstrap again (it rewrites `PUBLIC_HOST` and `CORS_ORIGINS`). Mail goes to MailHog (`http://<public-host>:8025`); `AWS_MAIL_MODE=log` writes it to the API log instead and `AWS_MAIL_MODE=ses` sends it through SES with a verified `MAIL_FROM`. HTTPS is out of scope for the course demo; put an ALB or Caddy in front for a real deployment and set `COOKIE_SECURE=true`.
 
 ## Replacing the stubs by the real C2 and C3
 

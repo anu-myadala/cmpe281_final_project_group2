@@ -11,9 +11,9 @@
 #
 # Optional environment before running: REPO_URL, REPO_DIR (default ~/scicp), BRANCH (main),
 # PUBLIC_HOST (defaults to the instance's public DNS from the metadata service),
-# AWS_S3_ACCESS_KEY / AWS_S3_SECRET_KEY (only without an instance role), AWS_MAIL_MODE (log|ses).
-# The model artifacts go to the S3 bucket scicp-models (docker-compose.aws.yml sets
-# STORAGE_BACKEND=s3); create it in us-west-2 with the CORS rule of README.md first.
+# AWS_STORAGE_BACKEND (local, the default: artifacts on the instance disk; or s3 with the bucket
+# scicp-models in us-west-2 and the CORS rule of README.md), AWS_S3_ACCESS_KEY / AWS_S3_SECRET_KEY
+# (only for s3 without an instance role), AWS_MAIL_MODE (smtp to MailHog, the default; log; ses).
 set -euo pipefail
 
 REPO_URL="${1:-${REPO_URL:-}}"
@@ -43,6 +43,17 @@ fi
 # Use sudo for docker until the group change applies to a new login shell.
 DOCKER="docker"
 if ! docker info >/dev/null 2>&1; then DOCKER="sudo docker"; fi
+
+# ---------------------------------------------------------------- 1b. Swap (the image builds need ~3 GB of memory)
+MEM_KB="$(awk '/MemTotal/ {print $2}' /proc/meminfo)"
+if [ "$MEM_KB" -lt 3500000 ] && ! swapon --show | grep -q /swapfile; then
+  log "Adding a 4 GB swap file (instance has $((MEM_KB / 1024)) MB of memory)"
+  sudo fallocate -l 4G /swapfile
+  sudo chmod 600 /swapfile
+  sudo mkswap /swapfile >/dev/null
+  sudo swapon /swapfile
+  grep -q '^/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab >/dev/null
+fi
 
 # ---------------------------------------------------------------- 2. Repository
 if [ -f "$(pwd)/docker-compose.yml" ] && [ -d "$(pwd)/c1" ]; then
@@ -97,7 +108,8 @@ if [ ! -f .env ]; then
     -e "s|^WEB_PORT=.*|WEB_PORT=80|" \
     -e "s|^AWS_S3_ACCESS_KEY=.*|AWS_S3_ACCESS_KEY=${AWS_S3_ACCESS_KEY:-}|" \
     -e "s|^AWS_S3_SECRET_KEY=.*|AWS_S3_SECRET_KEY=${AWS_S3_SECRET_KEY:-}|" \
-    -e "s|^AWS_MAIL_MODE=.*|AWS_MAIL_MODE=${AWS_MAIL_MODE:-log}|" \
+    -e "s|^AWS_MAIL_MODE=.*|AWS_MAIL_MODE=${AWS_MAIL_MODE:-smtp}|" \
+    -e "s|^AWS_STORAGE_BACKEND=.*|AWS_STORAGE_BACKEND=${AWS_STORAGE_BACKEND:-local}|" \
     .env
 fi
 # The public host may change after a stop/start of the instance: always refresh it.
@@ -121,6 +133,7 @@ cat <<EOF
 SCICP is up.
   Web app     http://${PUBLIC_HOST}/
   API health  http://${PUBLIC_HOST}/api/v1/health
+  MailHog     http://${PUBLIC_HOST}:8025/   (open port 8025 to your IP in the security group)
   API docs    ssh -L 8000:127.0.0.1:8000 ubuntu@${PUBLIC_HOST}  then  http://localhost:8000/api/v1/docs
   Logs        docker compose -f docker-compose.yml -f docker-compose.aws.yml logs -f api stubs
   Worker      docker compose -f docker-compose.yml -f docker-compose.aws.yml logs stubs | grep worker
