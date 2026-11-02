@@ -46,18 +46,24 @@ front end, the stubs, and the seed rely on. OpenAPI is served at `/api/v1/docs` 
 - `GET/POST/PATCH /admin/users`, `POST /admin/users/{id}/reset-password`, `GET/PUT /admin/alert-types`. Pagination `page` (1-based), `size` (default 25, max 100 -> 400).
 
 ## Models (C4 registry)
-- `GET/POST /models`, `GET /models/{id}/versions`, `POST /models/{id}/versions {version, sizeBytes, sha256?, notes?}` -> `{versionId, version, status, upload{url, key, expiresInSeconds}}` (presigned PUT to S3/MinIO),
+- `GET/POST /models`, `GET /models/{id}/versions`, `POST /models/{id}/versions {version, sizeBytes, sha256?, notes?}` -> `{versionId, version, status, upload{url, key, expiresInSeconds}}` (presigned PUT: a relative signed `/api/v1/storage/objects/...` URL with STORAGE_BACKEND=local, an S3 URL with s3),
   `POST /models/{id}/versions/{vid}/complete {sha256, metrics{macroF1, accuracy, perClass}}`, `POST .../activate {force?, note?}` -> `{active, previous, modelId}` (422 BR-10 details `{rule, activeMacroF1, targetMacroF1}`),
-  `POST /models/{id}/rollback`, `GET .../download` -> presigned GET, `GET .../feedback/export` CSV.
+  `POST /models/{id}/rollback`, `GET .../download` -> 302 to the presigned GET (relative Location locally), `GET .../feedback/export` CSV.
+- `GET /models/{id}/deployment` (IOT_ENGINEER, SERVICE_STAFF, SYS_ADMIN) -> `{modelId, activeVersion, workers[{workerId, modelVersion, state READY|LOADING|FAILED, loadedAt, sha256, sha256Verified, lastHeartbeatAt, detail, stale, runsActiveVersion}], asOf}`.
+- Local storage (STORAGE_BACKEND=local): `PUT /storage/objects/{key}?op=put&exp&sig` (body = bytes, streamed to a temp file and renamed; answers `{key, sizeBytes, sha256}`) and `GET /storage/objects/{key}?op=get&exp&sig` (attachment). `sig` = HMAC-SHA256(JWT_SECRET, "op\nkey\nexp"); a bad or expired signature answers 403 FORBIDDEN. 404 with STORAGE_BACKEND=s3.
 - `POST /events/{eventRef}/feedback {label: FALSE_ALARM|CONFIRMED|WRONG_CLASS, correctedClass?}` -> 201.
 
 ## WebSocket
 - `/ws` (also `/api/v1/ws`): first message `{"type":"auth","token":"<jwt>"}` within 10 s; close 4401 on failure; no ack; server `{"type":"ping"}` every 30 s -> answer `{"type":"pong"}`;
-  messages `alert.created {type, alert{...}}`, `alert.updated {type, alertId, status, by}`, `device.status {type, vehicleId, deviceId, status, lastSeenAt, faultReason?, muted?, config?}`, `model.activated {type, modelId, version}`.
+  messages `alert.created {type, alert{...}}`, `alert.updated {type, alertId, status, by}`, `device.status {type, vehicleId, deviceId, status, lastSeenAt, faultReason?, muted?, config?}`, `model.activated {type, modelId, version}`,
+  `model.deployed {type, workerId, modelId, modelName, modelVersion, state, loadedAt, sha256, sha256Verified, detail, lastHeartbeatAt}` (staff room only, like model.activated).
 
 ## Internal (service token: JWT with role SERVICE signed with SERVICE_TOKEN_SECRET, mint with `container.tokens.issue_service_token()`)
 - `POST /internal/events {topic, payload, tenantId}` (tenantId numeric or code "tA"); alert.created puts the alert under `payload.alert`.
 - `POST /internal/subscriptions/defaults {vehicleId, tenantId}` -> 201; `GET /internal/subscriptions?tenantId&vehicleId` -> rows with channels[], quiet hours, notifyRiders, timeZone.
+- C4 classifier worker: `GET /internal/models/active?modelId|name` (default `sound-classifier`) -> `{modelId, name, version, tag, sha256, sizeBytes, downloadUrl, expiresInSeconds, activatedAt}` (404 without an ACTIVE version; a relative downloadUrl is resolved against C1_BASE_URL's host);
+  `POST /internal/worker/status {workerId, modelId?, modelVersion, sha256?, state: READY|LOADING|FAILED, loadedAt?, detail?}` -> the stored entry; `sha256Verified` is true only for READY with the digest recorded in model_version.
+  The simulated worker (stubs/worker.py) is woken by MQTT `scicp/v1/platform/model/activated` (inline: the EventBus) and polls every 30 s; the demo generator stamps `inference.modelVersion` (and `alert.model_version`) of new events with the version the worker has loaded.
 - What C1 calls on the stubs: C2 `GET /vehicles?tenantId&size=100` (reads `items`), `GET /vehicles/{vehicleId}/devices`; C3 `GET /alerts?status=OPEN&tenantId&limit&size&sort=createdAt` (items/total),
   `GET /alerts/{alertId}`, `GET /alerts/map?status=OPEN&tenantId` (bare list or {items}). The stubs must accept the same service token.
 - Inline stubs: `app.main.stubs_mount(app, container)` imports `stubs.app` (needs `c2_router`, `c3_router` APIRouters and `async def demo_generator(eventbus, mongo_db, mysql_url)`), mounts them at `/c2/api/v1` and `/c3/api/v1` when STUBS_INLINE=1.
@@ -71,4 +77,4 @@ front end, the stubs, and the seed rely on. OpenAPI is served at `/api/v1/docs` 
 - The stubs must accept BOTH the user JWT (same JWT_SECRET, enforce the tenant of the token for tenant roles) and the service token (SERVICE_TOKEN_SECRET).
 - `alert.created` payload should carry `alert{alertId, vehicleId, type, severity, status, topClass, confidence, createdAt, lat, lon}` so the map pin appears at once.
 - Routing: Vite dev proxies /c2 and /c3 to the API process (inline stubs); nginx (c1/web/nginx/default.conf) proxies `/c2/` -> `http://stubs:8002/` and `/c3/` -> `http://stubs:8003/`, so the standalone stub apps serve under `/api/v1/...`.
-- MinIO/S3 must allow CORS PUT and GET from the web origin (model upload and download go browser -> bucket through presigned URLs; `S3_PUBLIC_ENDPOINT_URL` is what the browser reaches).
+- Model upload and download go browser -> storage through presigned URLs: locally they are same-origin API paths (nginx: `client_max_body_size 512m`, `proxy_request_buffering off` on /api/); on EC2 the S3 bucket must allow CORS PUT and GET from the web origin.

@@ -30,12 +30,12 @@ flowchart LR
     A[C1 API, FastAPI :8000<br/>auth, dashboard, subscriptions,<br/>reports, admin, models, /ws]
     S2[C2 vehicles / devices / telemetry<br/>stub :8002]
     S3[C3 alerts / rules<br/>stub :8003]
-    G[demo event generator]
+    G[demo event generator<br/>+ C4 classifier worker]
   end
   subgraph Data
     M[(MySQL 8)]
     D[(MongoDB 7<br/>audio_events,<br/>vehicle_telemetry)]
-    O[(S3 / MinIO<br/>scicp-models, scicp-clips)]
+    O[(model artifacts<br/>local volume or S3 scicp-models)]
     Q[Mosquitto MQTT]
     E[MailHog / SES]
   end
@@ -52,6 +52,8 @@ flowchart LR
   A --- D
   A --- O
   A -->|model.activated| Q
+  Q -->|model.activated| G
+  G -->|GET /internal/models/active,<br/>POST /internal/worker/status| A
   A -->|invitations| E
   S2 --- M
   S2 --- D
@@ -70,13 +72,13 @@ components reach the bus through `POST /internal/events` with a service token.
 
 ```
 README.md                 this file
-docker-compose.yml        local stack: mysql, mongo, minio(+init), mailhog, mosquitto, seed, api, stubs, web
-docker-compose.aws.yml    EC2 overrides (real S3, no MinIO/MailHog, web on :80)
+docker-compose.yml        local stack: mysql, mongo, mailhog, mosquitto, seed, api, stubs, web (+ volume objects)
+docker-compose.aws.yml    EC2 overrides (Amazon S3 for the artifacts, no MailHog, web on :80)
 .env.example              every variable with development defaults (copy to .env)
 c1/api/                   FastAPI backend (Python 3.11), package `app`, pytest suite in tests/
 c1/web/                   React 18 + TypeScript + Vite + MUI + Recharts + Leaflet + TanStack Query, Playwright smoke test
-seed/                     seed.py: idempotent MySQL + MongoDB (+ bucket) seed with the Deliverable #2 sample data
-stubs/                    C2 and C3 stand-ins (FastAPI) + demo event generator; inline or standalone
+seed/                     seed.py: idempotent MySQL + MongoDB (+ model artifacts) seed with the Deliverable #2 sample data
+stubs/                    C2 and C3 stand-ins (FastAPI) + demo event generator + simulated C4 classifier worker; inline or standalone
 deploy/                   ec2-bootstrap.sh, mosquitto.conf, DEMO_SCRIPT.md
 docs/                     BRIEF.md, API_NOTES.md, the design (spec_DESIGN.md, spec_part1..3, spec_overview)
 ```
@@ -103,12 +105,36 @@ and exits 0; `api` waits for it. Then:
 | API health | http://localhost:8000/api/v1/health |
 | C2 / C3 stub docs | http://localhost:8002/api/v1/docs, http://localhost:8003/api/v1/docs |
 | MailHog (invitation emails) | http://localhost:8025 |
-| MinIO console | http://localhost:9001 (minioadmin / minioadmin) |
 | MySQL / MongoDB / MQTT | localhost:3306 (scicp/scicp), localhost:27017, localhost:1883 |
 
 Useful commands: `docker compose logs -f api stubs`, `docker compose exec mysql mysql -uscicp -pscicp scicp`,
 `docker compose exec mongo mongosh scicp`, `docker compose run --rm seed` (re-seed; existing rows are kept),
-`docker compose down -v` (fresh databases).
+`docker compose down -v` (fresh databases and artifacts).
+
+All images are official multi-architecture images (mysql:8.0, mongo:7, eclipse-mosquitto:2,
+python:3.11-slim, node:20-alpine, nginx:1.27-alpine), so the stack builds natively on an
+Apple-silicon Mac and on an x86 EC2 instance. The one exception is `mailhog/mailhog`, which is
+published for amd64 only; Docker Desktop runs it under emulation (`platform: linux/amd64` in the
+compose file). Without MailHog set `MAIL_MODE=log` and read the invitations in `docker compose logs api`.
+
+### Model artifacts and deployment
+
+The model artifacts (`models/{modelId}/{version}/model.pt`) are stored by the API itself on the
+named volume `objects` (`STORAGE_BACKEND=local`, `STORAGE_DIR=/data/objects`); on EC2 they go to
+Amazon S3 (`STORAGE_BACKEND=s3`, see below). The interface is the same in both cases: the API
+hands out presigned URLs. Locally these are relative, HMAC-signed API paths
+(`/api/v1/storage/objects/<key>?op=put|get&exp=&sig=`, signed with `JWT_SECRET`, 15 min), so the
+browser uploads and downloads through nginx on whatever host name the page was opened with; each
+object gets a `<file>.sha256` sidecar with its digest.
+
+The stubs container also runs a simulated C4 classifier worker (`stubs/worker.py`). After an
+activation or a rollback it is notified on MQTT (`scicp/v1/platform/model/activated`, QoS 1,
+retained; inline mode: the EventBus topic `model.activated`) and polls C1 every 30 s as a fallback.
+It asks `GET /internal/models/active` for the version, its SHA-256 and a presigned download URL,
+downloads and verifies the artifact, and reports `POST /internal/worker/status` (LOADING, then READY
+or FAILED). The **AI models** page shows this in the Deployment card (live through the WebSocket
+message `model.deployed`), and new alerts from the demo generator carry the version the worker has
+loaded (`inference.modelVersion`, shown on the alert detail page).
 
 ## Demo accounts
 
@@ -137,6 +163,7 @@ startup and the in-process MongoDB mock.
 cd c1/api
 pip install -r requirements.txt
 DATABASE_URL=mysql+pymysql://scicp:scicp@127.0.0.1/scicp MONGO_URL=mock SEED_ON_START=1 STUBS_INLINE=1 \
+  STORAGE_DIR=./objects C1_BASE_URL=http://127.0.0.1:8000/api/v1 \
   C2_BASE_URL=http://127.0.0.1:8000/c2/api/v1 C3_BASE_URL=http://127.0.0.1:8000/c3/api/v1 \
   python3 -m uvicorn app.main:app --port 8000 --reload
 # in another terminal
@@ -144,7 +171,8 @@ cd c1/web && npm ci && npm run dev        # http://localhost:5173, proxies /api,
 ```
 
 Without a MySQL server use `DATABASE_URL=sqlite+aiosqlite:///./dev.db`. The generator
-publishes straight on the EventBus in this mode; `DEMO_ALERT_PERIOD_S=30` makes alerts arrive
+publishes straight on the EventBus in this mode, and the classifier worker listens to
+`model.activated` on it (it reaches the API over HTTP at `C1_BASE_URL`); `DEMO_ALERT_PERIOD_S=30` makes alerts arrive
 faster while developing. The stubs can also run on their own: `python -m stubs.standalone`
 (ports 8002/8003, `C1_BASE_URL=http://127.0.0.1:8000/api/v1`), with `STUBS_INLINE=0` and the
 default `C2_BASE_URL`/`C3_BASE_URL` on the API.
@@ -152,10 +180,17 @@ default `C2_BASE_URL`/`C3_BASE_URL` on the API.
 ## Tests
 
 ```bash
-cd c1/api && python -m pytest -q                 # 78 tests: BR-02/04/06/07/08/09/10/11 decision tables, tenancy, WebSocket
+cd c1/api && python -m pytest -q                 # 90 tests: BR-02/04/06/07/08/09/10/11 decision tables, tenancy, WebSocket,
+                                                 # signed local storage, model deployment endpoints
 cd c1/web && npm run typecheck && npm run build  # tsc --noEmit, Vite production build
 cd c1/web && npx playwright test                 # smoke: login -> overview -> map -> subscriptions -> reports -> admin -> models
+cd c1/web && E2E_BASE_URL=http://localhost:8080 npx playwright test   # against the running docker compose stack
 ```
+
+With `E2E_BASE_URL` the configuration starts no server and also runs `tests/stack.spec.ts`: the
+owner flow, Maria's moving cars and a live acknowledge seen from a second session, and the admin
+flow (tenant, invitation found in MailHog's API on :8025, model upload through the UI, activation
+with the BR-10 dialog, the Deployment card going LOADING -> READY, rollback).
 
 The backend tests use SQLite and the MongoDB mock by default (`TEST_DATABASE_URL` switches to
 MySQL/MariaDB). The Playwright configuration starts the API (SQLite, seeded) and the Vite dev
@@ -164,7 +199,7 @@ the inline-stubs process above.
 
 ## AWS EC2 deployment
 
-1. Launch Ubuntu 24.04 LTS, `t3.small` or larger (the build needs ~2 GB RAM; add a 2 GB swap file on `t3.small`), 20 GB disk. Security group: 22 from your IP, 80 from anywhere. Attach an instance role with `s3:*` on `arn:aws:s3:::scicp-models*` (or put keys in `.env` as `AWS_S3_ACCESS_KEY` / `AWS_S3_SECRET_KEY`). Create the bucket `scicp-models` in `us-west-2` (private; the API only hands out presigned URLs) with a CORS rule allowing `PUT` and `GET` from `http://<public-host>`.
+1. Launch Ubuntu 24.04 LTS, `t3.small` or larger (the build needs ~2 GB RAM; add a 2 GB swap file on `t3.small`), 20 GB disk. Security group: 22 from your IP, 80 from anywhere. Attach an instance role with `s3:*` on `arn:aws:s3:::scicp-models*` (or put keys in `.env` as `AWS_S3_ACCESS_KEY` / `AWS_S3_SECRET_KEY`). Create the bucket `scicp-models` in `us-west-2` (private; the API only hands out presigned URLs) with a CORS rule allowing `PUT` and `GET` from `http://<public-host>`. `docker-compose.aws.yml` sets `STORAGE_BACKEND=s3` for the API and the seed (no endpoint URL: the regional S3 endpoint), so the seed uploads the two dummy artifacts to the bucket and the browser and the classifier worker use presigned S3 URLs.
 2. SSH in and run the bootstrap (installs Docker, clones, writes `.env` with fresh secrets and the public hostname, starts the stack):
    ```bash
    curl -fsSL https://raw.githubusercontent.com/<org>/<repo>/main/deploy/ec2-bootstrap.sh | bash -s -- https://github.com/<org>/<repo>.git

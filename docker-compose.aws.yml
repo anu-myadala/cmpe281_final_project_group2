@@ -3,20 +3,16 @@
 #   docker compose -f docker-compose.yml -f docker-compose.aws.yml up -d --build
 #
 # Differences from the laptop stack:
-#   * no MinIO and no MailHog: the model bucket is Amazon S3 in us-west-2 (the instance role, or
-#     AWS_S3_ACCESS_KEY / AWS_S3_SECRET_KEY in .env; the MinIO keys of the base file are never
-#     used here), mail goes to the log (MAIL_MODE=log) or to SES
-#     (MAIL_MODE=ses with a verified MAIL_FROM); the local-only services are parked behind the
-#     "local" profile so that they are not started here;
+#   * the model artifacts go to Amazon S3 (STORAGE_BACKEND=s3, bucket scicp-models in us-west-2)
+#     through the instance role, or AWS_S3_ACCESS_KEY / AWS_S3_SECRET_KEY in .env; the browser
+#     uploads and downloads with presigned S3 URLs (the bucket needs the CORS rule of README.md);
+#   * no MailHog: mail goes to the API log (MAIL_MODE=log) or to SES (MAIL_MODE=ses with a
+#     verified MAIL_FROM); MailHog is parked behind the "local" profile so it is not started;
 #   * the web container is published on port 80 and CORS allows the public hostname;
 #   * MySQL, MongoDB and Mosquitto stay on the instance (no published database ports).
 # .env must set PUBLIC_HOST (the EC2 public DNS name or Elastic IP); deploy/ec2-bootstrap.sh does.
 
 services:
-  minio:
-    profiles: ["local"]
-  minio-init:
-    profiles: ["local"]
   mailhog:
     profiles: ["local"]
 
@@ -29,20 +25,17 @@ services:
 
   seed:
     environment:
+      STORAGE_BACKEND: s3
       S3_ENDPOINT_URL: ""
       S3_PUBLIC_ENDPOINT_URL: ""
       S3_ACCESS_KEY: ${AWS_S3_ACCESS_KEY:-}
       S3_SECRET_KEY: ${AWS_S3_SECRET_KEY:-}
       S3_REGION: ${S3_REGION:-us-west-2}
       AWS_DEFAULT_REGION: ${S3_REGION:-us-west-2}
-    depends_on: !override
-      mysql:
-        condition: service_healthy
-      mongo:
-        condition: service_healthy
 
   api:
     environment:
+      STORAGE_BACKEND: s3
       S3_ENDPOINT_URL: ""
       S3_PUBLIC_ENDPOINT_URL: ""
       S3_ACCESS_KEY: ${AWS_S3_ACCESS_KEY:-}

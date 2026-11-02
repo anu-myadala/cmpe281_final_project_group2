@@ -1,6 +1,6 @@
 """Idempotent seed of the SCICP demo data (docs/BRIEF.md, "Seed data").
 
-Usage as a CLI (reads DATABASE_URL, MONGO_URL and the S3 variables):
+Usage as a CLI (reads DATABASE_URL, MONGO_URL and STORAGE_BACKEND with its variables):
 
     python -m seed.seed
 
@@ -13,7 +13,7 @@ What it writes:
           subscription, alert, alert_action, ai_model, model_version, feedback_label
   MongoDB audio_events (~400 documents over 14 days), vehicle_telemetry (10 min of
           samples per online car around SJSU; AV-13 stopped 14 min ago; AV-14 none)
-  S3      the two dummy model artifacts, only when the bucket is reachable
+  storage the two dummy model artifacts (local volume or S3), when it is reachable
 Every row has a natural key, so running the seed twice changes nothing except
 the telemetry samples, which are rebuilt relative to "now" for the demo.
 """
@@ -23,7 +23,6 @@ import asyncio
 import hashlib
 import logging
 import math
-import os
 import random
 import sys
 import uuid
@@ -346,7 +345,8 @@ async def seed_models(session, storage) -> None:
             ModelVersion.model_id == 1, ModelVersion.version == version))).scalar_one_or_none()
         if existing is None:
             session.add(ModelVersion(model_id=1, version=version, status=status,
-                                     artifact_uri=f"s3://{getattr(storage, 'bucket', 'scicp-models')}/{key}",
+                                     artifact_uri=(storage.artifact_uri(1, version) if storage is not None
+                                                   else f"local://scicp-models/{key}"),
                                      sha256=sha, size_bytes=len(data),
                                      metrics_json={"macroF1": f1, "accuracy": acc, "perClass": per_class_metrics(rng, f1)},
                                      notes=notes, created_by=1006, created_at=created, activated_at=activated))
@@ -361,7 +361,7 @@ async def seed_models(session, storage) -> None:
                 except Exception as exc:  # noqa: BLE001
                     log.warning("Artifact upload skipped for %s: %s", key, exc)
             else:
-                log.info("S3 not reachable: artifact %s not uploaded (sha256 and size still recorded)", key)
+                log.info("Storage not reachable: artifact %s not uploaded (sha256 and size still recorded)", key)
     await session.flush()
 
 
@@ -522,12 +522,13 @@ async def run(engine_or_url, mongo_db, storage=None) -> Dict[str, int]:
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     from app.config import Settings
-    from app.clients import StorageClient
+    from app.clients import make_storage
 
     settings = Settings()
     mongo_db = make_mongo(settings.mongo_url, settings.mongo_database_name)
-    storage = StorageClient(settings) if (settings.s3_endpoint_url or settings.s3_access_key or
-                                          os.environ.get("AWS_PROFILE")) else None
+    # The same client the API uses (STORAGE_BACKEND=local: the shared "objects" volume;
+    # s3: the scicp-models bucket through the instance role or the keys in .env).
+    storage = make_storage(settings)
     counts = asyncio.run(run(settings.database_url, mongo_db, storage=storage))
     print(counts)
 

@@ -109,6 +109,9 @@ test.describe('SCICP C1 smoke', () => {
     await expect(versions).toContainText('1.1.0');
     await expect(versions).toContainText('1.2.0');
     await expect(versions.locator('[data-status="ACTIVE"]')).toHaveCount(1);
+    // The page preselects the newest non-active version; pick 1.2.0 explicitly so that a
+    // registry with later uploads (a reused stack) gives the same panel.
+    await versions.locator('tbody tr').filter({ hasText: /^1\.2\.0/ }).click();
     await expect(page.getByTestId('version-panel')).toContainText('Version 1.2.0');
     await expect(page.getByTestId('metrics-table')).toContainText('siren');
     await expect(page.getByTestId('set-active')).toBeEnabled();

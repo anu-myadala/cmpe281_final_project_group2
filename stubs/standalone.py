@@ -81,6 +81,7 @@ async def serve() -> None:
     settings = Settings()
     logging.basicConfig(level=getattr(logging, settings.log_level.upper(), logging.INFO),
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     c2_app, c3_app, ctx, engine, mongo = build_apps(settings)
     host = os.environ.get("STUBS_HOST", "0.0.0.0")
     c2_port = int(os.environ.get("STUBS_C2_PORT", "8002"))

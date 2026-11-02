@@ -15,6 +15,9 @@ venv/
 *.db
 *.db-journal
 *.sqlite
+# Local artifact storage of the developer / e2e runs (STORAGE_BACKEND=local)
+e2e-objects/
+objects/
 
 # Node / Vite
 node_modules/

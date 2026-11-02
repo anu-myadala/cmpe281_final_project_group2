@@ -12,6 +12,8 @@
 # Optional environment before running: REPO_URL, REPO_DIR (default ~/scicp), BRANCH (main),
 # PUBLIC_HOST (defaults to the instance's public DNS from the metadata service),
 # AWS_S3_ACCESS_KEY / AWS_S3_SECRET_KEY (only without an instance role), AWS_MAIL_MODE (log|ses).
+# The model artifacts go to the S3 bucket scicp-models (docker-compose.aws.yml sets
+# STORAGE_BACKEND=s3); create it in us-west-2 with the CORS rule of README.md first.
 set -euo pipefail
 
 REPO_URL="${1:-${REPO_URL:-}}"
@@ -121,5 +123,6 @@ SCICP is up.
   API health  http://${PUBLIC_HOST}/api/v1/health
   API docs    ssh -L 8000:127.0.0.1:8000 ubuntu@${PUBLIC_HOST}  then  http://localhost:8000/api/v1/docs
   Logs        docker compose -f docker-compose.yml -f docker-compose.aws.yml logs -f api stubs
+  Worker      docker compose -f docker-compose.yml -f docker-compose.aws.yml logs stubs | grep worker
 Accounts (password Passw0rd!demo): anh@example.com, maria@bayshuttle.example, staff@scicp.example, admin@scicp.example
 EOF

@@ -171,8 +171,10 @@ class ModelVersion(Base):
     def artifact_key(self) -> str:
         """Object key inside the models bucket (models/{modelId}/{version}/model.pt)."""
         uri = self.artifact_uri
-        if uri.startswith("s3://"):
-            return uri[5:].split("/", 1)[1]
+        # s3://scicp-models/<key> (Amazon S3) or local://scicp-models/<key> (local volume)
+        for scheme in ("s3://", "local://"):
+            if uri.startswith(scheme):
+                return uri[len(scheme):].split("/", 1)[1]
         return uri
 
     @property

@@ -1,5 +1,6 @@
 // StatusChip: every chip carries its text and the palette of the style guide
-// (severity, device connection, alert status, model version status, tenant / user status).
+// (severity, device connection, alert status, model version status, worker state,
+// tenant / user status).
 import Chip from '@mui/material/Chip';
 
 type Kind = 'red' | 'orange' | 'yellow' | 'amber' | 'green' | 'blue' | 'gray' | 'strike';
@@ -29,6 +30,8 @@ const KIND_BY_TEXT: Record<string, Kind> = {
   UPLOADING: 'amber',
   FAILED: 'red',
   OPEN: 'blue',
+  READY: 'green',
+  LOADING: 'amber',
 };
 
 const STYLES: Record<Kind, { bg: string; fg: string; border: string; weight?: number; strike?: boolean }> = {

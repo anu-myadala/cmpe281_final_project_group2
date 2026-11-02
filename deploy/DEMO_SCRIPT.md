@@ -8,7 +8,7 @@ simply follows Part B without the backend detours.
 
 1. Start the stack and the seed.
    - Laptop: `cp .env.example .env && docker compose up --build -d` (first build ~5 min).
-   - EC2: `bash deploy/ec2-bootstrap.sh` (already done; `docker compose -f docker-compose.yml -f docker-compose.aws.yml ps` must show every service `running`/`healthy`, `seed` and `minio-init` `exited (0)`).
+   - EC2: `bash deploy/ec2-bootstrap.sh` (already done; `docker compose -f docker-compose.yml -f docker-compose.aws.yml ps` must show every service `running`/`healthy` and `seed` `exited (0)`).
    - Developer mode (one process, no Docker) if the stack is unavailable:
      ```
      cd c1/api && DATABASE_URL=mysql+pymysql://scicp:scicp@127.0.0.1/scicp MONGO_URL=mock SEED_ON_START=1 \
@@ -31,9 +31,9 @@ simply follows Part B without the backend detours.
    - T1 web app `http://localhost:8080/login`
    - T2 API docs `http://localhost:8000/api/v1/docs`
    - T3 MailHog `http://localhost:8025`
-   - T4 MinIO console `http://localhost:9001` (minioadmin / minioadmin), bucket `scicp-models`
+   - T4 (optional) the stored artifacts: `docker compose exec api ls -l /data/objects/models/1/*` (on EC2: the S3 console, bucket `scicp-models`)
 4. Open two terminals:
-   - TA: `docker compose logs -f api stubs` (shows uvicorn request lines, `scicp.demo` generator lines, `scicp.ws` connections, `scicp.mail`).
+   - TA: `docker compose logs -f api stubs` (shows uvicorn request lines, `scicp.demo` generator lines, `scicp.worker` classifier worker lines, `scicp.ws` connections, `scicp.mail`).
    - TB: `docker compose exec mysql mysql -uscicp -pscicp scicp` and, in a second pane, `docker compose exec mongo mongosh scicp`.
 5. Accounts (password `Passw0rd!demo` for all):
 
@@ -104,14 +104,18 @@ curl -s -X POST http://localhost:8000/api/v1/internal/events -H "Authorization: 
 
 ### 12:00 Model registry: activation with the BR-10 gate, rollback
 - Menu **AI models**: `sound-classifier`, versions 1.1.0 ACTIVE (macro-F1 0.84, accuracy 0.88) and 1.2.0 REGISTERED (0.86 / 0.89), per-class metrics table for the 7 classes (siren, crash, glass_break, scream, honking, traffic, environmental).
+- The **Deployment** card under the versions: `worker-1` runs 1.1.0, READY, "SHA-256 verified", heartbeat a few seconds ago (the simulated C4 classifier worker in the stubs container).
 - Select 1.2.0 -> **Set active**: the confirm dialog shows "1.1.0 (macro-F1 0.84) -> 1.2.0 (macro-F1 0.86)". Confirm. 1.2.0 becomes ACTIVE, 1.1.0 INACTIVE; the staff room receives `model.activated {modelId, version}`.
-- Say what BR-10 checks in one transaction: the artifact exists in the bucket with the recorded sha256 and size, the macro-F1 is not lower than the active version's (a lower one needs `force` with a note), the previous version is deactivated, the activation is audited, and the event goes to the EventBus and to MQTT `scicp/v1/platform/model/activated` (retained) for the C4 worker. T4: the bucket `scicp-models/models/1/1.2.0/model.pt`.
-- **Rollback** -> 1.1.0 active again (`MODEL_ROLLBACK` audit row, another `model.activated`).
+- Watch the Deployment card: within a second it turns LOADING (amber) with 1.2.0, then READY (green) with "SHA-256 verified" about two seconds later. TA shows the path: `worker worker-1: MQTT scicp/v1/platform/model/activated 1.2.0`, `GET /internal/models/active`, the signed `GET /api/v1/storage/objects/models/1/1.2.0/model.pt`, `POST /internal/worker/status` LOADING then READY.
+- Say what BR-10 checks in one transaction: the artifact exists in storage with the recorded sha256 and size, the macro-F1 is not lower than the active version's (a lower one needs `force` with a note), the previous version is deactivated, the activation is audited, and the event goes to the EventBus and to MQTT `scicp/v1/platform/model/activated` (retained) for the C4 worker, which also polls C1 every 30 s in case it missed the message. T4: `models/1/1.2.0/model.pt` and its `.sha256` sidecar.
+- New alerts from now on carry `model sound-classifier-1.2.0` on the alert detail page (the generator stamps the version the worker has loaded; one alert every ~2.5 min, or set `DEMO_ALERT_PERIOD_S=30` before the demo).
+- **Rollback** -> 1.1.0 active again (`MODEL_ROLLBACK` audit row, another `model.activated`); the Deployment card goes back to 1.1.0 READY.
+- Mongo pane: `db.worker_status.find()` shows the last report of the worker.
 - TB: `SELECT version, status, activated_at FROM model_version;` and `SELECT action, entity, entity_id, ts FROM audit_log ORDER BY audit_id DESC LIMIT 5;`.
-- Optional (30 s): **Upload new version** 1.3.0 with a small file: presigned PUT from the browser straight to MinIO, then `complete` verifies the sha256 (a wrong hash is refused, BR-10) and the version becomes REGISTERED.
+- Optional (30 s): **Upload new version** 1.3.0 with a small file and metrics: the browser computes the SHA-256, PUTs the file to the signed storage URL (`/api/v1/storage/objects/...`, Amazon S3 on EC2), then `complete` verifies size and sha256 (a wrong hash is refused, BR-10) and the version becomes REGISTERED; activate it and the Deployment card follows.
 
 ### 13:30 Close: tests and docs
-- Terminal: `cd c1/api && python -m pytest -q` -> 78 passed (decision tables BR-02/04/06/07/08/09/10/11, tenancy 404/403, WebSocket fan-out). `cd c1/web && npm run typecheck && npm run build` and `npx playwright test` (2 passed).
+- Terminal: `cd c1/api && python -m pytest -q` -> 90 passed (decision tables BR-02/04/06/07/08/09/10/11, tenancy 404/403, WebSocket fan-out, signed storage, model deployment). `cd c1/web && npm run typecheck && npm run build` and `E2E_BASE_URL=http://localhost:8080 npx playwright test` (5 passed against the stack).
 - T2: the OpenAPI page once more; mention `docs/` (design, brief, API notes) and the README for the EC2 deployment.
 
 ## C. Recorded scenario demo (2 points, ~6 minutes)
@@ -122,7 +126,7 @@ Record Part B without the terminals, in this order, with a short voice-over per 
 3. Logout, login as Maria -> Vehicle map: moving cars, select AV-11 (trail), Follow on, wait for or inject one new alert pin.
 4. Staff: statistics for Bay Shuttle and the CSV download.
 5. Admin: create the tenant, invite the user, show MailHog.
-6. AI models: activate 1.2.0 (dialog with both macro-F1 values), rollback.
+6. AI models: activate 1.2.0 (dialog with both macro-F1 values), the Deployment card going LOADING -> READY on 1.2.0, rollback.
 7. Last frame: the pytest summary and the Playwright summary.
 
 ## D. Things that can go wrong
@@ -133,5 +137,6 @@ Record Part B without the terminals, in this order, with a short voice-over per 
 | Markers do not move | the generator stopped (`docker compose logs stubs | grep demo`), or `DEMO_ENABLED=0`; restart `docker compose restart stubs` |
 | Alert 20482 is already ACKNOWLEDGED | rehearsal leftover: run the SQL of step A.2 |
 | No pin on a new alert | the browser tab lost the WebSocket (reconnects within 10 s with polling fallback); reload |
-| Model activation says the artifact is missing | the seed could not upload to MinIO at first start: `docker compose run --rm seed` again |
+| Model activation says the artifact is missing | the seed could not write the artifact (on EC2: the bucket or the instance role is missing): `docker compose run --rm seed` again |
+| Deployment card stays LOADING or FAILED | `docker compose logs stubs | grep worker`; FAILED with "sha256 mismatch" means the stored file changed; the worker keeps serving the previous version and retries on the next poll (30 s) |
 | MailHog is empty | `MAIL_MODE` is `log`: the message is in `docker compose logs api` instead |

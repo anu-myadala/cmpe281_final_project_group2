@@ -23,7 +23,9 @@ from ..models import STAFF_ROLES
 
 log = logging.getLogger("scicp.ws")
 
-WS_TOPICS = ("alert.created", "alert.updated", "device.status", "model.activated")
+WS_TOPICS = ("alert.created", "alert.updated", "device.status", "model.activated", "model.deployed")
+# Model registry messages concern the platform staff only.
+STAFF_ONLY_TOPICS = ("model.activated", "model.deployed")
 AUTH_TIMEOUT_SECONDS = 10
 PING_INTERVAL_SECONDS = 30
 MAX_MISSED_PINGS = 3
@@ -81,7 +83,7 @@ class WsHub:
         body = dict(payload or {})
         tenant_id = body.pop("tenantId", None)
         message = {"type": topic, **body}
-        if topic == "model.activated":
+        if topic in STAFF_ONLY_TOPICS:
             await self.broadcast("staff", message)
             return
         tenant_id = await self._resolve_tenant(tenant_id)

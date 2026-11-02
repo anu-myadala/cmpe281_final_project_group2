@@ -1,4 +1,6 @@
-"""StorageClient: S3 (or MinIO) access for the model artifacts.
+"""StorageClient: Amazon S3 access for the model artifacts (STORAGE_BACKEND=s3, used on
+EC2 with the instance role). LocalStorageClient (local_storage.py) has the same
+interface for the laptop stack.
 
 Keys follow models/{modelId}/{version}/model.pt in the scicp-models bucket.
 presign_put/presign_get return URLs the browser uses directly; head() reads
@@ -62,7 +64,8 @@ class StorageClient:
 
     @property
     def public_client(self):
-        """Signs URLs with the endpoint the browser can reach (MinIO on localhost)."""
+        """Signs URLs with the endpoint the browser can reach (S3_PUBLIC_ENDPOINT_URL when the
+        API reaches the bucket through a private endpoint; normally the regional S3 endpoint)."""
         if self._public_client is None:
             endpoint = self.settings.s3_public_endpoint_url or self.settings.s3_endpoint_url or None
             self._public_client = self._make(endpoint)

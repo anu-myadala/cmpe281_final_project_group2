@@ -25,7 +25,7 @@ from .container import AppContainer
 from .db import create_schema
 from .errors import install_error_handlers
 from .models import Tenant
-from .routers import admin, auth, dashboard, internal, models, reports, subscriptions, ws
+from .routers import admin, auth, dashboard, internal, models, reports, storage, subscriptions, ws
 
 log = logging.getLogger("scicp")
 
@@ -75,6 +75,8 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     settings = settings or get_settings()
     logging.basicConfig(level=getattr(logging, settings.log_level.upper(), logging.INFO),
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    # One INFO line per outgoing request (C2/C3 calls, the inline worker) drowns the useful logs.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     container = AppContainer.build(settings)
 
     async def resolve_tenant_code(code: str) -> Optional[int]:
@@ -111,7 +113,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
 
     prefix = settings.api_prefix
     for router in (auth.router, dashboard.router, subscriptions.router, reports.router, admin.router,
-                   models.router, internal.router):
+                   models.router, internal.router, storage.router):
         app.include_router(router, prefix=prefix)
     app.include_router(ws.router)            # /ws (what nginx proxies)
     app.include_router(ws.router, prefix=prefix)  # /api/v1/ws as an alias

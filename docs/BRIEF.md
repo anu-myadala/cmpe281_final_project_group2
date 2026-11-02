@@ -23,7 +23,13 @@ Where the text and this brief differ, this brief wins (it contains the late chan
 - alert_type seed: ACCIDENT CRITICAL 10 min, EMERGENCY HIGH 5, SECURITY HIGH 15, SAFETY MEDIUM 30, PASSENGER LOW 60, VEHICLE_HEALTH LOW 120.
 - The subscription row stores `vehicle_id` as the BIGINT key of the C2 `vehicle` table; the API uses the public code (AV-01). Resolve codes through the vehicle table.
 - AuditLogger is shared: C2/C3 write RETIRE_VEHICLE, PROVISION, DELETE_CLIP, RULE_SAVE, RULE_DELETE through it (just accept any action string).
-- Buckets: `scicp-models` (artifacts, key `models/{modelId}/{version}/model.pt`), `scicp-clips` (C2). Region us-west-2 on AWS; MinIO locally.
+- Buckets: `scicp-models` (artifacts, key `models/{modelId}/{version}/model.pt`), `scicp-clips` (C2). Region us-west-2 on AWS.
+  Locally (Nov 1: MinIO no longer publishes Docker images) the API stores the artifacts itself: `STORAGE_BACKEND=local`, `STORAGE_DIR=/data/objects`
+  on the named volume `objects`, presigned URLs = relative HMAC-signed `/api/v1/storage/objects/<key>?op&exp&sig`; `STORAGE_BACKEND=s3` on EC2.
+- Model deployment (Nov 1, the instructor asks for "UI and model management, and deployment" for AI components): the C4 classifier worker
+  (simulated in stubs/) reloads on model.activated (MQTT, EventBus inline, 30 s poll), downloads the active artifact through C1
+  (`GET /internal/models/active`), verifies the SHA-256 and reports `POST /internal/worker/status`; `GET /models/{id}/deployment` and the
+  WebSocket message `model.deployed` drive the Deployment card on the models page.
 - Feedback: the C3 alert page posts FALSE_ALARM on "False alarm" and CONFIRMED on "Resolve".
 - VEHICLE MAP (added Oct 30 after the instructor asked for tracking on a map; priority HIGH, it is the demo's centerpiece):
   - `GET /dashboard/map?tenantId` -> `{vehicles[{vehicleId, label, status, connection, lat, lon, headingDeg, speedKph, driveMode, ignition, sampleAt}], alerts[{alertId, vehicleId, lat, lon, severity, type, createdAt}], asOf, degraded?}`.
@@ -41,8 +47,8 @@ Where the text and this brief differ, this brief wins (it contains the late chan
 ## Repository layout (monorepo shared with Brandon (C2) and Ray (C3) later)
 ```
 README.md                 how to run locally, on AWS, and the demo script
-docker-compose.yml        local: mysql, mongo, minio, mailhog, mosquitto, api, web, stubs, seed
-docker-compose.aws.yml    overrides for EC2 (real S3/SES, no minio/mailhog)
+docker-compose.yml        local: mysql, mongo, mailhog, mosquitto, api, web, stubs, seed (volume objects for the artifacts)
+docker-compose.aws.yml    overrides for EC2 (real S3/SES, no mailhog)
 deploy/                   nginx.conf, EC2 bootstrap script, .env.example
 c1/api/                   FastAPI backend (Python 3.11)   -> package `app`
 c1/web/                   React 18 + TypeScript + Vite + MUI + Recharts + TanStack Query
@@ -69,8 +75,8 @@ docs/                     this brief and the specs
 DATABASE_URL=mysql+pymysql://scicp:scicp@mysql:3306/scicp
 MONGO_URL=mongodb://mongo:27017/scicp            (or "mock" -> mongomock_motor, used by tests)
 JWT_SECRET=...  SERVICE_TOKEN_SECRET=...
-S3_ENDPOINT_URL=http://minio:9000 (empty on AWS)  S3_PUBLIC_ENDPOINT_URL=http://localhost:9000 (what the browser can reach)
-S3_ACCESS_KEY, S3_SECRET_KEY, S3_REGION=us-west-2, S3_MODELS_BUCKET=scicp-models
+STORAGE_BACKEND=local|s3  STORAGE_DIR=/data/objects (local)
+S3_ACCESS_KEY, S3_SECRET_KEY (empty with the instance role), S3_REGION=us-west-2, S3_MODELS_BUCKET=scicp-models (s3)
 MAIL_MODE=smtp|ses|log  SMTP_HOST=mailhog SMTP_PORT=1025  MAIL_FROM=no-reply@scicp.example
 MQTT_URL=mqtt://mosquitto:1883 (optional) MQTT_USERNAME=svc-api MQTT_PASSWORD=...
 C2_BASE_URL=http://stubs:8002/api/v1  C3_BASE_URL=http://stubs:8003/api/v1
@@ -78,7 +84,7 @@ CORS_ORIGINS=http://localhost:5173,http://localhost:8080
 ```
 
 ## Running modes (all three must work)
-- `docker compose up` on a laptop or EC2: separate containers mysql, mongo, minio, mailhog, mosquitto, api (:8000), web (nginx :8080 serving the Vite build and proxying /api and /ws to api), stubs (:8002 C2, :8003 C3), seed (one-shot).
+- `docker compose up` on a laptop or EC2: separate containers mysql, mongo, mailhog, mosquitto, api (:8000), web (nginx :8080 serving the Vite build and proxying /api and /ws to api), stubs (:8002 C2, :8003 C3), seed (one-shot).
 - Developer / CI mode without Docker (what the container used to build this has: MariaDB on localhost, no MongoDB daemon, no Docker):
   `MONGO_URL=mock` makes the API use `mongomock_motor.AsyncMongoMockClient` in process, and `STUBS_INLINE=1` mounts the C2 and C3 stub routers
   inside the same FastAPI app (under `/c2/api/v1` and `/c3/api/v1`, with `C2_BASE_URL`/`C3_BASE_URL` pointing at itself) so that one process is a complete demo;
@@ -117,7 +123,7 @@ Subscriptions: defaults for every vehicle (EMERGENCY, ACCIDENT, SECURITY, SAFETY
 Alerts (MySQL `alert`): 20482 ACCIDENT CRITICAL NEW crash 0.91 AV-01 event_ref 6729b1c4e1f0a2d3c4b5a697 created 2026-11-04T21:42:12Z; plus ~40 alerts over the last 14 days across both tenants
 with mixed types, statuses (NEW/ACKNOWLEDGED/RESOLVED/FALSE_ALARM) and acknowledged_at/closed_at so statistics are meaningful.
 audio_events (Mongo): ~400 events over the last 14 days, classes weighted (traffic, environmental most common), with inference.topK, modelVersion "sound-classifier-1.1.0", decision for the alert ones.
-Models: ai_model "sound-classifier" (task "audio event classification (CLAP + head)"); versions 1.1.0 ACTIVE macroF1 0.84 acc 0.88, 1.2.0 REGISTERED 0.86/0.89, both with perClass metrics for the 7 classes, artifacts uploaded to the bucket as small dummy files with correct sha256.
+Models: ai_model "sound-classifier" (task "audio event classification (CLAP + head)"); versions 1.1.0 ACTIVE macroF1 0.84 acc 0.88, 1.2.0 REGISTERED 0.86/0.89, both with perClass metrics for the 7 classes, artifacts stored (local volume or bucket) as small dummy files with correct sha256.
 Feedback labels: ~15 on version 1.1.0.
 
 ## Quality bar

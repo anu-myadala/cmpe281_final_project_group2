@@ -5,11 +5,11 @@ a test can swap a client for a fake."""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Dict, Optional, Union
 
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
-from .clients import AlertClient, MailSender, MqttPublisher, StorageClient, VehicleClient
+from .clients import AlertClient, LocalStorageClient, MailSender, MqttPublisher, StorageClient, VehicleClient, make_storage
 from .config import Settings
 from .core.cache import RateCounter, TtlCache
 from .core.eventbus import EventBus
@@ -31,7 +31,7 @@ class AppContainer:
     hub: WsHub
     vehicle_client: VehicleClient
     alert_client: AlertClient
-    storage: StorageClient
+    storage: Union[StorageClient, LocalStorageClient]
     mail: MailSender
     mqtt: MqttPublisher
     overview_cache: TtlCache
@@ -39,6 +39,8 @@ class AppContainer:
     pins_cache: TtlCache
     login_rate: RateCounter
     events: EventQueryRepo = field(init=False)
+    # Latest status report of each classifier worker (POST /internal/worker/status), by workerId.
+    workers: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self.events = EventQueryRepo(self.mongo)
@@ -59,7 +61,7 @@ class AppContainer:
             hub=WsHub(bus, tokens),
             vehicle_client=VehicleClient(settings, tokens),
             alert_client=AlertClient(settings, tokens),
-            storage=StorageClient(settings),
+            storage=make_storage(settings),
             mail=MailSender(settings),
             mqtt=MqttPublisher(settings),
             overview_cache=TtlCache(settings.overview_cache_seconds),

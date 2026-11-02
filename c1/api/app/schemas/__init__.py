@@ -148,3 +148,17 @@ class InternalEventBody(Body):
 class SubscriptionDefaultsBody(Body):
     vehicleId: str = Field(min_length=1, max_length=16)
     tenantId: int
+
+
+WorkerState = Literal["READY", "LOADING", "FAILED"]
+
+
+class WorkerStatusBody(Body):
+    """What the C4 classifier worker reports after (re)loading a model version."""
+    workerId: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_.:-]+$")
+    modelId: Optional[int] = None
+    modelVersion: Optional[str] = Field(default=None, max_length=32)
+    sha256: Optional[str] = Field(default=None, max_length=64)
+    state: WorkerState
+    loadedAt: Optional[str] = Field(default=None, max_length=40)
+    detail: Optional[str] = Field(default=None, max_length=500)

@@ -7,10 +7,11 @@
 **/.pytest_cache
 **/*.db
 **/*.db-journal
-c1/web/node_modules
-c1/web/dist
-c1/web/test-results
-c1/web/playwright-report
+# The web image has its own build context (c1/web); the api and stubs images do not need it.
+c1/web
+# Local artifact directories of the developer mode and the e2e runs
+**/objects
+**/e2e-objects
 c1/api/tests
 docs
 deploy

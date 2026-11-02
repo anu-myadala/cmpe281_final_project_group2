@@ -263,6 +263,29 @@ export interface BeginUploadResponse {
   upload: { url: string; key: string; expiresInSeconds: number };
 }
 
+// GET /models/{id}/deployment: what each C4 classifier worker runs
+export type WorkerState = 'READY' | 'LOADING' | 'FAILED';
+
+export interface DeploymentWorker {
+  workerId: string;
+  modelVersion: string | null;
+  state: WorkerState;
+  loadedAt: string | null;
+  sha256: string | null;
+  sha256Verified: boolean;
+  lastHeartbeatAt: string | null;
+  detail: string | null;
+  stale?: boolean;
+  runsActiveVersion?: boolean;
+}
+
+export interface DeploymentResponse {
+  modelId: number;
+  activeVersion: string | null;
+  workers: DeploymentWorker[];
+  asOf: string;
+}
+
 // C2 vehicle list (through the C2 base path)
 export interface C2Vehicle {
   vehicleId: string;
@@ -292,4 +315,5 @@ export type LiveMessage =
   | { type: 'alert.updated'; alertId: number; status: AlertStatus; by?: string }
   | { type: 'device.status'; vehicleId: string; deviceId?: string; status: string; lastSeenAt?: string; faultReason?: string; muted?: boolean }
   | { type: 'model.activated'; modelId: number; version: string }
+  | ({ type: 'model.deployed'; modelId: number } & DeploymentWorker)
   | { type: string; [key: string]: unknown };

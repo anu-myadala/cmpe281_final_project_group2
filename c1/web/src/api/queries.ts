@@ -8,6 +8,7 @@ import type {
   AlertTypeDto,
   C2Device,
   C2Vehicle,
+  DeploymentResponse,
   IntelligenceService,
   MapResponse,
   ModelDto,
@@ -53,6 +54,7 @@ export const queryKeys = {
   alertTypes: ['admin', 'alert-types'] as const,
   models: ['models'] as const,
   versions: (modelId: number | null) => ['models', modelId, 'versions'] as const,
+  deployment: (modelId: number | null) => ['models', modelId, 'deployment'] as const,
   report: (type: string, params: Record<string, unknown>) => ['report', type, params] as const,
 };
 
@@ -73,6 +75,10 @@ export function invalidateFor(type: string): void {
       break;
     case 'model.activated':
       void queryCache.invalidateQueries({ queryKey: ['models'] });
+      break;
+    case 'model.deployed':
+      // Only the deployment card changes; the versions table stays as it is.
+      void queryCache.invalidateQueries({ predicate: (query) => query.queryKey[0] === 'models' && query.queryKey[2] === 'deployment' });
       break;
     default:
       break;
@@ -222,6 +228,17 @@ export function useVersions(modelId: number | null) {
     queryKey: queryKeys.versions(modelId),
     queryFn: () => ApiClient.get<VersionDto[]>(`/models/${modelId}/versions`),
     enabled: modelId !== null,
+  });
+}
+
+/** Which version each classifier worker runs; refetched every 10 s besides model.deployed. */
+export function useDeployment(modelId: number | null) {
+  return useQuery<DeploymentResponse>({
+    queryKey: queryKeys.deployment(modelId),
+    queryFn: () => ApiClient.get<DeploymentResponse>(`/models/${modelId}/deployment`),
+    enabled: modelId !== null,
+    staleTime: STALE_LIVE_MS,
+    refetchInterval: STALE_LIVE_MS,
   });
 }
 

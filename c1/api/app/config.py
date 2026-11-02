@@ -7,10 +7,10 @@ single-process developer mode.
 from __future__ import annotations
 
 from functools import lru_cache
-from typing import List, Optional
+from typing import Annotated, List, Optional
 
 from pydantic import field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
 class Settings(BaseSettings):
@@ -30,7 +30,10 @@ class Settings(BaseSettings):
     cookie_secure: bool = False
     login_rate_limit_per_minute: int = 10
 
-    # Object storage (S3 or MinIO)
+    # Object storage for the model artifacts. "local" keeps them on a volume of the API
+    # container (docker compose on a laptop); "s3" uses Amazon S3 (EC2 with the instance role).
+    storage_backend: str = "local"  # local | s3
+    storage_dir: str = "/data/objects"
     s3_endpoint_url: Optional[str] = None
     s3_public_endpoint_url: Optional[str] = None
     s3_access_key: Optional[str] = None
@@ -61,7 +64,8 @@ class Settings(BaseSettings):
     overview_local_fallback: bool = False
 
     # Web
-    cors_origins: List[str] = ["http://localhost:5173", "http://localhost:8080"]
+    # Comma-separated in the environment (NoDecode: not parsed as JSON before _split_origins).
+    cors_origins: Annotated[List[str], NoDecode] = ["http://localhost:5173", "http://localhost:8080"]
     api_prefix: str = "/api/v1"
 
     # Developer / CI mode
@@ -75,6 +79,20 @@ class Settings(BaseSettings):
         if isinstance(value, str):
             return [o.strip() for o in value.split(",") if o.strip()]
         return value
+
+    @field_validator("storage_backend", mode="before")
+    @classmethod
+    def _backend(cls, value):
+        value = str(value or "local").strip().lower()
+        if value not in ("local", "s3"):
+            raise ValueError("STORAGE_BACKEND must be local or s3")
+        return value
+
+    @field_validator("s3_endpoint_url", "s3_public_endpoint_url", "s3_access_key", "s3_secret_key", mode="before")
+    @classmethod
+    def _empty_is_none(cls, value):
+        """docker-compose.aws.yml blanks these out; an empty string means "not set"."""
+        return value or None
 
     @field_validator("database_url", mode="before")
     @classmethod

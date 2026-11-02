@@ -1,5 +1,6 @@
 """Internal endpoints for the other components (service token only):
-POST /internal/events, POST /internal/subscriptions/defaults, GET /internal/subscriptions."""
+POST /internal/events, POST /internal/subscriptions/defaults, GET /internal/subscriptions,
+and for the C4 classifier worker GET /internal/models/active and POST /internal/worker/status."""
 from __future__ import annotations
 
 from typing import Optional
@@ -12,8 +13,8 @@ from ..container import AppContainer
 from ..deps import get_container, get_session, require_service_token
 from ..errors import NotFound
 from ..models import Vehicle
-from ..schemas import InternalEventBody, SubscriptionDefaultsBody
-from ..services import SubscriptionService
+from ..schemas import InternalEventBody, SubscriptionDefaultsBody, WorkerStatusBody
+from ..services import DeploymentService, SubscriptionService
 from ..services.subscription_service import service_entry
 from ..repos import IntelligenceServiceRepo
 
@@ -48,3 +49,17 @@ async def internal_subscriptions(tenantId: int, vehicleId: Optional[str] = None,
                                  session: AsyncSession = Depends(get_session),
                                  container: AppContainer = Depends(get_container)):
     return await SubscriptionService(container, session).internal_rows(tenantId, vehicleId)
+
+
+@router.get("/models/active")
+async def active_model(modelId: Optional[int] = None, name: Optional[str] = None,
+                       session: AsyncSession = Depends(get_session), container: AppContainer = Depends(get_container)):
+    """The ACTIVE version the worker should run: version, SHA-256, size and a presigned download URL
+    (relative to C1 with STORAGE_BACKEND=local, an S3 URL with s3)."""
+    return await DeploymentService(container, session).active_artifact(modelId, name)
+
+
+@router.post("/worker/status")
+async def worker_status(body: WorkerStatusBody, session: AsyncSession = Depends(get_session),
+                        container: AppContainer = Depends(get_container)):
+    return await DeploymentService(container, session).report(body)

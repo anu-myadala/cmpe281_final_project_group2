@@ -1,6 +1,7 @@
 // ModelsPage: model list and VersionTable (8), the selected version with artifact, labels and
 // held-out results (9), Upload new version / Set as active / Roll back / Download / Export labels (10)
-// with the confirm dialog for activation and rollback (12). Listens to model.activated.
+// with the confirm dialog for activation and rollback (12), and the Deployment card (which
+// version the classifier worker runs). Listens to model.activated and model.deployed.
 import { useEffect, useMemo, useState } from 'react';
 import { useMutation } from '@tanstack/react-query';
 import Box from '@mui/material/Box';
@@ -16,11 +17,12 @@ import DialogContent from '@mui/material/DialogContent';
 import DialogActions from '@mui/material/DialogActions';
 import { useAuth } from '../auth/AuthProvider';
 import { useLiveHandler } from '../live/useLiveEvents';
-import { queryCache, useModels, useVersions } from '../api/queries';
+import { queryCache, queryKeys, useModels, useVersions } from '../api/queries';
 import { ApiClient, API_BASE, errorMessage, getAccessToken, isApiError } from '../api/ApiClient';
 import type { ModelDto, VersionDto } from '../api/types';
 import { Card, ConfirmDialog, DataTable, ErrorNote, Loading, type Column } from '../components/common';
 import { StatusChip } from '../components/StatusChip';
+import { DeploymentCard } from '../components/DeploymentCard';
 import { MetricsTable, VersionTable, compareSemver } from '../components/VersionTable';
 import { useToast } from '../components/Toast';
 import { UploadVersionDialog } from './UploadVersionDialog';
@@ -180,6 +182,7 @@ export function ModelsPage() {
               states: UPLOADING {'→'} REGISTERED {'→'} ACTIVE {'↔'} INACTIVE, FAILED on checksum or metrics error; one ACTIVE per model; the chip moves live on model.activated
             </Typography>
           </Card>
+          <DeploymentCard modelId={modelId} modelName={model?.name ?? 'this model'} />
         </Box>
         <Card
           title={
@@ -281,8 +284,11 @@ export function ModelsPage() {
           onUploaded={(version) => {
             toast(`Version ${version.version} registered`);
             setUploadOpen(false);
-            refresh();
+            // Put the new row into the cached list first: otherwise the selection effect sees an
+            // id that is not in the (not yet refetched) list and falls back to another version.
+            queryCache.setQueryData<VersionDto[]>(queryKeys.versions(model.modelId), (rows) => [version, ...(rows ?? []).filter((r) => r.versionId !== version.versionId)]);
             setVersionId(version.versionId);
+            refresh();
           }}
         />
       )}

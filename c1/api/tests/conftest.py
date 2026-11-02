@@ -36,7 +36,8 @@ def test_settings(**overrides) -> Settings:
                 mongo_url="mock", jwt_secret="test-jwt-secret-0123456789abcdef0123456789",
                 service_token_secret="test-service-secret-0123456789abcdef01234",
                 mail_mode="log", seed_on_start=True, stubs_inline=False, login_rate_limit_per_minute=100000,
-                c2_base_url="http://c2.invalid/api/v1", c3_base_url="http://c3.invalid/api/v1", log_level="WARNING")
+                c2_base_url="http://c2.invalid/api/v1", c3_base_url="http://c3.invalid/api/v1", log_level="WARNING",
+                storage_backend="local", storage_dir=str(Path(tempfile.gettempdir()) / "scicp_c1_test_objects"))
     base.update(overrides)
     return Settings(_env_file=None, **base)
 

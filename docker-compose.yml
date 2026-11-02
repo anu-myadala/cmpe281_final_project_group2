@@ -1,6 +1,7 @@
 # SCICP local stack (CMPE 281 Group 2): one command runs the C1 API, the web app, the C2/C3 stubs
-# with the demo generator, the seed, and the infrastructure (MySQL 8, MongoDB 7, MinIO, MailHog,
-# Mosquitto).
+# with the demo generator and the classifier worker, the seed, and the infrastructure (MySQL 8,
+# MongoDB 7, MailHog, Mosquitto). Model artifacts live on the named volume "objects"
+# (STORAGE_BACKEND=local); on EC2 they go to Amazon S3 instead (docker-compose.aws.yml).
 #
 #   cp .env.example .env
 #   docker compose up --build
@@ -8,7 +9,6 @@
 #   web        http://localhost:8080          (nginx: static build + /api, /ws, /c2, /c3 proxies)
 #   API docs   http://localhost:8000/api/v1/docs
 #   MailHog    http://localhost:8025
-#   MinIO      http://localhost:9001          (console; API on 9000; minioadmin / minioadmin)
 #   stubs      http://localhost:8002/api/v1/docs (C2), http://localhost:8003/api/v1/docs (C3)
 #
 # On EC2 add the override: docker compose -f docker-compose.yml -f docker-compose.aws.yml up -d --build
@@ -49,51 +49,11 @@ services:
       retries: 30
       start_period: 10s
 
-  minio:
-    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
-    command: server /data --console-address ":9001"
-    environment:
-      MINIO_ROOT_USER: ${S3_ACCESS_KEY:-minioadmin}
-      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:-minioadmin}
-      # The browser uploads and downloads model artifacts through presigned URLs (PUT and GET).
-      MINIO_API_CORS_ALLOW_ORIGIN: "*"
-    ports:
-      - "9000:9000"
-      - "9001:9001"
-    volumes:
-      - minio-data:/data
-    healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
-      interval: 5s
-      timeout: 5s
-      retries: 20
-      start_period: 5s
-
-  # One-shot: creates the two buckets and allows anonymous downloads of the model artifacts.
-  minio-init:
-    image: minio/mc:RELEASE.2025-04-16T18-13-26Z
-    depends_on:
-      minio:
-        condition: service_healthy
-    environment:
-      S3_ACCESS_KEY: ${S3_ACCESS_KEY:-minioadmin}
-      S3_SECRET_KEY: ${S3_SECRET_KEY:-minioadmin}
-      S3_MODELS_BUCKET: ${S3_MODELS_BUCKET:-scicp-models}
-      S3_CLIPS_BUCKET: ${S3_CLIPS_BUCKET:-scicp-clips}
-    entrypoint: ["/bin/sh", "-c"]
-    command:
-      - |
-        set -e
-        mc alias set local http://minio:9000 "$$S3_ACCESS_KEY" "$$S3_SECRET_KEY"
-        mc mb --ignore-existing "local/$$S3_MODELS_BUCKET"
-        mc mb --ignore-existing "local/$$S3_CLIPS_BUCKET"
-        mc anonymous set download "local/$$S3_MODELS_BUCKET"
-        mc anonymous set none "local/$$S3_CLIPS_BUCKET"
-        echo "buckets ready: $$S3_MODELS_BUCKET (public download), $$S3_CLIPS_BUCKET (private)"
-    restart: "no"
-
   mailhog:
     image: mailhog/mailhog:v1.0.1
+    # MailHog publishes an amd64 image only; Docker Desktop on Apple silicon runs it under
+    # emulation, and saying so here avoids the platform warning. MAIL_MODE=log needs no MailHog.
+    platform: linux/amd64
     ports:
       - "8025:8025"   # web UI; SMTP on 1025 inside the network
 
@@ -106,7 +66,8 @@ services:
       - "1883:1883"
 
   # ------------------------------------------------------------------ platform
-  # Seed (one-shot): the Deliverable #2 sample data in MySQL, MongoDB and the model bucket.
+  # Seed (one-shot): the Deliverable #2 sample data in MySQL, MongoDB and the model artifacts
+  # (written to the "objects" volume that the API serves).
   seed:
     build:
       context: .
@@ -114,13 +75,13 @@ services:
     image: scicp/c1-api:local
     env_file: .env
     command: ["python", "-m", "seed.seed"]
+    volumes:
+      - objects:/data/objects
     depends_on:
       mysql:
         condition: service_healthy
       mongo:
         condition: service_healthy
-      minio-init:
-        condition: service_completed_successfully
     restart: "no"
 
   api:
@@ -134,6 +95,8 @@ services:
       SEED_ON_START: "0"
     ports:
       - "8000:8000"
+    volumes:
+      - objects:/data/objects
     depends_on:
       mysql:
         condition: service_healthy
@@ -153,8 +116,10 @@ services:
       start_period: 15s
     restart: unless-stopped
 
-  # C2 (:8002) and C3 (:8003) stand-ins plus the demo event generator. Replaced by the real
-  # components later: point C2_BASE_URL / C3_BASE_URL (and the nginx upstreams) at them.
+  # C2 (:8002) and C3 (:8003) stand-ins plus the demo event generator and the simulated C4
+  # classifier worker (MQTT model.activated -> download through C1 -> verify -> report).
+  # Replaced by the real components later: point C2_BASE_URL / C3_BASE_URL (and the nginx
+  # upstreams) at them.
   stubs:
     build:
       context: .
@@ -169,6 +134,8 @@ services:
     depends_on:
       api:
         condition: service_healthy
+      mosquitto:
+        condition: service_started
     restart: unless-stopped
 
   web:
@@ -187,5 +154,5 @@ services:
 volumes:
   mysql-data:
   mongo-data:
-  minio-data:
+  objects:
   mosquitto-data:

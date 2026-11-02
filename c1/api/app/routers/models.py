@@ -12,7 +12,7 @@ from ..core.rbac import RbacGuard
 from ..core.security import Claims
 from ..deps import client_ip, get_container, get_session
 from ..schemas import ActivateBody, FeedbackBody, ModelCreateBody, RollbackBody, VersionCompleteBody, VersionCreateBody
-from ..services import ModelRegistryService
+from ..services import DeploymentService, ModelRegistryService
 
 router = APIRouter(tags=["models"])
 
@@ -69,6 +69,13 @@ async def rollback(model_id: int, body: RollbackBody, request: Request, claims: 
                    session: AsyncSession = Depends(get_session), container: AppContainer = Depends(get_container)):
     return await ModelRegistryService(container, session).rollback(model_id, body.note, claims.user_id,
                                                                    client_ip(request))
+
+
+@router.get("/models/{model_id}/deployment")
+async def deployment(model_id: int, _: Claims = Depends(registry_read), session: AsyncSession = Depends(get_session),
+                     container: AppContainer = Depends(get_container)):
+    """Which version each classifier worker runs (the latest POST /internal/worker/status)."""
+    return await DeploymentService(container, session).deployment(model_id)
 
 
 @router.get("/models/{model_id}/versions/{version}/download")

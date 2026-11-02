@@ -1,5 +1,8 @@
 """Demo event generator: keeps the online cars moving, flips a microphone
 to FAULT and back now and then, and raises a new alert every few minutes.
+It also runs the simulated C4 classifier worker (stubs.worker) next to it:
+new audio events carry the model version the worker has loaded, so an
+activation in the registry shows up on the alert detail page.
 
     await demo_generator(eventbus, mongo_db, mysql_url)
 
@@ -16,6 +19,7 @@ Environment:
   DEMO_MAX_ALERTS=30             cap per process so a long session does not flood the queue
   DEMO_DEVICE_FAULT_MEAN_S=60    mean period between device.status FAULT messages
   DEMO_ONLINE_VEHICLES=AV-01,AV-10,AV-11,AV-12
+  WORKER_ENABLED=1               0 runs the generator without the classifier worker
 """
 from __future__ import annotations
 
@@ -38,6 +42,7 @@ from app.db import make_engine
 from app.models import Alert, AlertAction, Tenant, Vehicle, sound_class_id
 
 from .common import ALERT_RULES, DEVICE_OVERRIDES, device_ids, env_flag, utcnow
+from .worker import ClassifierWorker
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 try:
@@ -158,7 +163,8 @@ async def _load_cars(session_factory, codes: List[str], rng: random.Random) -> L
     return [CarState(code, tenant_id, tenant_code, rng) for code, tenant_id, tenant_code in rows]
 
 
-async def _create_alert(session_factory, mongo_db, publisher, car: CarState, rng: random.Random) -> Optional[int]:
+async def _create_alert(session_factory, mongo_db, publisher, car: CarState, rng: random.Random,
+                        model_tag: str = MODEL_VERSION_TAG) -> Optional[int]:
     cls = rng.choice(ALERT_CLASS_POOL)
     state = "MOVING" if car.speed_kph > 0 else "PARKED"
     rule = next((r for r in ALERT_RULES if r["class"] == cls and r["vehicleState"] in ("ANY", state)), None)
@@ -173,11 +179,12 @@ async def _create_alert(session_factory, mongo_db, publisher, car: CarState, rng
                      {"alert": True, "alertId": None, "alertType": rule["alertType"], "severity": rule["severity"],
                       "reason": "ALERT_CREATED"})
     doc["context"]["speedKph"] = round(car.speed_kph, 1)
+    doc["inference"]["modelVersion"] = model_tag  # the version the classifier worker runs now
     await mongo_db["audio_events"].insert_one(doc)
     async with session_factory() as session:
         row = Alert(tenant_id=car.tenant_id, vehicle_id=car.code, alert_type_code=rule["alertType"], rule_id=rule["ruleId"],
                     top_class_id=sound_class_id(cls), severity=rule["severity"], status="NEW", event_ref=str(event_id),
-                    confidence=confidence, vehicle_state=state, model_version=MODEL_VERSION_TAG,
+                    confidence=confidence, vehicle_state=state, model_version=model_tag,
                     count=rule["minRepeats"], lat=round(car.lat, 6), lon=round(car.lon, 6), created_at=now, updated_at=now)
         session.add(row)
         await session.flush()
@@ -191,16 +198,45 @@ async def _create_alert(session_factory, mongo_db, publisher, car: CarState, rng
              "acknowledgedBy": None, "lat": round(car.lat, 6), "lon": round(car.lon, 6), "vehicleState": state,
              "eventRef": str(event_id)}
     await publisher.publish("alert.created", {"tenantId": car.tenant_id, "alert": alert})
-    log.info("demo: alert %s %s/%s %s %.2f on %s (%s) -> alert.created", alert_id, rule["alertType"], rule["severity"],
-             cls, confidence, car.code, car.tenant_code)
+    log.info("demo: alert %s %s/%s %s %.2f on %s (%s, %s) -> alert.created", alert_id, rule["alertType"],
+             rule["severity"], cls, confidence, car.code, car.tenant_code, model_tag)
     return alert_id
 
 
-async def demo_generator(eventbus: Any, mongo_db: Any, mysql_url: str, publisher: Any = None) -> None:
+def _make_worker(eventbus: Any) -> Optional[ClassifierWorker]:
+    if not env_flag("WORKER_ENABLED", "1"):
+        log.info("classifier worker disabled (WORKER_ENABLED=0)")
+        return None
+    from app.config import Settings  # the same secrets as the API (.env or the environment)
+    # Inline mode hands over the C1 EventBus (it has subscribe); the stubs container hands over
+    # the HTTP publisher, and the worker listens on MQTT instead.
+    bus = eventbus if hasattr(eventbus, "subscribe") else None
+    return ClassifierWorker.from_env(bus=bus, service_token_secret=Settings().service_token_secret)
+
+
+async def demo_generator(eventbus: Any, mongo_db: Any, mysql_url: str, publisher: Any = None,
+                         worker: Optional[ClassifierWorker] = None) -> None:
     """Runs until canceled. See the module docstring for the environment knobs."""
-    if not env_flag("DEMO_ENABLED", "1"):
-        log.info("demo generator disabled (DEMO_ENABLED=0)")
-        return
+    worker = worker or _make_worker(eventbus)
+    worker_task = asyncio.create_task(worker.run()) if worker is not None else None
+    try:
+        if not env_flag("DEMO_ENABLED", "1"):
+            log.info("demo generator disabled (DEMO_ENABLED=0)")
+            if worker_task is not None:
+                await worker_task
+            return
+        await _generate(eventbus, mongo_db, mysql_url, publisher, worker)
+    finally:
+        if worker_task is not None:
+            worker_task.cancel()
+            try:
+                await worker_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+
+
+async def _generate(eventbus: Any, mongo_db: Any, mysql_url: str, publisher: Any,
+                    worker: Optional[ClassifierWorker]) -> None:
     publisher = publisher or eventbus
     tick_s = max(2.0, _env_float("DEMO_TICK_S", 10.0))
     alert_period_s = max(20.0, _env_float("DEMO_ALERT_PERIOD_S", 150.0))
@@ -273,7 +309,8 @@ async def demo_generator(eventbus: Any, mongo_db: Any, mysql_url: str, publisher
             # 3. a new alert now and then
             if now >= next_alert_at and alerts_created < max_alerts:
                 try:
-                    await _create_alert(session_factory, mongo_db, publisher, rng.choice(cars), rng)
+                    tag = (worker.model_tag if worker is not None else None) or MODEL_VERSION_TAG
+                    await _create_alert(session_factory, mongo_db, publisher, rng.choice(cars), rng, tag)
                     alerts_created += 1
                 except Exception as exc:  # noqa: BLE001
                     log.warning("demo generator: alert creation failed: %s", exc)
