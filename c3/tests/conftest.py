@@ -13,8 +13,12 @@ from __future__ import annotations
 
 import sys
 import tempfile
+import time
+import uuid
 from pathlib import Path
+from typing import Optional
 
+import jwt
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
@@ -39,6 +43,37 @@ def make_settings(**overrides) -> Settings:
                 c1_base_url="http://c1.invalid/api/v1", log_level="WARNING")
     base.update(overrides)
     return Settings(_env_file=None, **base)
+
+
+def user_token(user_id: int, role: str, tenant_id: Optional[int], name: str = "Test User",
+               secret: str = JWT_SECRET) -> str:
+    """A user access token with the claims C1's TokenService.issue_access puts in it."""
+    now = int(time.time())
+    return jwt.encode({"sub": str(user_id), "tenantId": tenant_id, "role": role, "name": name,
+                       "jti": uuid.uuid4().hex, "iat": now, "exp": now + 900}, secret, algorithm="HS256")
+
+
+def service_token(subject: str = "c1-api", role: str = "SERVICE", secret: str = SERVICE_SECRET) -> str:
+    """A service token as C1's TokenService.issue_service_token makes it."""
+    now = int(time.time())
+    return jwt.encode({"sub": subject, "role": role, "iat": now, "exp": now + 3600, "jti": uuid.uuid4().hex},
+                      secret, algorithm="HS256")
+
+
+def bearer(token: str) -> dict:
+    return {"Authorization": f"Bearer {token}"}
+
+
+# The seeded users (seed/seed.py USERS): (user_id, role, tenant_id, name)
+SEED_USERS = {
+    "anh": (1001, "OWNER", 1, "Anh Nguyen"), "maria": (1002, "FLEET_MANAGER", 2, "Maria Lopez"),
+    "rider": (1003, "RIDER", 1, "Rider Demo"), "iot": (1004, "IOT_ENGINEER", None, "D. Patel"),
+    "staff": (1005, "SERVICE_STAFF", None, "Service Staff"), "admin": (1006, "SYS_ADMIN", None, "Platform Admin"),
+}
+
+
+def token_of(who: str) -> str:
+    return user_token(*SEED_USERS[who])
 
 
 @pytest_asyncio.fixture(scope="session")

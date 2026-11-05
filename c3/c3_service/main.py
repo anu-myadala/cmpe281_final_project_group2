@@ -16,6 +16,7 @@ from typing import Any, Optional
 from fastapi import FastAPI, Request
 from sqlalchemy import text
 
+from .auth import TenantDirectory
 from .config import Settings, get_settings
 from .db import make_engine, make_mongo, make_session_factory
 from .errors import install_error_handlers
@@ -35,6 +36,7 @@ def create_app(settings: Optional[Settings] = None, mongo: Any = None) -> FastAP
         engine = make_engine(settings.database_url)
         app.state.engine = engine
         app.state.session_factory = make_session_factory(engine)
+        app.state.tenants = TenantDirectory(app.state.session_factory)
         app.state.mongo = mongo if mongo is not None else make_mongo(settings.mongo_url, settings.mongo_database_name)
         await create_c3_schema(engine)
         log.info("C3 ready: %s, MongoDB %s", engine.dialect.name, settings.mongo_database_name)
