@@ -107,3 +107,26 @@ async def test_no_tenant_is_400(client, who, path):
     assert response.status_code == 400
     assert response.json() == {"error": {"code": "VALIDATION", "message": "tenantId is required",
                                          "details": {"field": "tenantId"}}}
+
+
+# -- event lookup is tenant-scoped (O6) ---------------------------------------------------------
+async def test_event_of_another_tenant_is_not_shown(app, client, mongo):
+    """An alert of tenant A whose event_ref points at a tenant B audio event: the detail shows no event and no clip."""
+    other = await mongo["audio_events"].find_one({"tenantId": "tB", "clip": {"$exists": True}, "decision.alert": False})
+    assert other is not None  # the event exists, so only the tenant filter can hide it
+    async with app.state.session_factory() as session:
+        row = Alert(tenant_id=1, vehicle_id="AV-01", alert_type_code="EMERGENCY", rule_id=1, top_class_id=1,
+                    severity="HIGH", status="NEW", event_ref=str(other["_id"]), confidence=0.8,
+                    vehicle_state="MOVING", model_version="sound-classifier-1.1.0", lat=37.33, lon=-121.88)
+        session.add(row)
+        await session.commit()
+        alert_id = row.alert_id
+    try:
+        for who in ("anh", "staff"):  # the alert's own tenant, and staff (who see every tenant)
+            body = (await _get(client, who, f"/alerts/{alert_id}")).json()
+            assert body["alert"]["eventRef"] == str(other["_id"])
+            assert body["event"] is None and body["clip"] is None
+    finally:
+        async with app.state.session_factory() as session:
+            await session.execute(delete(Alert).where(Alert.alert_id == alert_id))
+            await session.commit()
