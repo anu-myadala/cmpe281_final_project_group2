@@ -20,6 +20,7 @@ from .auth import TenantDirectory
 from .config import Settings, get_settings
 from .db import make_engine, make_mongo, make_session_factory
 from .errors import install_error_handlers
+from .routers import alerts
 from .schema import create_c3_schema
 from .timeutil import iso, utcnow
 
@@ -49,6 +50,7 @@ def create_app(settings: Optional[Settings] = None, mongo: Any = None) -> FastAP
                   docs_url=f"{settings.api_prefix}/docs", openapi_url=f"{settings.api_prefix}/openapi.json")
     app.state.settings = settings
     install_error_handlers(app)
+    app.include_router(alerts.router, prefix=settings.api_prefix)
 
     @app.get(f"{settings.api_prefix}/health", tags=["health"])
     async def health(request: Request):
