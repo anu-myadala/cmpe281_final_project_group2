@@ -13,8 +13,9 @@ from typing import Any, Optional
 
 from fastapi import Depends, Query, Request
 
-from .auth import Caller, TenantDirectory, forbid_roles, resolve_caller
+from .auth import Caller, TenantDirectory, bearer_token, decode_token, forbid_roles, resolve_caller
 from .config import Settings
+from .errors import Forbidden
 
 
 def get_settings_dep(request: Request) -> Settings:
@@ -53,3 +54,11 @@ def get_publisher(request: Request) -> Any:
 
 def get_c1_client(request: Request) -> Any:
     return request.app.state.c1_client
+
+
+async def service_caller(request: Request, settings: Settings = Depends(get_settings_dep)) -> dict:
+    """The internal routes (Table 89): a service token only. No or a bad token is 401; a valid user token 403."""
+    payload = decode_token(bearer_token(request), settings)
+    if payload.get("role") != "SERVICE":
+        raise Forbidden("A service token is required")
+    return payload

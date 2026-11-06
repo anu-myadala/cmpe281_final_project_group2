@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class AlertRow(BaseModel):
@@ -134,3 +134,41 @@ class ActionBody(BaseModel):
     """POST /alerts/{alertId}/actions. Defined exactly like the stub's, so a bad body gets the same 400 wording."""
     action: Literal["ACKNOWLEDGE", "RESOLVE", "FALSE_ALARM"]
     note: Optional[str] = Field(default=None, max_length=500)
+
+
+# -- the internal result call (Part III, Section 2.3, Table 85) ------------------------------------
+class Score(BaseModel):
+    """One class of the result: {"class": "crash", "conf": 0.91}."""
+    model_config = ConfigDict(populate_by_name=True)
+
+    class_: str = Field(alias="class", min_length=1, max_length=32)
+    conf: float = Field(ge=0.0, le=1.0)
+
+
+class ResultBody(BaseModel):
+    """What the classifier worker reports for an audio event it has already stored."""
+    tenantId: str = Field(min_length=1, max_length=16)    # tenant code, e.g. tA
+    vehicleId: str = Field(min_length=1, max_length=32)   # vehicle code, e.g. AV-01
+    topK: List[Score] = Field(default_factory=list, max_length=3)
+    modelVersion: str = Field(min_length=1, max_length=64)
+    latencyMs: Optional[int] = Field(default=None, ge=0)
+    error: Optional[str] = Field(default=None, max_length=500)
+
+    @model_validator(mode="after")
+    def _top_k_or_error(self) -> "ResultBody":
+        if not self.topK and not self.error:
+            raise ValueError("topK is empty and no error is given")
+        return self
+
+
+class Decision(BaseModel):
+    """The engine's decision; alertId, alertType and severity only when there is an alert."""
+    alert: bool
+    alertId: Optional[int] = None
+    alertType: Optional[str] = None
+    severity: Optional[str] = None
+    reason: str   # ALERT_CREATED NO_RULE STATE_MISMATCH BELOW_THRESHOLD SERVICE_OFF REPEAT_PENDING DUPLICATE_RESULT ERROR_RECORDED
+
+
+class ResultResponse(BaseModel):
+    decision: Decision

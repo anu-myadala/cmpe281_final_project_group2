@@ -20,7 +20,7 @@ from .auth import TenantDirectory
 from .config import Settings, get_settings
 from .db import make_engine, make_mongo, make_session_factory
 from .errors import install_error_handlers
-from .routers import alerts
+from .routers import alerts, internal
 from .schema import create_c3_schema
 from .services.c1_client import C1Client
 from .services.publisher import HttpPublisher, NoopPublisher
@@ -65,6 +65,7 @@ def create_app(settings: Optional[Settings] = None, mongo: Any = None, publisher
     app.state.c1_client = c1_client or C1Client(settings.c1_base_url, settings.client_timeout_seconds)
     install_error_handlers(app)
     app.include_router(alerts.router, prefix=settings.api_prefix)
+    app.include_router(internal.router, prefix=settings.api_prefix)
 
     @app.get(f"{settings.api_prefix}/health", tags=["health"])
     async def health(request: Request):

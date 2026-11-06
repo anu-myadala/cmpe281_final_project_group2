@@ -7,6 +7,7 @@ the audio_events document (alert.event_ref).
 """
 from __future__ import annotations
 
+from datetime import timedelta
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 from bson import ObjectId
@@ -59,3 +60,33 @@ def location_of(doc: Optional[Dict[str, Any]]) -> Optional[Tuple[float, float]]:
     if not coords or len(coords) < 2 or coords[0] is None or coords[1] is None:
         return None
     return coords[1], coords[0]
+
+
+# -- used by the result call (AlertEngine, step 7) ---------------------------------------------------
+class ResultEvents(EventStore):
+    """The audio_events reads and the one write of the result call (Part III, Table 98)."""
+
+    async def get_for_vehicle(self, event_ref: str, tenant_code: str, vehicle_id: str) -> Optional[Dict[str, Any]]:
+        """The event by _id, and only if it belongs to this tenant and vehicle (404 otherwise)."""
+        oid = _object_id(event_ref)
+        if oid is None:
+            return None
+        return await self.mongo["audio_events"].find_one({"_id": oid, "tenantId": tenant_code, "vehicleId": vehicle_id})
+
+    async def count_same_top_class(self, event: Dict[str, Any], class_name: str, window_s: int) -> int:
+        """BR-C3-05: events of the vehicle whose top class is `class_name` with ts in [ts - window_s, ts], the current
+        event counted as 1 whatever its stored top class (it is excluded from the query and added).
+        Served by the index {tenantId, vehicleId, ts} (Table 98)."""
+        ts = event["ts"]
+        others = await self.mongo["audio_events"].count_documents({
+            "tenantId": event["tenantId"], "vehicleId": event["vehicleId"],
+            "ts": {"$gte": ts - timedelta(seconds=window_s), "$lte": ts},
+            "inference.topK.0.class": class_name, "_id": {"$ne": event["_id"]}})
+        return others + 1
+
+    async def set_decision_if_absent(self, event: Dict[str, Any], decision: Dict[str, Any]) -> bool:
+        """audio_events.decision is written once (Table 96: "Set once"); True when this call wrote it."""
+        result = await self.mongo["audio_events"].update_one(
+            {"_id": event["_id"], "tenantId": event["tenantId"], "decision": {"$exists": False}},
+            {"$set": {"decision": decision}})
+        return result.modified_count == 1
