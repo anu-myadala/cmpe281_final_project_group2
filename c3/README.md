@@ -30,6 +30,53 @@ DATABASE_URL=mysql+pymysql://scicp:scicp@127.0.0.1:3306/scicp MONGO_URL=mongodb:
   .venv/bin/uvicorn c3_service.main:app --port 8003   # against docker compose's mysql and mongo
 ```
 
+## Docker compose (the whole platform with this C3)
+
+```bash
+cp .env.example .env        # once; the secrets and URLs are shared with C1
+docker compose -f docker-compose.yml -f docker-compose.c3.yml up -d --build
+# EC2: -f docker-compose.yml -f docker-compose.aws.yml -f docker-compose.c3.yml, and C3_PUBLIC_BASE_URL=http://<host> in .env
+```
+
+| What | URL |
+|---|---|
+| Web app | http://localhost:8080 |
+| C3 API docs (localhost only) | http://localhost:8003/api/v1/docs |
+| MailHog (alert emails) | http://localhost:8025 |
+
+`docker-compose.c3.yml` switches C1 over without editing any shared file:
+
+- `c3`: this service (`c3/Dockerfile`), on `c3:8003` inside the network; email through MailHog, events to C1.
+- `api`: `C3_BASE_URL=http://c3:8003/api/v1` (C1's AlertClient: overview, map pins).
+- `web`: nginx `/c3/` -> `c3:8003`, by mounting `c3/deploy/nginx-default.conf` (C1's file with that one
+  upstream line changed; `tests/test_deploy_files.py` fails if the two ever differ in anything else).
+- `stubs`: C2 only (`c3/deploy/stubs_c2_only.py`); the cars still move, devices still fault, the simulated
+  C4 worker still runs, but `DEMO_MAX_ALERTS=0`: new alerts come only from C3's result call.
+
+## Demo tools
+
+`tools/send_result.py` plays the classifier worker: it stores an audio event at the car's position and
+posts its result to C3, which decides (Table 102) and, for an alert, notifies (Table 104) and pushes it live.
+
+```bash
+DC="docker compose -f docker-compose.yml -f docker-compose.c3.yml"
+$DC exec c3 python tools/send_result.py crash 0.91 AV-01 tA 48            # ACCIDENT/CRITICAL, email to Anh
+$DC exec c3 python tools/send_result.py scream 0.83 AV-12 tB 0            # SECURITY/HIGH, email to Maria (not 22:00-06:00 LA)
+$DC exec c3 python tools/send_result.py honking 0.80 AV-10 tB 30 --repeat 2   # REPEAT_PENDING, then SAFETY/MEDIUM
+$DC exec c3 python tools/send_result.py honking 0.80 AV-12 tB 30          # SERVICE_OFF (SAFETY is off on AV-12)
+$DC exec c3 python tools/send_result.py crash 0.95 AV-01 tA 0             # STATE_MISMATCH (crash while parked)
+$DC exec c3 python tools/send_result.py traffic 0.97 AV-01 tA 30          # NO_RULE
+```
+
+Arguments: `class confidence vehicle tenant speedKph`; options `--also CLASS:CONF` (2nd and 3rd class),
+`--ignition on|off`, `--repeat N --gap S`, `--error TEXT` (ERROR_RECORDED), `--model-version`.
+
+`tools/watch_ws.py` prints what C1 pushes to a user over the WebSocket (run it on the host):
+
+```bash
+c3/.venv/bin/python c3/tools/watch_ws.py --email maria@bayshuttle.example --seconds 300
+```
+
 ## Known seed artifacts
 
 `seed/seed.py` (owned by C1) builds the alert history without applying the alert rules, so 17 of

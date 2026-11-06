@@ -9,6 +9,8 @@ WORKDIR /srv/c3
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY c3_service ./c3_service
+# Demo tools (python tools/send_result.py ...): run inside this container, where MONGO_URL and the secrets are set
+COPY tools ./tools
 
 EXPOSE 8003
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
