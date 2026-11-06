@@ -44,7 +44,7 @@ SERVICE_SECRET = "test-service-secret-0123456789abcdef01234"
 
 def make_settings(**overrides) -> Settings:
     base = dict(database_url=DB_URL, mongo_url="mock", jwt_secret=JWT_SECRET, service_token_secret=SERVICE_SECRET,
-                c1_base_url="http://c1.invalid/api/v1", log_level="WARNING")
+                c1_base_url="http://c1.invalid/api/v1", log_level="WARNING", publisher="noop")
     base.update(overrides)
     return Settings(_env_file=None, **base)
 

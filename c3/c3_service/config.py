@@ -24,9 +24,12 @@ class Settings(BaseSettings):
     jwt_secret: str = "change-me-jwt-secret"
     service_token_secret: str = "change-me-service-secret"
 
-    # C1, for POST /internal/events and the feedback labels (used from step 5 on)
+    # C1: POST /internal/events (alert.created / alert.updated) and the feedback labels
     c1_base_url: str = "http://localhost:8000/api/v1"
     client_timeout_seconds: float = 5.0
+    # How alert events reach C1: http (POST /internal/events, the default) or noop (dropped, logged)
+    publisher: str = "http"
+    publish_timeout_seconds: float = 2.0
 
     api_prefix: str = "/api/v1"
     log_level: str = "INFO"
@@ -41,6 +44,14 @@ class Settings(BaseSettings):
             return "mysql+aiomysql://" + value[len("mysql://"):]
         if value.startswith("sqlite:///"):
             return "sqlite+aiosqlite:///" + value[len("sqlite:///"):]
+        return value
+
+    @field_validator("publisher", mode="before")
+    @classmethod
+    def _publisher(cls, value) -> str:
+        value = str(value or "http").strip().lower()
+        if value not in ("http", "noop"):
+            raise ValueError("PUBLISHER must be http or noop")
         return value
 
     @property
