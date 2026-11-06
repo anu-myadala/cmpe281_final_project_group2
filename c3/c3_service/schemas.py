@@ -172,3 +172,41 @@ class Decision(BaseModel):
 
 class ResultResponse(BaseModel):
     decision: Decision
+
+
+# -- the alert rules API (Part III, Section 2.2, Table 84) ------------------------------------------
+class RuleItem(BaseModel):
+    """One effective rule, in the stub's field order (stubs/c3.py GET /alert-rules)."""
+    model_config = ConfigDict(populate_by_name=True)
+
+    ruleId: int
+    scope: str                              # DEFAULT | TENANT
+    tenantId: Optional[int] = None          # the override's tenant; null for a platform default
+    alertType: str
+    class_: str = Field(alias="class")
+    vehicleState: str                       # ANY | MOVING | PARKED
+    minConfidence: float
+    severity: str                           # what an alert of this rule gets (override, else the type's default)
+    severityOverride: Optional[str] = None
+    minRepeats: int
+    windowSeconds: Optional[int] = None
+    enabled: bool
+    soundClass: str                         # the same as class, for the web's rules table
+    updatedBy: Optional[str] = None         # display name; null for the seeded defaults
+    updatedAt: Optional[str] = None
+
+
+class RuleChanges(BaseModel):
+    """PUT /alert-rules/{ruleId}: only the fields sent are changed; severityOverride null removes the override.
+    Unknown fields are refused (400), so a typo can't be silently ignored."""
+    model_config = ConfigDict(extra="forbid")
+
+    minConfidence: Optional[float] = None
+    severityOverride: Optional[Literal["LOW", "MEDIUM", "HIGH", "CRITICAL"]] = None
+    minRepeats: Optional[int] = None
+    windowSeconds: Optional[int] = None
+    enabled: Optional[bool] = None
+
+    def changes(self) -> Dict[str, Any]:
+        """The fields the caller actually sent (explicit nulls included)."""
+        return {name: getattr(self, name) for name in self.model_fields_set}

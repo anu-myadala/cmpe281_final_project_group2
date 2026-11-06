@@ -61,6 +61,14 @@ class Conflict(ApiError):
     status, code = 409, "CONFLICT"
 
 
+class BusinessRule(ApiError):
+    """422 BUSINESS_RULE; details.rule names the rule (BR-C3-09, BR-C3-10), as C1's BusinessRule."""
+    status, code = 422, "BUSINESS_RULE"
+
+    def __init__(self, rule: str, message: str, **details: Any) -> None:
+        super().__init__(message, {"rule": rule, **{k: v for k, v in details.items() if v is not None}})
+
+
 _HTTP_CODES = {400: "VALIDATION", 401: "UNAUTHORIZED", 403: "FORBIDDEN", 404: "NOT_FOUND", 405: "NOT_FOUND",
                409: "CONFLICT", 422: "VALIDATION"}
 

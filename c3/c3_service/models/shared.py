@@ -1,5 +1,7 @@
-"""Read-only mappings of the C1 and C2 tables that C3 reads (Part III, Section 1.5,
-Table 82, and Section 2.6, Table 88: "SELECT-only through C5").
+"""Mappings of the C1 and C2 tables that C3 reads (Part III, Section 1.5, Table 82, and
+Section 2.6, Table 88: "SELECT-only through C5"), and C1's audit_log, the one C1 table C3
+writes: C1's AuditLogger is "shared with C2 and C3, which pass their own action names",
+and Table 84 audits RULE_SAVE and RULE_DELETE (team decision, step 9).
 
 C3 never writes or creates these tables, so only the columns C3 needs are mapped.
 Enum columns are mapped as plain strings, so a value that C1 adds later can't break a
@@ -9,10 +11,10 @@ from __future__ import annotations
 
 from typing import Optional
 
-from sqlalchemy import Boolean, Integer, SmallInteger, String, Time
+from sqlalchemy import JSON, Boolean, Integer, SmallInteger, String, Time
 from sqlalchemy.orm import Mapped, mapped_column
 
-from .base import Base, BigId, UtcDateTime
+from .base import Base, BigId, UtcDateTime, utcnow
 
 # Values shared with C1 (c1/api/app/models): roles, alert statuses, alert types.
 TENANT_ROLES = ("OWNER", "FLEET_MANAGER", "RIDER")
@@ -90,3 +92,20 @@ class Subscription(Base):
     quiet_from: Mapped[Optional[object]] = mapped_column(Time, nullable=True)
     quiet_to: Mapped[Optional[object]] = mapped_column(Time, nullable=True)
     notify_riders: Mapped[bool] = mapped_column(Boolean, nullable=False)
+
+
+class AuditLog(Base):
+    """C1's audit_log, all columns as c1/api/app/models/c1.py defines them (BR-12 of C1). C3 inserts the same
+    row C1's AuditLogger.write builds; it never creates or alters the table."""
+    __tablename__ = "audit_log"
+
+    audit_id: Mapped[int] = mapped_column(BigId, primary_key=True, autoincrement=True)
+    actor_user_id: Mapped[Optional[int]] = mapped_column(BigId, nullable=True)
+    tenant_id: Mapped[Optional[int]] = mapped_column(BigId, nullable=True)
+    action: Mapped[str] = mapped_column(String(40), nullable=False)
+    entity: Mapped[str] = mapped_column(String(40), nullable=False)
+    entity_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    before_json: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    after_json: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    ip: Mapped[Optional[str]] = mapped_column(String(45), nullable=True)
+    ts: Mapped[object] = mapped_column(UtcDateTime, nullable=False, default=utcnow)

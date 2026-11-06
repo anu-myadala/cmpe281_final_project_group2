@@ -8,11 +8,18 @@ FastAPI, Python 3.11, package `c3_service`, routes under `/api/v1` (`/c3/api/v1`
 | `GET /alerts`, `GET /alerts/map`, `GET /alerts/{alertId}` | the queue, the map pins, the alert page (Table 83) |
 | `POST /alerts/{alertId}/actions` | Acknowledge, Resolve, False alarm (BR-C3-07, guarded update) |
 | `POST /internal/events/{eventRef}/result` | the classifier worker's result -> at most one alert (Table 85, service token only) |
+| `GET /alert-rules?tenantId` | the effective rules: defaults with the tenant's overrides in place (Table 84) |
+| `PUT /alert-rules/{ruleId}` | change a rule; on a default with a tenant scope it creates that tenant's override (201); BR-C3-09, BR-C3-10 |
+| `DELETE /alert-rules/{ruleId}` | remove an override (204; the default applies again); a default answers 409 |
 | `GET /health` | database check |
 
+`POST /alert-rules` (a brand-new rule) is **design only** this semester and is not built: it answers
+405. Tenants change behaviour by overriding the seven default rules with PUT.
+
 C3 creates only `alert_rule`, `notification` and `sound_class`; `alert`, `alert_action` and
-`v_alert_summary` are created by C1. Events go to C1 with `POST /internal/events`
-(`PUBLISHER=noop` drops them).
+`v_alert_summary` are created by C1. Rule changes are audited in C1's `audit_log` (RULE_SAVE /
+RULE_DELETE, the row C1's AuditLogger writes). Events go to C1 with `POST /internal/events`
+(`PUBLISHER=noop` drops them); emails go out with `MAIL_MODE=smtp` (MailHog) or `log`.
 
 ## Run
 
