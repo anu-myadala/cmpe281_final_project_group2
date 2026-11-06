@@ -5,8 +5,9 @@ The output is the stub's (stubs/c3.py) field for field, with three of the team's
   * the map takes the alert row's lat/lon first, then the audio event's, then the car's
     newest telemetry (the stub looks at the event first; both are written from the same
     position, so the pins are the same);
-  * notifications is [] until the notification table is filled (step 8); the stub
-    derives a list from the subscription instead;
+  * notifications are the real notification rows (the DASHBOARD row shows as recipient
+    "dashboard"); the stub derives a list from the subscription instead, so the seeded alerts,
+    which have no rows, list none;
   * the audio event is looked up with the alert's tenant code as well as its _id (O6).
 
 Scoping (Table 89): a tenant role sees its own tenant, staff the tenant they chose
@@ -23,9 +24,10 @@ from sqlalchemy import case, func, select
 
 from ..auth import Caller, TenantDirectory
 from ..errors import NotFound, Validation
-from ..models import OPEN_STATUSES, Alert, AlertAction, AlertRule, AppUser, sound_class_name
+from ..models import OPEN_STATUSES, Alert, AlertAction, AlertRule, AppUser, Notification, sound_class_name
 from ..timeutil import as_naive_utc, iso, parse_iso, utcnow
 from .event_store import EventStore, location_of
+from .recipient_resolver import DASHBOARD_RECIPIENT
 
 PAGE_SIZE_DEFAULT = 25
 PAGE_SIZE_MAX = 100
@@ -224,9 +226,14 @@ class AlertQueryService:
             actions = list((await session.execute(select(AlertAction).where(AlertAction.alert_id == alert_id)
                                                   .order_by(AlertAction.ts, AlertAction.action_id))).scalars().all())
             rule = await session.get(AlertRule, row.rule_id)
+            sent = (await session.execute(
+                select(Notification.channel, Notification.status, Notification.sent_at, AppUser.email)
+                .outerjoin(AppUser, AppUser.user_id == Notification.recipient_user_id)
+                .where(Notification.alert_id == alert_id).order_by(Notification.notification_id))).all()
             names = await self._user_names(session, [row.acknowledged_by, row.closed_by] + [a.user_id for a in actions])
         tenant_code = await self.tenants.code_of(row.tenant_id)  # the alert's own tenant, also for staff
         doc = await self.events.get(row.event_ref, tenant_code)
         return {"alert": alert_row(row, names), "event": event_info(doc) if doc else None, "rule": rule_info(rule),
                 "clip": clip_info(doc), "actions": [action_entry(a, names) for a in actions],
-                "notifications": []}  # filled from the notification table in step 8
+                "notifications": [{"recipient": email or DASHBOARD_RECIPIENT, "channel": channel, "status": status,
+                                   "sentAt": iso(sent_at)} for channel, status, sent_at, email in sent]}

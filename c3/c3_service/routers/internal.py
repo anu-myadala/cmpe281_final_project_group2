@@ -13,7 +13,7 @@ from typing import Any
 from fastapi import APIRouter, Depends
 
 from ..auth import TenantDirectory
-from ..deps import get_mongo, get_publisher, get_session_factory, get_tenants, service_caller
+from ..deps import get_mongo, get_notifier, get_publisher, get_session_factory, get_tenants, service_caller
 from ..schemas import ResultBody, ResultResponse
 from ..services.alert_engine import AlertEngine
 from ..services.event_store import ResultEvents
@@ -22,8 +22,9 @@ router = APIRouter(prefix="/internal", tags=["internal"])
 
 
 def get_engine(session_factory: Any = Depends(get_session_factory), mongo: Any = Depends(get_mongo),
-               publisher: Any = Depends(get_publisher), tenants: TenantDirectory = Depends(get_tenants)) -> AlertEngine:
-    return AlertEngine(session_factory, ResultEvents(mongo), publisher, tenants)
+               publisher: Any = Depends(get_publisher), tenants: TenantDirectory = Depends(get_tenants),
+               notifier: Any = Depends(get_notifier)) -> AlertEngine:
+    return AlertEngine(session_factory, ResultEvents(mongo), publisher, tenants, notifier)
 
 
 @router.post("/events/{eventRef}/result", response_model=ResultResponse, response_model_exclude_none=True)

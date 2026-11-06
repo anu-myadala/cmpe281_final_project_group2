@@ -112,12 +112,12 @@ class ActionEntry(BaseModel):
 
 
 class NotificationEntry(BaseModel):
-    """One notification row (filled from step 8 on)."""
+    """One notification row: the user's email (or "dashboard" for the tenant room), DASHBOARD | EMAIL,
+    PENDING | SENT | FAILED, and when it was sent."""
     recipient: str
     channel: str
     status: str
     sentAt: Optional[str] = None
-    reason: Optional[str] = None
 
 
 class AlertDetail(BaseModel):

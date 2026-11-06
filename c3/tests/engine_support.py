@@ -95,13 +95,15 @@ async def engine_env(fresh_db_copy):
     """A C3 app on a fresh copy of the seeded database, an empty MongoDB, a recording publisher."""
     stack = []
 
-    async def build(publisher_fails: bool = False) -> EngineEnv:
+    async def build(publisher_fails: bool = False, mailer: Any = None, clock: Any = None) -> EngineEnv:
         mongo, publisher = AsyncMongoMockClient()["scicp"], RecordingPublisher(fail=publisher_fails)
         app = create_app(make_settings(database_url=sqlite_url(fresh_db_copy(f"engine{len(stack)}.db"))), mongo=mongo,
-                         publisher=publisher)
+                         publisher=publisher, mailer=mailer)
         lifespan = app.router.lifespan_context(app)
         await lifespan.__aenter__()
         publisher.session_factory = app.state.session_factory
+        if clock is not None:
+            app.state.notifier.clock = clock  # "now" for the quiet hours and the rider window
         client = AsyncClient(transport=ASGITransport(app=app), base_url="http://c3.test")
         stack.append((client, lifespan))
         return EngineEnv(client, app, mongo, publisher)

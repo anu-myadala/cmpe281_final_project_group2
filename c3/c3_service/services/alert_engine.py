@@ -7,7 +7,8 @@ BR-C3-01 to BR-C3-06 and BR-C3-12; Section 4.1, Table 102; pseudocode of Section
                     (BR-C3-02, 03), then judge_class() in the order of Table 102; pick_winner() (BR-C3-04)
     create_alert()  ONE transaction: INSERT alert + INSERT alert_action(CREATE); the unique key
                     (event_ref, alert_type_code) turns a racing duplicate into DUPLICATE_RESULT.
-                    After the COMMIT only: audio_events.decision, the step 8 notification hook, alert.created.
+                    After the COMMIT only: audio_events.decision, the notifications (after_alert_created:
+                    the rows now, the emails in the background), alert.created.
 
 judge_class() and pick_winner() are pure, so every row of the decision tables is a unit test.
 """
@@ -66,18 +67,23 @@ def duplicate_of(stored: Dict[str, Any]) -> Dict[str, Any]:
             "severity": stored.get("severity"), "reason": "DUPLICATE_RESULT"}
 
 
-async def after_alert_created(alert_id: int) -> None:
-    """STEP 8 HOOK: RecipientResolver and NotificationService (Table 104, BR-C3-11) will write the notification
-    rows and send the e-mails here. Until then it does nothing; no notification data is invented."""
-    return None
-
-
 class AlertEngine:
-    def __init__(self, session_factory: Any, events: ResultEvents, publisher: Publisher, tenants: TenantDirectory) -> None:
+    def __init__(self, session_factory: Any, events: ResultEvents, publisher: Publisher, tenants: TenantDirectory,
+                 notifier: Any = None) -> None:
         self.session_factory = session_factory
         self.events = events
         self.publisher = publisher
         self.tenants = tenants
+        self.notifier = notifier  # NotificationService; None writes no notifications (the seed-consistency test)
+
+    async def after_alert_created(self, alert: Alert) -> None:
+        """The notification hook (BR-C3-11), after the COMMIT: never fails the result call."""
+        if self.notifier is None:
+            return
+        try:
+            await self.notifier.after_alert_created(alert)
+        except Exception as exc:  # noqa: BLE001 - NotificationService already logs; this guards a replacement
+            log.error("alert %s: notification hook failed: %s", alert.alert_id, exc)
 
     # -- the result call ----------------------------------------------------------------------------
     async def handle(self, event_ref: str, tenant_code: str, vehicle_id: str, top_k: List[Tuple[str, float]],
@@ -163,7 +169,7 @@ class AlertEngine:
         decision = {"alert": True, "alertId": row.alert_id, "alertType": row.alert_type_code, "severity": row.severity,
                     "reason": "ALERT_CREATED"}
         await self.events.set_decision_if_absent(event, decision)
-        await after_alert_created(row.alert_id)
+        await self.after_alert_created(row)
         await safe_publish(self.publisher, "alert.created", alert_created_payload(alert_row(row, {}, now)), tenant_id)
         log.info("event %s: %s %s alert %s on %s (%s %.2f, rule %s)", event_ref, row.severity, row.alert_type_code,
                  row.alert_id, row.vehicle_id, best.class_name, best.conf, best.rule.rule_id)

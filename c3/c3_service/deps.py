@@ -56,6 +56,10 @@ def get_c1_client(request: Request) -> Any:
     return request.app.state.c1_client
 
 
+def get_notifier(request: Request) -> Any:
+    return request.app.state.notifier
+
+
 async def service_caller(request: Request, settings: Settings = Depends(get_settings_dep)) -> dict:
     """The internal routes (Table 89): a service token only. No or a bad token is 401; a valid user token 403."""
     payload = decode_token(bearer_token(request), settings)

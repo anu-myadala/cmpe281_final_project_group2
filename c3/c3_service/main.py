@@ -22,7 +22,9 @@ from .db import make_engine, make_mongo, make_session_factory
 from .errors import install_error_handlers
 from .routers import alerts, internal
 from .schema import create_c3_schema
+from .services.alert_mailer import AlertMailer
 from .services.c1_client import C1Client
+from .services.notification_service import NotificationService
 from .services.publisher import HttpPublisher, NoopPublisher
 from .timeutil import iso, utcnow
 
@@ -37,7 +39,7 @@ def make_publisher(settings: Settings):
 
 
 def create_app(settings: Optional[Settings] = None, mongo: Any = None, publisher: Any = None,
-               c1_client: Optional[C1Client] = None) -> FastAPI:
+               c1_client: Optional[C1Client] = None, mailer: Any = None) -> FastAPI:
     """The tests hand in `mongo` (the mock the seed wrote to), a recording `publisher` and a `c1_client`
     on httpx.MockTransport. Without them: the configured MongoDB, make_publisher(settings) and a
     C1Client on C1_BASE_URL."""
@@ -52,10 +54,13 @@ def create_app(settings: Optional[Settings] = None, mongo: Any = None, publisher
         app.state.tenants = TenantDirectory(app.state.session_factory)
         app.state.mongo = mongo if mongo is not None else make_mongo(settings.mongo_url, settings.mongo_database_name)
         await create_c3_schema(engine)
+        app.state.notifier = NotificationService(app.state.session_factory, mailer or AlertMailer(settings),
+                                                 settings.retry_waits)
         log.info("C3 ready: %s, MongoDB %s", engine.dialect.name, settings.mongo_database_name)
         try:
             yield
         finally:
+            await app.state.notifier.close()  # stops the email retries; their rows stay PENDING
             await engine.dispose()
 
     app = FastAPI(title="SCICP C3 Alert Tracking and Monitoring", version="1.0.0", lifespan=lifespan,

@@ -6,9 +6,12 @@ the status code and the JSON body must be equal. Before comparing, only two thin
 changed, each by a named normalizer:
 
   drop_age_seconds              ageSeconds depends on the instant of the call
-  stub_notifications_to_empty   decision D6: C3 lists real notification rows (empty until
-                                step 8); the stub derives SENT/SUPPRESSED entries from the
-                                subscription
+  stub_notifications_to_empty   decision D6: C3 lists the real notification rows; the stub
+                                derives SENT/SUPPRESSED entries from the subscription. Every
+                                alert compared here was created by the seed (the stub's data),
+                                so it has no rows in C3: C3 must answer [] for it, which the
+                                comparison enforces. Alerts created through C3's result call
+                                list their real rows (tests/test_notifications.py).
 
 Known difference that the data cannot show (decision D1): the map takes the alert row's
 position before the audio event's; the stub does the reverse. The seed and the generator
