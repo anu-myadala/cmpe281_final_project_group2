@@ -4,13 +4,16 @@
    tables and the alert history are exactly what docker compose has;
 2. one in-process MongoDB mock is shared by the seed and C3 (the audio events);
 3. the C3 app starts with its lifespan (that creates and seeds the C3 tables), and an
-   httpx client calls it in process.
+   httpx client calls it in process;
+4. right then, before any test writes, the database file is copied to SNAPSHOT_DB: the
+   action tests run each scenario on a fresh copy of it (fresh_db_copy).
 
 The seed imports C1's `app` package, which is why the test virtualenv also has
 c1/api/requirements.txt installed.
 """
 from __future__ import annotations
 
+import shutil
 import sys
 import tempfile
 import time
@@ -33,6 +36,7 @@ from c3_service.config import Settings  # noqa: E402
 from c3_service.main import create_app  # noqa: E402
 
 TEST_DB = Path(tempfile.gettempdir()) / "scicp_c3_test.db"
+SNAPSHOT_DB = Path(tempfile.gettempdir()) / "scicp_c3_snapshot.db"
 DB_URL = f"sqlite+aiosqlite:///{TEST_DB}"
 JWT_SECRET = "test-jwt-secret-0123456789abcdef0123456789"
 SERVICE_SECRET = "test-service-secret-0123456789abcdef01234"
@@ -95,7 +99,22 @@ async def seeded(mongo):
 async def app(seeded, mongo):
     application = create_app(make_settings(), mongo=mongo)
     async with application.router.lifespan_context(application):
+        shutil.copyfile(TEST_DB, SNAPSHOT_DB)  # pristine: seeded, C3 tables created, nothing changed yet
         yield application
+
+
+@pytest.fixture
+def fresh_db_copy(app, tmp_path):
+    """Returns a function that copies the pristine snapshot to a new file and gives its path."""
+    def copy(name: str = "c3.db") -> Path:
+        target = tmp_path / name
+        shutil.copyfile(SNAPSHOT_DB, target)
+        return target
+    return copy
+
+
+def sqlite_url(path: Path) -> str:
+    return f"sqlite+aiosqlite:///{path}"
 
 
 @pytest_asyncio.fixture(scope="session")

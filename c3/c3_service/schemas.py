@@ -8,7 +8,7 @@ UTC strings (timeutil.iso).
 """
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -128,3 +128,9 @@ class AlertDetail(BaseModel):
     clip: Optional[ClipInfo] = None
     actions: List[ActionEntry] = []
     notifications: List[NotificationEntry] = []
+
+
+class ActionBody(BaseModel):
+    """POST /alerts/{alertId}/actions. Defined exactly like the stub's, so a bad body gets the same 400 wording."""
+    action: Literal["ACKNOWLEDGE", "RESOLVE", "FALSE_ALARM"]
+    note: Optional[str] = Field(default=None, max_length=500)

@@ -45,3 +45,11 @@ async def alert_caller(request: Request, tenantId: Optional[str] = Query(default
 async def rules_caller(caller: Caller = Depends(alert_caller)) -> Caller:
     forbid_roles(caller, "OWNER", "RIDER")  # Table 89: rules are for fleet managers and staff
     return caller
+
+
+def get_publisher(request: Request) -> Any:
+    return request.app.state.publisher
+
+
+def get_c1_client(request: Request) -> Any:
+    return request.app.state.c1_client
