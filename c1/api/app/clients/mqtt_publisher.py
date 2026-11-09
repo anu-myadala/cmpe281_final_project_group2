@@ -48,6 +48,14 @@ class MqttPublisher:
         if parsed.scheme in ("mqtts", "ssl"):
             client.tls_set()
         client.connect(host, port, keepalive=10)
-        info = client.publish(topic, payload, qos=qos, retain=retain)
-        info.wait_for_publish(timeout=5)
-        client.disconnect()
+        # The network loop must run for the broker's PUBACK (QoS 1) to be read; without it
+        # wait_for_publish sat out its whole timeout on every activation.
+        client.loop_start()
+        try:
+            info = client.publish(topic, payload, qos=qos, retain=retain)
+            info.wait_for_publish(timeout=5)
+            if not info.is_published():
+                raise TimeoutError(f"no PUBACK from {host}:{port} within 5 s")
+        finally:
+            client.disconnect()
+            client.loop_stop()
