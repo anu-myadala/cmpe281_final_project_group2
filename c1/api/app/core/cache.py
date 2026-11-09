@@ -28,10 +28,15 @@ class TtlCache:
         self._items[key] = (time.monotonic() + self.ttl, value)
 
     def expire(self, key: Hashable) -> None:
-        """Mark one entry stale while keeping its value (used by the tests)."""
+        """Mark one entry stale while keeping its value."""
         item = self._items.get(key)
         if item:
             self._items[key] = (0.0, item[1])
+
+    def expire_all(self) -> None:
+        """Mark every entry stale, keeping the values for the degraded fallback."""
+        for key in list(self._items):
+            self.expire(key)
 
     def clear(self) -> None:
         self._items.clear()

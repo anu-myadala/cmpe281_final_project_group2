@@ -44,6 +44,23 @@ class AppContainer:
 
     def __post_init__(self) -> None:
         self.events = EventQueryRepo(self.mongo)
+        # A new or changed alert, or a device going on or offline, makes the tenant's cached
+        # overview and alert pins stale at once, so the counters follow the live toast instead of
+        # waiting for the 30 s cache. The stale value stays as the fallback when C2 or C3 is down.
+        for topic in ("alert.created", "alert.updated", "device.status"):
+            self.bus.subscribe(topic, self._expire_tenant_caches)
+
+    def _expire_tenant_caches(self, topic: str, payload: Dict[str, Any]) -> None:
+        # The caches are keyed by the numeric tenant id; an event that names the tenant by its code
+        # ("tB") or not at all marks every tenant's entry stale.
+        try:
+            tenant = int(payload.get("tenantId"))
+        except (TypeError, ValueError):
+            self.overview_cache.expire_all()
+            self.pins_cache.expire_all()
+            return
+        self.overview_cache.expire(tenant)
+        self.pins_cache.expire(tenant)
 
     @classmethod
     def build(cls, settings: Settings) -> "AppContainer":

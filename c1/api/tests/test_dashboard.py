@@ -24,6 +24,18 @@ async def test_overview_shape_and_cache(client, auth, container):
     assert second.json()["asOf"] == body["asOf"] and container.vehicle_client.calls == calls  # served from cache
 
 
+async def test_alert_event_makes_the_cached_overview_stale(client, auth, container):
+    headers = await auth.headers("maria")
+    first = (await client.get("/api/v1/dashboard/overview", headers=headers)).json()
+    assert container.overview_cache.get(2) is not None
+    await container.bus.publish("alert.created", {"tenantId": 2, "alert": {"alertId": 99001}})
+    assert container.overview_cache.get(2) is None and container.overview_cache.get_stale(2) is not None
+    second = (await client.get("/api/v1/dashboard/overview", headers=headers)).json()
+    assert second["asOf"] >= first["asOf"] and container.overview_cache.get(2) is not None
+    await container.bus.publish("alert.updated", {"tenantId": "tB", "alertId": 99001, "status": "ACKNOWLEDGED"})
+    assert container.overview_cache.get(2) is None
+
+
 async def test_overview_degrades_to_cache_when_c2_is_down(client, auth, container):
     headers = await auth.headers("anh")
     fresh = await client.get("/api/v1/dashboard/overview", headers=headers)
