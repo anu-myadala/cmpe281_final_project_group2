@@ -1,0 +1,9 @@
+# C2 and C3 together: the one thing the two overlays both change is nginx's config, so this last file
+# points /c2/ at c2:8002 and /c3/ at c3:8003 (c2/deploy/nginx-c2-c3.conf):
+#
+#   docker compose -f docker-compose.yml -f docker-compose.c3.yml -f docker-compose.c2.yml -f docker-compose.c2c3.yml up -d --build
+
+services:
+  web:
+    volumes:
+      - ./c2/deploy/nginx-c2-c3.conf:/etc/nginx/conf.d/default.conf:ro

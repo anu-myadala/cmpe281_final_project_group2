@@ -1,0 +1,6 @@
+edge/datasets/*/
+clips/
+*.db
+.venv/
+__pycache__/
+agent.yaml

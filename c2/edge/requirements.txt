@@ -1,0 +1,5 @@
+# SCICP edge agent and simulator (Python 3.11+). sounddevice only for --mic on a laptop.
+numpy>=1.26
+paho-mqtt==2.1.0
+httpx==0.28.1
+PyYAML>=6.0
