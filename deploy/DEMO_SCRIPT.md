@@ -8,7 +8,7 @@ simply follows Part B without the backend detours.
 
 1. Start the stack and the seed.
    - Laptop: `cp .env.example .env && docker compose up --build -d` (first build ~5 min).
-   - EC2: `bash deploy/ec2-bootstrap.sh` (already done; `docker compose -f docker-compose.yml -f docker-compose.aws.yml ps` must show every service `running`/`healthy` and `seed` `exited (0)`).
+   - EC2: `bash deploy/ec2-bootstrap.sh` (already done; `sudo docker compose ps` in `~/scicp` must show every service `running`/`healthy` and `seed` `exited (0)`).
    - Developer mode (one process, no Docker) if the stack is unavailable:
      ```
      cd c1/api && DATABASE_URL=mysql+pymysql://scicp:scicp@127.0.0.1/scicp MONGO_URL=mock SEED_ON_START=1 \

@@ -13,7 +13,12 @@
 # PUBLIC_HOST (defaults to the instance's public DNS from the metadata service),
 # AWS_STORAGE_BACKEND (local, the default: artifacts on the instance disk; or s3 with the bucket
 # scicp-models in us-west-2 and the CORS rule of README.md), AWS_S3_ACCESS_KEY / AWS_S3_SECRET_KEY
-# (only for s3 without an instance role), AWS_MAIL_MODE (smtp to MailHog, the default; log; ses).
+# (only for s3 without an instance role), AWS_MAIL_MODE (smtp to MailHog, the default; log; ses),
+# SCICP_STUBS_ONLY=1 (run C1 with the C2/C3 stand-ins even when the real C2 and C3 are in the repo).
+#
+# When the repository has the real C2 and C3 (docker-compose.c2.yml, docker-compose.c3.yml and
+# docker-compose.c2c3.yml), they start too. The file list is written to .env as COMPOSE_FILE, so
+# afterwards a plain "docker compose ps / logs / exec" in the folder uses the same files.
 set -euo pipefail
 
 REPO_URL="${1:-${REPO_URL:-}}"
@@ -44,9 +49,9 @@ fi
 DOCKER="docker"
 if ! docker info >/dev/null 2>&1; then DOCKER="sudo docker"; fi
 
-# ---------------------------------------------------------------- 1b. Swap (the image builds need ~3 GB of memory)
+# ---------------------------------------------------------------- 1b. Swap (the image builds of C1, C2 and C3 together need ~3 GB)
 MEM_KB="$(awk '/MemTotal/ {print $2}' /proc/meminfo)"
-if [ "$MEM_KB" -lt 3500000 ] && ! swapon --show | grep -q /swapfile; then
+if [ "$MEM_KB" -lt 7500000 ] && ! swapon --show | grep -q /swapfile; then
   log "Adding a 4 GB swap file (instance has $((MEM_KB / 1024)) MB of memory)"
   sudo fallocate -l 4G /swapfile
   sudo chmod 600 /swapfile
@@ -112,21 +117,39 @@ if [ ! -f .env ]; then
     -e "s|^AWS_STORAGE_BACKEND=.*|AWS_STORAGE_BACKEND=${AWS_STORAGE_BACKEND:-local}|" \
     .env
 fi
-# The public host may change after a stop/start of the instance: always refresh it.
-sed -i -e "s|^PUBLIC_HOST=.*|PUBLIC_HOST=${PUBLIC_HOST}|" .env
-grep -q '^PUBLIC_HOST=' .env || echo "PUBLIC_HOST=${PUBLIC_HOST}" >> .env
+# set_env KEY VALUE: replace the line or append it.
+set_env() {
+  if grep -q "^$1=" .env; then sed -i -e "s|^$1=.*|$1=$2|" .env; else echo "$1=$2" >> .env; fi
+}
+# The public host may change after a stop/start of the instance: always refresh it (and the
+# alert links in C3's emails, which point at it).
+set_env PUBLIC_HOST "${PUBLIC_HOST}"
+set_env C3_PUBLIC_BASE_URL "http://${PUBLIC_HOST}"
+
+# The compose files: the base and the AWS override, plus the real C3 and C2 when they are merged.
+COMPOSE_FILES="docker-compose.yml:docker-compose.aws.yml"
+LOG_SERVICES="api stubs"
+if [ "${SCICP_STUBS_ONLY:-0}" != "1" ] && [ -f docker-compose.c3.yml ] && [ -f docker-compose.c2.yml ] \
+    && [ -f docker-compose.c2c3.yml ]; then
+  COMPOSE_FILES="${COMPOSE_FILES}:docker-compose.c3.yml:docker-compose.c2.yml:docker-compose.c2c3.yml"
+  LOG_SERVICES="api c2 c3 stubs"
+  log "Starting C1 with the real C2 and C3"
+else
+  log "Starting C1 with the C2/C3 stand-ins"
+fi
+set_env COMPOSE_FILE "${COMPOSE_FILES}"
 chmod 600 .env
 
 # ---------------------------------------------------------------- 5. Up
 log "Building and starting the stack (this takes a few minutes the first time)"
-$DOCKER compose -f docker-compose.yml -f docker-compose.aws.yml up -d --build
+$DOCKER compose up -d --build
 
 log "Waiting for the API"
 for _ in $(seq 1 60); do
   if curl -fsS http://127.0.0.1/api/v1/health >/dev/null 2>&1; then break; fi
   sleep 5
 done
-$DOCKER compose -f docker-compose.yml -f docker-compose.aws.yml ps
+$DOCKER compose ps
 
 cat <<EOF
 
@@ -135,7 +158,8 @@ SCICP is up.
   API health  http://${PUBLIC_HOST}/api/v1/health
   MailHog     http://${PUBLIC_HOST}:8025/   (open port 8025 to your IP in the security group)
   API docs    ssh -L 8000:127.0.0.1:8000 ubuntu@${PUBLIC_HOST}  then  http://localhost:8000/api/v1/docs
-  Logs        docker compose -f docker-compose.yml -f docker-compose.aws.yml logs -f api stubs
-  Worker      docker compose -f docker-compose.yml -f docker-compose.aws.yml logs stubs | grep worker
+  Compose     ${COMPOSE_FILES}  (COMPOSE_FILE in .env: run "sudo docker compose ..." in $(pwd))
+  Logs        sudo docker compose logs -f ${LOG_SERVICES}
+  Worker      sudo docker compose logs stubs | grep worker
 Accounts (password Passw0rd!demo): anh@example.com, maria@bayshuttle.example, staff@scicp.example, admin@scicp.example
 EOF
