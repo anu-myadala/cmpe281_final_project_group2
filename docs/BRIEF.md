@@ -123,7 +123,7 @@ Subscriptions: defaults for every vehicle (EMERGENCY, ACCIDENT, SECURITY, SAFETY
 Alerts (MySQL `alert`): 20482 ACCIDENT CRITICAL NEW crash 0.91 AV-01 event_ref 6729b1c4e1f0a2d3c4b5a697 created 2026-11-04T21:42:12Z; plus ~40 alerts over the last 14 days across both tenants
 with mixed types, statuses (NEW/ACKNOWLEDGED/RESOLVED/FALSE_ALARM) and acknowledged_at/closed_at so statistics are meaningful.
 audio_events (Mongo): ~400 events over the last 14 days, classes weighted (traffic, environmental most common), with inference.topK, modelVersion "sound-classifier-1.1.0", decision for the alert ones.
-Models: ai_model "sound-classifier" (task "audio event classification (CLAP + head)"); versions 1.1.0 ACTIVE macroF1 0.84 acc 0.88, 1.2.0 REGISTERED 0.86/0.89, both with perClass metrics for the 7 classes, artifacts stored (local volume or bucket) as small dummy files with correct sha256.
+Models: ai_model "sound-classifier" (task "audio event classification (CLAP + head)"); versions 1.1.0 ACTIVE (CLAP zero-shot, macroF1 0.68, acc 0.72) and 1.2.0 REGISTERED (CLAP + trained head, macroF1 0.99, acc 0.99), both scored on the same 237 held-out clips of the course Smart Car audio dataset with perClass metrics for the 7 classes (seed/models/evaluation.json); the real artifacts of seed/models are stored on the local volume or the bucket.
 Feedback labels: ~15 on version 1.1.0.
 
 ## Quality bar

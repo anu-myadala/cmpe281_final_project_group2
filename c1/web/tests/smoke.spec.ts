@@ -117,8 +117,8 @@ test.describe('SCICP C1 smoke', () => {
     await expect(page.getByTestId('set-active')).toBeEnabled();
     // The confirm dialog shows both macro-F1 values (BR-10)
     await page.getByTestId('set-active').click();
-    await expect(page.getByRole('dialog')).toContainText('1.1.0 (macro-F1 0.84)');
-    await expect(page.getByRole('dialog')).toContainText('1.2.0 (macro-F1 0.86)');
+    await expect(page.getByRole('dialog')).toContainText('1.1.0 (macro-F1 0.68)');
+    await expect(page.getByRole('dialog')).toContainText('1.2.0 (macro-F1 0.99)');
     await page.getByRole('dialog').getByRole('button', { name: 'Cancel' }).click();
 
     // Staff overview for the selected tenant shows the KPI row (degraded without the stubs)

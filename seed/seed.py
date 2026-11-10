@@ -13,7 +13,7 @@ What it writes:
           subscription, alert, alert_action, ai_model, model_version, feedback_label
   MongoDB audio_events (~400 documents over 14 days), vehicle_telemetry (10 min of
           samples per online car around SJSU; AV-13 stopped 14 min ago; AV-14 none)
-  storage the two dummy model artifacts (local volume or S3), when it is reachable
+  storage the two sound-classifier artifacts of seed/models (local volume or S3), when it is reachable
 Every row has a natural key, so running the seed twice changes nothing except
 the telemetry samples, which are rebuilt relative to "now" for the demo.
 """
@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import math
 import random
@@ -113,10 +114,13 @@ PATHS = {
     "AV-13": [(37.3330, -121.8855), (37.3330, -121.8775), (37.3290, -121.8775), (37.3290, -121.8855)],
 }
 
-ARTIFACTS = {
-    "1.1.0": b"SCICP dummy model artifact sound-classifier 1.1.0 (CLAP + head)\n" * 512,
-    "1.2.0": b"SCICP dummy model artifact sound-classifier 1.2.0 (CLAP + head)\n" * 640,
-}
+# The two sound-classifier versions are real C4 artifacts (seed/models): 1.1.0 is CLAP zero-shot with text
+# prompts, 1.2.0 a small head trained on CLAP embeddings of the course Smart Car audio dataset. Both were
+# scored on the same held-out clips; seed/models/evaluation.json holds the scores, the split and the test
+# files, and embed_clips.py / train_and_score.py rebuild them.
+MODELS_DIR = Path(__file__).resolve().parent / "models"
+ARTIFACTS = {version: (MODELS_DIR / version / "model.pt").read_bytes() for version in ("1.1.0", "1.2.0")}
+EVALUATION = json.loads((MODELS_DIR / "evaluation.json").read_text())
 
 
 def utcnow() -> datetime:
@@ -127,15 +131,6 @@ def oid(seed: str) -> ObjectId:
     """Deterministic 24-hex ObjectId derived from a name (keeps the seed idempotent)."""
     return ObjectId(hashlib.sha1(seed.encode()).hexdigest()[:24])
 
-
-def per_class_metrics(rng: random.Random, base: float) -> Dict[str, Dict[str, float]]:
-    out = {}
-    for cls in CLASSES:
-        f1 = round(min(0.99, max(0.6, base + rng.uniform(-0.08, 0.08))), 3)
-        precision = round(min(0.99, f1 + rng.uniform(-0.03, 0.03)), 3)
-        recall = round(min(0.99, 2 * precision * f1 / max(precision + f1, 1e-6) if precision else f1), 3)
-        out[cls] = {"precision": precision, "recall": recall, "f1": f1, "support": rng.randint(40, 120)}
-    return out
 
 
 # -------------------------------------------------------------------------------------------
@@ -324,7 +319,6 @@ async def seed_alerts(session, specs: List[Dict[str, Any]]) -> None:
 
 
 async def seed_models(session, storage) -> None:
-    rng = random.Random(42)
     model = await session.get(AiModel, 1)
     if model is None:
         model = AiModel(model_id=1, name="sound-classifier", task="audio event classification (CLAP + head)",
@@ -332,12 +326,16 @@ async def seed_models(session, storage) -> None:
         session.add(model)
         await session.flush()
     now = utcnow()
+    test = EVALUATION["split"]["test"]
     versions = [
-        ("1.1.0", "ACTIVE", 0.84, 0.88, now - timedelta(days=40), now - timedelta(days=20), "Baseline CLAP head"),
-        ("1.2.0", "REGISTERED", 0.86, 0.89, now - timedelta(days=5), None, "Retrained with Oct feedback labels"),
+        ("1.1.0", "ACTIVE", now - timedelta(days=40), now - timedelta(days=20),
+         f"CLAP zero-shot with text prompts (no training); scored on {test} held-out course clips"),
+        ("1.2.0", "REGISTERED", now - timedelta(days=5), None,
+         f"CLAP + head trained on {EVALUATION['split']['train']} course clips; scored on the same {test} held-out clips"),
     ]
     bucket_ok: Optional[bool] = None
-    for version, status, f1, acc, created, activated, notes in versions:
+    for version, status, created, activated, notes in versions:
+        scores = EVALUATION[version]
         data = ARTIFACTS[version]
         sha = hashlib.sha256(data).hexdigest()
         key = f"models/1/{version}/model.pt"
@@ -348,7 +346,8 @@ async def seed_models(session, storage) -> None:
                                      artifact_uri=(storage.artifact_uri(1, version) if storage is not None
                                                    else f"local://scicp-models/{key}"),
                                      sha256=sha, size_bytes=len(data),
-                                     metrics_json={"macroF1": f1, "accuracy": acc, "perClass": per_class_metrics(rng, f1)},
+                                     metrics_json={"macroF1": scores["macroF1"], "accuracy": scores["accuracy"],
+                                                   "perClass": scores["perClass"]},
                                      notes=notes, created_by=1006, created_at=created, activated_at=activated))
         if storage is not None:
             if bucket_ok is None:

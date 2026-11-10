@@ -39,7 +39,7 @@ async def test_models_list_from_seed(client, auth):
     assert model["name"] == "sound-classifier" and model["activeVersion"] == "1.1.0" and model["versions"] >= 2
     versions = (await client.get(f"/api/v1/models/{MODEL}/versions", headers=await auth.headers("iot"))).json()
     by_version = {v["version"]: v for v in versions}
-    assert by_version["1.1.0"]["status"] == "ACTIVE" and by_version["1.1.0"]["metrics"]["macroF1"] == 0.84
+    assert by_version["1.1.0"]["status"] == "ACTIVE" and by_version["1.1.0"]["metrics"]["macroF1"] == 0.6821
     assert by_version["1.1.0"]["labelCount"] >= 10 and len(by_version["1.1.0"]["metrics"]["perClass"]) == 7
     assert by_version["1.2.0"]["status"] == "REGISTERED" and by_version["1.2.0"]["sha256"]
     assert (await client.get("/api/v1/models/999/versions", headers=await auth.headers("iot"))).status_code == 404
@@ -118,12 +118,12 @@ async def test_r3_metrics_missing_is_refused(client, auth, container, db):
 
 async def test_r4_macro_f1_drop_over_margin_is_refused(client, auth, container):
     staff = await auth.headers("staff")
-    await _register(client, staff, container, "3.3.0", 0.78)
+    await _register(client, staff, container, "3.3.0", 0.62)
     response = await client.post(f"/api/v1/models/{MODEL}/versions/3.3.0/activate", headers=staff, json={})
     assert response.status_code == 422
     error = response.json()["error"]
     assert error["message"] == "Macro-F1 is more than 0.05 below the active version"
-    assert error["details"] == {"rule": "BR-10", "activeMacroF1": 0.84, "targetMacroF1": 0.78}
+    assert error["details"] == {"rule": "BR-10", "activeMacroF1": 0.6821, "targetMacroF1": 0.62}
     # force without a note is not an override
     forced_without_note = await client.post(f"/api/v1/models/{MODEL}/versions/3.3.0/activate", headers=staff,
                                             json={"force": True})

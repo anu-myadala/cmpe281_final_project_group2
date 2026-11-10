@@ -2,9 +2,12 @@
 // stubs with the demo generator and the classifier worker, MailHog). Runs only when
 // E2E_BASE_URL is set, e.g.  E2E_BASE_URL=http://localhost:8080 npx playwright test
 // MailHog's API is E2E_MAILHOG_URL (default http://localhost:8025).
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { expect, test, type Page } from '@playwright/test';
 
 const PASSWORD = 'Passw0rd!demo';
+const REAL_ARTIFACT = fileURLToPath(new URL('../../../seed/models/1.2.0/model.pt', import.meta.url));
 const MAILHOG = process.env.E2E_MAILHOG_URL ?? 'http://localhost:8025';
 
 test.skip(!process.env.E2E_BASE_URL, 'needs the running stack (set E2E_BASE_URL)');
@@ -142,7 +145,8 @@ test.describe('SCICP stack (docker compose)', () => {
     const version = `4.${stamp}.0`;
     await page.getByTestId('upload-new-version').click();
     await page.getByTestId('upload-version').fill(version);
-    await page.getByTestId('upload-file').setInputFiles({ name: 'model.pt', mimeType: 'application/octet-stream', buffer: Buffer.from(`e2e dummy weights ${version}\n`.repeat(2000)) });
+    // A real artifact (the trained head of seed/models), so that the C4 worker can load it too.
+    await page.getByTestId('upload-file').setInputFiles({ name: 'model.pt', mimeType: 'application/octet-stream', buffer: readFileSync(REAL_ARTIFACT) });
     await page.getByTestId('upload-macro-f1').fill('0.87');
     await page.getByTestId('upload-submit').click();
     await expectToast(page, `Version ${version} registered`);
