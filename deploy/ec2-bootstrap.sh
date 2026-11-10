@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SCICP EC2 bootstrap (Ubuntu 24.04 LTS, t3.small or larger, security group with 22 and 80 open).
+# SCICP EC2 bootstrap (Ubuntu 24.04 LTS, t3.medium or larger, t3.large with the C4 worker; ports 22 and 80 open).
 #
 # Installs Docker Engine with the compose plugin, clones the repository, writes .env with the
 # public hostname and fresh secrets, and starts the stack with the AWS override. Run it as the
@@ -17,7 +17,8 @@
 # SCICP_STUBS_ONLY=1 (run C1 with the C2/C3 stand-ins even when the real C2 and C3 are in the repo).
 #
 # When the repository has the real C2 and C3 (docker-compose.c2.yml, docker-compose.c3.yml and
-# docker-compose.c2c3.yml), they start too. The file list is written to .env as COMPOSE_FILE, so
+# docker-compose.c2c3.yml), they start too, and so does the C4 classifier worker when
+# docker-compose.c4.yml is there (it needs about 3 GB more memory: use t3.large). The file list is written to .env as COMPOSE_FILE, so
 # afterwards a plain "docker compose ps / logs / exec" in the folder uses the same files.
 set -euo pipefail
 
@@ -133,11 +134,20 @@ if [ "${SCICP_STUBS_ONLY:-0}" != "1" ] && [ -f docker-compose.c3.yml ] && [ -f d
     && [ -f docker-compose.c2c3.yml ]; then
   COMPOSE_FILES="${COMPOSE_FILES}:docker-compose.c3.yml:docker-compose.c2.yml:docker-compose.c2c3.yml"
   LOG_SERVICES="api c2 c3 stubs"
-  log "Starting C1 with the real C2 and C3"
+  if [ -f docker-compose.c4.yml ]; then
+    COMPOSE_FILES="${COMPOSE_FILES}:docker-compose.c4.yml"
+    LOG_SERVICES="api c2 c3 c4"
+    log "Starting C1 with the real C2, C3 and the C4 classifier worker"
+  else
+    log "Starting C1 with the real C2 and C3"
+  fi
 else
   log "Starting C1 with the C2/C3 stand-ins"
 fi
 set_env COMPOSE_FILE "${COMPOSE_FILES}"
+if [ -f docker-compose.c2.yml ] && [ -z "$(find c2/edge/datasets -mindepth 2 -name '*.wav' 2>/dev/null | head -1)" ]; then
+  log "c2/edge/datasets has no clips: the simulated cars will send synthetic sounds (copy the course clips there first)"
+fi
 chmod 600 .env
 
 # ---------------------------------------------------------------- 5. Up
@@ -160,6 +170,6 @@ SCICP is up.
   API docs    ssh -L 8000:127.0.0.1:8000 ubuntu@${PUBLIC_HOST}  then  http://localhost:8000/api/v1/docs
   Compose     ${COMPOSE_FILES}  (COMPOSE_FILE in .env: run "sudo docker compose ..." in $(pwd))
   Logs        sudo docker compose logs -f ${LOG_SERVICES}
-  Worker      sudo docker compose logs stubs | grep worker
+  Worker      sudo docker compose logs $( [ -f docker-compose.c4.yml ] && [ "${SCICP_STUBS_ONLY:-0}" != "1" ] && echo c4 || echo stubs ) | grep -i -E "ready|loading|failed"
 Accounts (password Passw0rd!demo): anh@example.com, maria@bayshuttle.example, staff@scicp.example, admin@scicp.example
 EOF

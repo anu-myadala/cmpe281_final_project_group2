@@ -205,7 +205,7 @@ the inline-stubs process above.
    curl -fsSL https://raw.githubusercontent.com/anu-myadala/cmpe281_final_project_group2/main/deploy/ec2-bootstrap.sh | bash -s -- https://github.com/anu-myadala/cmpe281_final_project_group2.git
    ```
    or clone first and run `bash deploy/ec2-bootstrap.sh`. It ends with the URLs; the web app is `http://<public-host>/`.
-3. Operate: `sudo docker compose ps|logs -f|down` in `~/scicp`. The bootstrap writes the compose files to `.env` as `COMPOSE_FILE`: `docker-compose.yml` and `docker-compose.aws.yml`, plus the C3 and C2 overlays when they are in the repository (`SCICP_STUBS_ONLY=1` keeps the stand-ins). After a stop/start of the instance the public DNS changes: run the bootstrap again (it rewrites `PUBLIC_HOST`, `C3_PUBLIC_BASE_URL` and `CORS_ORIGINS`). Mail goes to MailHog (`http://<public-host>:8025`); `AWS_MAIL_MODE=log` writes it to the API log instead and `AWS_MAIL_MODE=ses` sends it through SES with a verified `MAIL_FROM`. HTTPS is out of scope for the course demo; put an ALB or Caddy in front for a real deployment and set `COOKIE_SECURE=true`.
+3. Operate: `sudo docker compose ps|logs -f|down` in `~/scicp`. The bootstrap writes the compose files to `.env` as `COMPOSE_FILE`: `docker-compose.yml` and `docker-compose.aws.yml`, plus the C3 and C2 overlays and `docker-compose.c4.yml` (the C4 classifier worker; use t3.large) when they are in the repository (`SCICP_STUBS_ONLY=1` keeps the stand-ins). After a stop/start of the instance the public DNS changes: run the bootstrap again (it rewrites `PUBLIC_HOST`, `C3_PUBLIC_BASE_URL` and `CORS_ORIGINS`). Mail goes to MailHog (`http://<public-host>:8025`); `AWS_MAIL_MODE=log` writes it to the API log instead and `AWS_MAIL_MODE=ses` sends it through SES with a verified `MAIL_FROM`. HTTPS is out of scope for the course demo; put an ALB or Caddy in front for a real deployment and set `COOKIE_SECURE=true`.
 
 ## Replacing the stubs by the real C2 and C3
 
@@ -216,9 +216,9 @@ C1 only knows the base URLs and the contract in `docs/API_NOTES.md`:
 - The shared tables `vehicle`, `vehicle_rider`, `alert`, `alert_action` and the view `v_alert_summary` keep the columns of Parts II and III; the stubs read exactly those, so the dashboard does not change.
 - Each real service comes as an overlay that changes no shared file: `docker-compose.c3.yml` (C3), `docker-compose.c2.yml` (C2 and the simulated cars) and `docker-compose.c2c3.yml` (the nginx file for both). With all three in the repository, run
   ```bash
-  docker compose -f docker-compose.yml -f docker-compose.c3.yml -f docker-compose.c2.yml -f docker-compose.c2c3.yml up -d --build
+  docker compose -f docker-compose.yml -f docker-compose.c3.yml -f docker-compose.c2.yml -f docker-compose.c2c3.yml -f docker-compose.c4.yml up -d --build
   ```
-  or uncomment `COMPOSE_FILE` in `.env` and use a plain `docker compose ...`. The stubs container then keeps only the simulated C4 worker running.
+  or uncomment `COMPOSE_FILE` in `.env` and use a plain `docker compose ...`. `docker-compose.c4.yml` adds the real C4 classifier worker (CLAP, about 3 GB of memory) and turns off the simulated worker of the stubs container; without it the simulated worker stays on.
 
 ## Documentation
 
