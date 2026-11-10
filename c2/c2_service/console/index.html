@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SCICP C2 Device Console</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="login" class="login hidden">
+  <form id="loginForm" class="card">
+    <h1>SCICP device console</h1>
+    <p class="muted">C2 Edge Agent and IoT Device Management. Sign in with your platform account.</p>
+    <label>Email <input id="email" type="email" value="iot@scicp.example" required></label>
+    <label>Password <input id="password" type="password" value="Passw0rd!demo" required></label>
+    <button class="primary" type="submit">Sign in</button>
+    <p id="loginError" class="error"></p>
+    <p class="muted small">Demo accounts: iot@scicp.example (IoT engineer), anh@example.com (owner), maria@bayshuttle.example (fleet manager), staff@scicp.example.</p>
+  </form>
+</div>
+
+<div id="app" class="hidden">
+  <header class="top">
+    <span class="brand">SCICP · Vehicle and device manager</span>
+    <span id="tenantBox"></span>
+    <span id="live" class="chip grey">polling</span>
+    <span id="who" class="who"></span>
+    <a href="/" class="link">Dashboard</a>
+    <button id="logout" class="ghost">Sign out</button>
+  </header>
+  <main class="body">
+    <section class="card list">
+      <div class="row between"><h2>Vehicles</h2><span id="planCount" class="muted small"></span></div>
+      <div class="row gap"><input id="search" placeholder="Search code or VIN"><button id="addVehicle" class="primary engineer">+ Add vehicle</button></div>
+      <table id="vehicleTable"><thead><tr><th>Car</th><th>Status</th><th>Agent</th></tr></thead><tbody></tbody></table>
+    </section>
+    <section class="detail">
+      <div id="empty" class="card muted">Pick a vehicle.</div>
+      <div id="vehicle" class="hidden">
+        <div class="card">
+          <div class="row between">
+            <div><h2 id="vTitle"></h2><div id="vMeta" class="muted small"></div></div>
+            <div class="row gap engineer"><button id="provision">Provision agent</button><button id="retire" class="danger">Retire</button></div>
+          </div>
+          <nav class="tabs"><button data-tab="devices" class="tab on">Devices</button><button data-tab="network" class="tab">Network</button><button data-tab="data" class="tab">Data</button></nav>
+          <div id="tab-devices">
+            <table id="deviceTable"><thead><tr><th>Device</th><th>Type</th><th>Position</th><th>Status</th><th>Seen</th><th>Config</th><th></th></tr></thead><tbody></tbody></table>
+            <div class="row gap engineer" style="margin-top:8px"><button id="addDevice">+ Add device</button></div>
+          </div>
+          <div id="tab-network" class="hidden">
+            <table id="netTable"><thead><tr><th>Priority</th><th>SSID</th><th>Security</th><th>Password</th><th></th></tr></thead><tbody></tbody></table>
+            <div class="row gap engineer" style="margin-top:8px"><button id="addNet">+ Add network</button><button id="saveNet" class="primary">Save network</button></div>
+            <p id="netInfo" class="muted small"></p>
+          </div>
+          <div id="tab-data" class="hidden">
+            <div class="row gap wrap">
+              <select id="dataWindow"><option value="1">Last 24 h</option><option value="7" selected>Last 7 days</option><option value="30">Last 30 days</option></select>
+              <label class="inline"><input type="checkbox" id="alertOnly"> Alerts only</label>
+              <span class="spacer"></span>
+              <span class="muted small">Retention</span><input id="retention" type="number" min="7" max="365" style="width:70px"><span class="muted small">days</span>
+              <button id="saveRetention" class="writer">Save</button>
+            </div>
+            <table id="clipTable"><thead><tr><th>Time</th><th>Device</th><th>Channel</th><th>Class</th><th>Conf.</th><th>Alert</th><th>Clip</th><th>Expires</th><th></th></tr></thead><tbody></tbody></table>
+            <audio id="player" controls class="hidden"></audio>
+            <p class="muted small">A new retention applies to clips captured from now on (BR-C2-23).</p>
+          </div>
+        </div>
+        <div id="editor" class="card hidden">
+          <div class="row between"><h3 id="edTitle"></h3><button id="edClose" class="ghost">Close</button></div>
+          <div class="row gap wrap">
+            <label class="inline">Microphone gain (dB) <input id="edGain" type="number" min="-12" max="24" step="1" style="width:70px"></label>
+            <label class="inline">Detection threshold <input id="edThr" type="number" min="0.10" max="0.95" step="0.01" style="width:70px"></label>
+            <button id="edApply" class="primary engineer">Apply</button>
+            <button id="edMute" class="engineer">Mute</button>
+            <button id="edToggle" class="engineer">Disable</button>
+            <button id="edDelete" class="danger engineer">Delete</button>
+          </div>
+          <p class="muted small">Sample rate 16 kHz and clip length 5 s are fixed.</p>
+          <div id="edState"></div>
+          <table id="cmdTable" class="small"><thead><tr><th>#</th><th>Command</th><th>Status</th><th>Created</th><th>Acked</th></tr></thead><tbody></tbody></table>
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<dialog id="dlg"><form method="dialog" id="dlgForm"><h3 id="dlgTitle"></h3><div id="dlgBody"></div><p id="dlgError" class="error"></p>
+  <div class="row gap end"><button value="cancel" class="ghost">Cancel</button><button id="dlgOk" value="ok" class="primary">OK</button></div></form></dialog>
+<div id="toast" class="toast hidden"></div>
+<script src="app.js"></script>
+</body>
+</html>

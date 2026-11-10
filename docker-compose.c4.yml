@@ -1,0 +1,45 @@
+# C4 classifier worker (Ray Zhao) on top of the C2 + C3 stack. Adds the real worker and turns off the
+# stubs' simulated one, without editing any shared file:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.c3.yml -f docker-compose.c2.yml \
+#                  -f docker-compose.c2c3.yml -f docker-compose.c4.yml up -d --build
+#
+#   c4     c3/worker: MQTT scicp/v1/+/+/audio/event -> C2 clip -> CLAP + head -> audio_events -> C3 result;
+#          model from C1's registry (GET /internal/models/active, POST /internal/worker/status);
+#          GET /healthz on 127.0.0.1:8010. CLAP weights live on the named volume c4-hf-cache (downloaded once).
+#   stubs  WORKER_ENABLED=0: the stub generator starts its simulated worker even with DEMO_ENABLED=0
+#          (stubs/generator.py demo_generator), so this is the switch that stops it.
+
+services:
+  c4:
+    build:
+      context: ./c3/worker
+    image: scicp/c4-worker:local
+    env_file: .env          # MONGO_URL, SERVICE_TOKEN_SECRET (and LOG_LEVEL)
+    environment:
+      MQTT_HOST: mosquitto
+      MQTT_PORT: "1883"
+      C1_BASE_URL: http://api:8000/api/v1
+      C2_BASE_URL: http://c2:8002/api/v1
+      C3_BASE_URL: http://c3:8003/api/v1
+      WORKER_ID: c4-worker-1
+      HF_HOME: /hf-cache
+    ports:
+      - "127.0.0.1:8010:8010"
+    volumes:
+      - c4-hf-cache:/hf-cache
+    depends_on:
+      mosquitto:
+        condition: service_started
+      mongo:
+        condition: service_healthy
+      c3:
+        condition: service_healthy
+    restart: unless-stopped
+
+  stubs:
+    environment:
+      WORKER_ENABLED: "0"
+
+volumes:
+  c4-hf-cache:
