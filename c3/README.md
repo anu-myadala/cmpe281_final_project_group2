@@ -12,6 +12,7 @@ FastAPI, Python 3.11, package `c3_service`, routes under `/api/v1` (`/c3/api/v1`
 | `PUT /alert-rules/{ruleId}` | change a rule; on a default with a tenant scope it creates that tenant's override (201); BR-C3-09, BR-C3-10 |
 | `DELETE /alert-rules/{ruleId}` | remove an override (204; the default applies again); a default answers 409 |
 | `GET /health` | database check |
+| C4 worker (`c3/worker/`, own container) | MQTT audio event -> classify -> `audio_events` -> the result route above; `GET /healthz` on :8010 ([below](#c4-classifier-worker)) |
 
 `POST /alert-rules` (a brand-new rule) is **design only** this semester and is not built: it answers
 405. Tenants change behaviour by overriding the seven default rules with PUT.
@@ -75,6 +76,69 @@ Arguments: `class confidence vehicle tenant speedKph`; options `--also CLASS:CON
 
 ```bash
 c3/.venv/bin/python c3/tools/watch_ws.py --email maria@bayshuttle.example --seconds 300
+```
+
+## C4 classifier worker
+
+`c3/worker/` (package `c4_worker`, its own requirements and Dockerfile) replaces the stubs' simulated worker:
+
+1. subscribes to `scicp/v1/+/+/audio/event` (QoS 1); tenant and vehicle come from the topic;
+2. fetches the 5 s 16 kHz clip with C2's `GET /internal/clips/{clipId}` (service token) and resamples it to 48 kHz;
+3. computes the CLAP audio embedding (`laion/clap-htsat-unfused`, 512-d, CPU);
+4. classifies it with the ACTIVE model from C1 (a trained head or zero-shot prompts) and keeps the top 3;
+5. inserts the `audio_events` document and posts `POST /internal/events/{_id}/result` to C3 (a clip that cannot be fetched or decoded is stored with `inference.error` -> ERROR_RECORDED).
+
+**Model kinds** (`model.pt`, a torch dict; classes in the order siren, crash, glass_break, scream, honking, traffic, environmental):
+
+- `{'kind': 'head', 'state_dict', 'classes', 'embedding_dim': 512}`: Linear(512,128), ReLU, Dropout, Linear(128,7) on the normalized embedding.
+- `{'kind': 'zero_shot', 'classes', 'prompts': {class: [texts]}, 'temperature'}`: the worker embeds the prompts when it loads the model and scores by cosine similarity with a softmax.
+
+**Build the zero-shot model** (needs torch only; the venv commands are in `c3/worker/requirements-dev.txt`):
+
+```bash
+c3/worker/.venv/bin/python c3/worker/make_zero_shot_model.py     # -> $SCICP_DATA/work/models/zero_shot/
+# writes model.pt, model.pt.sha256 and metrics.json ({macroF1, accuracy, perClass}; zeros: not evaluated)
+```
+
+**Upload and activate** at http://localhost:8080 -> AI models, as `admin@scicp.example` / `Passw0rd!demo`
+(only SERVICE_STAFF and SYS_ADMIN can write to the registry):
+
+- *Upload new version*: version (e.g. `1.3.0`), the `model.pt` file, and macro-F1, accuracy and per-class from `metrics.json`. The browser computes the SHA-256 itself.
+- *Set as active*: BR-10 fails when macro-F1 is more than 0.05 below the active version (the seed's 1.1.0 has 0.84, the zero-shot model 0), so tick *Force* and write a note.
+- The *Deployment* card shows `c4-worker-1` go LOADING, then READY with the SHA-256 verified (or FAILED with the reason).
+  Until then it shows FAILED on 1.1.0: the seed's artifacts are dummy text, not torch files.
+
+**Run** (the five-file command from `docker-compose.c4.yml`; it also sets `WORKER_ENABLED=0` on the stubs, because
+`DEMO_ENABLED=0` alone still starts their simulated worker):
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.c3.yml -f docker-compose.c2.yml \
+               -f docker-compose.c2c3.yml -f docker-compose.c4.yml up -d --build
+curl -s http://127.0.0.1:8010/healthz     # {status, modelVersion, queueDepth, processed, dropped, errors}
+cd c3/worker && .venv/bin/python -m pytest -q     # unit tests: fake encoder and head, no model download
+```
+
+The CLAP weights (about 600 MB) download on the first start into the named volume `c4-hf-cache`, then load from it.
+
+**Design decisions**
+
+- **Ack after store**: the MQTT message is acknowledged only once the event is in `audio_events`; a redelivered event (same tenant and `eventId`) reuses the stored `_id`.
+- **One clip at a time**: a single consumer; fetch, inference, store and the result call finish before the next event.
+- **Priority queue of 200**: HIGH before NORMAL; when full, the oldest NORMAL is dropped and counted. Mosquitto's default of 20 unacknowledged messages per client keeps the queue far below 200 in practice.
+- **Model swap only between clips**: a new version is downloaded, verified (size and SHA-256) and loaded alongside the current one, then swapped in between two clips. A bad artifact reports FAILED and the previous model keeps serving.
+- **No model, no processing**: events wait in the queue (and in the broker) until a version loads. C1 is polled every 30 s besides the `model/activated` MQTT wake-up (every 5 s while nothing is loaded and C1 has no ACTIVE version or is unreachable).
+
+## Demo checklist
+
+```bash
+DC="docker compose -f docker-compose.yml -f docker-compose.c3.yml -f docker-compose.c2.yml -f docker-compose.c2c3.yml -f docker-compose.c4.yml"
+eval $DC up -d --build                        # 1. the stack (cp .env.example .env once before)
+curl -s http://127.0.0.1:8010/healthz         # 2. status NO_MODEL, queueDepth grows
+c3/worker/.venv/bin/python c3/worker/make_zero_shot_model.py   # 3. model.pt + metrics.json
+# 4. web: admin@scicp.example -> AI models -> Upload new version 1.3.0 -> Set as active (Force + note)
+eval $DC logs -f c4                           # 5. LOADING -> READY, then one line per classified event
+curl -s http://127.0.0.1:8010/healthz         # 6. status READY, modelVersion sound-classifier-1.3.0
+# 7. web: the alert monitor gets the alerts C3 decides from the simulated cars' events
 ```
 
 ## Known seed artifacts
