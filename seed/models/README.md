@@ -1,7 +1,8 @@
 # Sound-classifier versions of the seed
 
 The seed registers two real versions of `sound-classifier` with the scores below. Both are artifacts the
-C4 worker (`c3/worker`) loads: `1.1.0` is CLAP zero-shot with text prompts (no training) and is ACTIVE
+C4 worker (`c3/worker`) loads: `1.1.0` is CLAP zero-shot with text prompts (no training, softmax temperature
+0.05, the worker's default) and is ACTIVE
 after the seed; `1.2.0` is a small head (512 -> 128 -> 7) trained on CLAP embeddings and is REGISTERED.
 
 Data: the course Smart Car `Audio_Datasets` folder (professor's shared drive). 787 clips, one class per

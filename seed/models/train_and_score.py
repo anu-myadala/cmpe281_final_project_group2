@@ -1,5 +1,5 @@
 """Builds the two sound-classifier versions and scores both on the same held-out clips.
-1.1.0 zero_shot: CLAP + text prompts (C4's format, no training).
+1.1.0 zero_shot: CLAP + text prompts (C4's format, no training), softmax temperature 0.05 (C4's default).
 1.2.0 head: Linear(512,128)-ReLU-Dropout-Linear(128,7) trained on CLAP embeddings of the training clips."""
 import json, os, sys, hashlib
 sys.path.insert(0, os.environ["C4_SRC"])
@@ -34,7 +34,7 @@ def save(obj, name):
     return p, hashlib.sha256(p.read_bytes()).hexdigest()
 enc = ClapEncoder(); enc.load()
 # 1.1.0 zero-shot, scored through C4's own loader
-zs_path, zs_sha = save({"kind": "zero_shot", "classes": list(CLASSES), "prompts": PROMPTS, "temperature": 0.01}, "1.1.0")
+zs_path, zs_sha = save({"kind": "zero_shot", "classes": list(CLASSES), "prompts": PROMPTS, "temperature": 0.05}, "1.1.0")
 zs = load_artifact(zs_path, enc)
 zs_pred = [CLASSES.index(zs.classify(X[i])[0][0]) for i in te]
 m_zs = metrics(y[te], zs_pred)

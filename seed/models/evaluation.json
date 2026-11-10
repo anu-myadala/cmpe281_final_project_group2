@@ -9,8 +9,8 @@
   "clipPrep": "5 s at 16 kHz like a car's clip (random 5 s window or zero-padded), CLAP laion/clap-htsat-unfused",
   "1.1.0": {
     "kind": "zero_shot",
-    "sha256": "603448ee566537312a2f89ca8a36e2eb6df202055629b90f682f40ac9d56532c",
-    "sizeBytes": 1688,
+    "sha256": "d26db51dddf705304e5ea27d34b942f9e99f7e8106db3b7661a233b6d9e3afa2",
+    "sizeBytes": 1720,
     "macroF1": 0.6821,
     "accuracy": 0.7173,
     "perClass": {
@@ -121,7 +121,8 @@
         10,
         3
       ]
-    ]
+    ],
+    "temperature": 0.05
   },
   "1.2.0": {
     "kind": "head",
