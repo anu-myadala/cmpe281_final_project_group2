@@ -91,19 +91,22 @@ c3/.venv/bin/python c3/tools/watch_ws.py --email maria@bayshuttle.example --seco
 **Model kinds** (`model.pt`, a torch dict; classes in the order siren, crash, glass_break, scream, honking, traffic, environmental):
 
 - `{'kind': 'head', 'state_dict', 'classes', 'embedding_dim': 512}`: Linear(512,128), ReLU, Dropout, Linear(128,7) on the normalized embedding.
-- `{'kind': 'zero_shot', 'classes', 'prompts': {class: [texts]}, 'temperature'}`: the worker embeds the prompts when it loads the model and scores by cosine similarity with a softmax.
+- `{'kind': 'zero_shot', 'classes', 'prompts': {class: [texts]}, 'temperature'}`: the worker embeds the prompts when it loads the model and scores by softmax(cosine / temperature).
+  The default temperature is 0.05: CLAP's cosines are close together, and 0.01 (version 1.3.0) gave 1.00 for almost every clip, while 0.05 gives about 0.67 - 0.91 on the C2 clips.
+  On the simulator's labeled events, zero-shot gets about 46% right: correct on siren, traffic and glass_break, wrong on honking, environmental, scream and crash.
 
 **Build the zero-shot model** (needs torch only; the venv commands are in `c3/worker/requirements-dev.txt`):
 
 ```bash
-c3/worker/.venv/bin/python c3/worker/make_zero_shot_model.py     # -> $SCICP_DATA/work/models/zero_shot/
+c3/worker/.venv/bin/python c3/worker/make_zero_shot_model.py     # -> $SCICP_DATA/work/models/zero_shot_1.3.1/
+# options: --version X.Y.Z (output folder zero_shot_<version>), --temperature T (default 0.05; higher = softer)
 # writes model.pt, model.pt.sha256 and metrics.json ({macroF1, accuracy, perClass}; zeros: not evaluated)
 ```
 
 **Upload and activate** at http://localhost:8080 -> AI models, as `admin@scicp.example` / `Passw0rd!demo`
 (only SERVICE_STAFF and SYS_ADMIN can write to the registry):
 
-- *Upload new version*: version (e.g. `1.3.0`), the `model.pt` file, and macro-F1, accuracy and per-class from `metrics.json`. The browser computes the SHA-256 itself.
+- *Upload new version*: version `1.3.1`, the `model.pt` file, and macro-F1, accuracy and per-class from `metrics.json`. The browser computes the SHA-256 itself.
 - *Set as active*: BR-10 fails when macro-F1 is more than 0.05 below the active version (the seed's 1.1.0 has 0.84, the zero-shot model 0), so tick *Force* and write a note.
 - The *Deployment* card shows `c4-worker-1` go LOADING, then READY with the SHA-256 verified (or FAILED with the reason).
   Until then it shows FAILED on 1.1.0: the seed's artifacts are dummy text, not torch files.
@@ -134,10 +137,10 @@ The CLAP weights (about 600 MB) download on the first start into the named volum
 DC="docker compose -f docker-compose.yml -f docker-compose.c3.yml -f docker-compose.c2.yml -f docker-compose.c2c3.yml -f docker-compose.c4.yml"
 eval $DC up -d --build                        # 1. the stack (cp .env.example .env once before)
 curl -s http://127.0.0.1:8010/healthz         # 2. status NO_MODEL, queueDepth grows
-c3/worker/.venv/bin/python c3/worker/make_zero_shot_model.py   # 3. model.pt + metrics.json
-# 4. web: admin@scicp.example -> AI models -> Upload new version 1.3.0 -> Set as active (Force + note)
+c3/worker/.venv/bin/python c3/worker/make_zero_shot_model.py   # 3. zero_shot_1.3.1/: model.pt + metrics.json
+# 4. web: admin@scicp.example -> AI models -> Upload new version 1.3.1 -> Set as active (Force + note)
 eval $DC logs -f c4                           # 5. LOADING -> READY, then one line per classified event
-curl -s http://127.0.0.1:8010/healthz         # 6. status READY, modelVersion sound-classifier-1.3.0
+curl -s http://127.0.0.1:8010/healthz         # 6. status READY, modelVersion sound-classifier-1.3.1
 # 7. web: the alert monitor gets the alerts C3 decides from the simulated cars' events
 ```
 

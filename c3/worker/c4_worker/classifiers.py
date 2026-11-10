@@ -3,9 +3,14 @@
   {'kind': 'head', 'state_dict', 'classes', 'embedding_dim': 512}
       Linear(512,128) -> ReLU -> Dropout -> Linear(128,7) on the L2-normalized audio embedding
       (optional 'normalize': False feeds the raw embedding, if the head was trained that way).
-  {'kind': 'zero_shot', 'classes', 'prompts': {class: [text, ...]}, 'temperature'?: 0.01}
+  {'kind': 'zero_shot', 'classes', 'prompts': {class: [text, ...]}, 'temperature'?: 0.05}
       text embeddings of the prompts are computed once at load time and averaged per class;
       scores = softmax(cosine(audio, class) / temperature).
+
+CLAP's audio-text cosines sit in a narrow band (about -0.05 to 0.5), so the temperature sets how
+peaked the scores are: 0.01 (CLAP's own logit scale, x100) gives 1.00 for nearly every clip and
+makes C3's 0.60 / 0.70 rule thresholds meaningless; 0.05 (x20) gave 0.67 - 0.91 on the C2 clips.
+An artifact's own 'temperature' always wins over the default.
 
 Classes must be exactly siren, crash, glass_break, scream, honking, traffic, environmental, in that
 order. Anything else raises ArtifactError, and the ModelManager keeps the previous model.
@@ -23,6 +28,7 @@ from .config import CLASSES
 from .encoder import Encoder
 
 TopK = List[Tuple[str, float]]
+DEFAULT_ZERO_SHOT_TEMPERATURE = 0.05
 
 
 class ArtifactError(Exception):
@@ -60,7 +66,8 @@ class HeadClassifier:
 class ZeroShotClassifier:
     kind = "zero_shot"
 
-    def __init__(self, prompts: Dict[str, List[str]], encoder: Encoder, temperature: float = 0.01) -> None:
+    def __init__(self, prompts: Dict[str, List[str]], encoder: Encoder,
+                 temperature: float = DEFAULT_ZERO_SHOT_TEMPERATURE) -> None:
         if temperature <= 0:
             raise ArtifactError("temperature must be > 0")
         rows = []
@@ -116,7 +123,7 @@ def load_artifact(path: Path, encoder: Encoder):
         if kind == "zero_shot":
             if not isinstance(data.get("prompts"), dict):
                 raise ArtifactError("zero_shot: prompts missing")
-            return ZeroShotClassifier(data["prompts"], encoder, float(data.get("temperature", 0.01)))
+            return ZeroShotClassifier(data["prompts"], encoder, float(data.get("temperature", DEFAULT_ZERO_SHOT_TEMPERATURE)))
     except ArtifactError:
         raise
     except (RuntimeError, ValueError, TypeError, KeyError) as exc:

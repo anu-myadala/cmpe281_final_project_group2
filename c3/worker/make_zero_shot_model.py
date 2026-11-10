@@ -3,8 +3,13 @@
 The artifact holds only class names and text prompts: the worker computes the CLAP text embeddings
 of the prompts when it loads the model, so this script needs torch but not transformers or CLAP.
 
-    c3/worker/.venv/bin/python c3/worker/make_zero_shot_model.py            # -> $SCICP_DATA/work/models/zero_shot/
-    c3/worker/.venv/bin/python c3/worker/make_zero_shot_model.py --out /some/dir --temperature 0.01
+    c3/worker/.venv/bin/python c3/worker/make_zero_shot_model.py     # -> $SCICP_DATA/work/models/zero_shot_1.3.1/
+    c3/worker/.venv/bin/python c3/worker/make_zero_shot_model.py --version 1.3.2 --temperature 0.07 --out /some/dir
+
+--temperature divides the cosine similarities before the softmax. CLAP's audio-text cosines lie in a
+narrow band (about -0.05 to 0.5), so 0.01 (1.3.0, CLAP's own logit scale) gave 1.00 for nearly every
+clip. 0.05 was chosen on the five C2 clips: top-1 0.67 - 0.91, still above C3's 0.60 / 0.70 thresholds
+for a clear sound; 0.07 gave 0.52 - 0.80 (two clips under 0.60), 0.03 gave 0.87 - 0.99. Higher = softer.
 
 Then on the AI models page: upload model.pt, paste the sha256 if asked, and paste metrics.json's
 macroF1 / accuracy / perClass. The metrics are ZEROS because the model has not been evaluated (no
@@ -20,6 +25,8 @@ from pathlib import Path
 
 import torch
 
+DEFAULT_TEMPERATURE = 0.05   # = c4_worker.classifiers.DEFAULT_ZERO_SHOT_TEMPERATURE (a test checks it)
+DEFAULT_VERSION = "1.3.1"
 CLASSES = ["siren", "crash", "glass_break", "scream", "honking", "traffic", "environmental"]
 PROMPTS = {
     "siren": ["an ambulance siren", "a police car siren wailing", "a fire truck siren"],
@@ -33,11 +40,17 @@ PROMPTS = {
 
 
 def main() -> int:
-    default_out = Path(os.environ.get("SCICP_DATA", "/Users/ray/Documents/scicp-data")) / "work" / "models" / "zero_shot"
+    models_dir = Path(os.environ.get("SCICP_DATA", "/Users/ray/Documents/scicp-data")) / "work" / "models"
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--out", type=Path, default=default_out)
-    ap.add_argument("--temperature", type=float, default=0.01, help="softmax temperature on cosine similarity")
+    ap.add_argument("--version", default=DEFAULT_VERSION,
+                    help="the version you will type in the upload dialog; names the output folder")
+    ap.add_argument("--out", type=Path, help="output folder (default $SCICP_DATA/work/models/zero_shot_<version>)")
+    ap.add_argument("--temperature", type=float, default=DEFAULT_TEMPERATURE,
+                    help="softmax temperature on the cosine similarities (higher = softer); default %(default)s")
     args = ap.parse_args()
+    if args.temperature <= 0:
+        ap.error("--temperature must be > 0")
+    args.out = args.out or models_dir / f"zero_shot_{args.version}"
 
     assert list(PROMPTS) == CLASSES and all(2 <= len(p) <= 4 for p in PROMPTS.values())
     args.out.mkdir(parents=True, exist_ok=True)
@@ -53,10 +66,12 @@ def main() -> int:
         "macroF1": 0.0,
         "accuracy": 0.0,
         "perClass": {c: {"precision": 0.0, "recall": 0.0, "f1": 0.0, "support": 0} for c in CLASSES},
-        "note": "zero-shot CLAP (laion/clap-htsat-unfused) with text prompts; NOT evaluated, metrics are placeholders",
+        "note": f"sound-classifier {args.version}: zero-shot CLAP (laion/clap-htsat-unfused) with text prompts, "
+                f"temperature {args.temperature}; NOT evaluated, metrics are placeholders",
     }
     (args.out / "metrics.json").write_text(json.dumps(metrics, indent=2) + "\n")
 
+    print(f"version          {args.version} (temperature {args.temperature})")
     print(f"model.pt         {model_path} ({len(data)} bytes)")
     print(f"sha256           {sha}")
     print(f"metrics.json     {args.out / 'metrics.json'}")
