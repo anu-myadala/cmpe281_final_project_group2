@@ -97,8 +97,13 @@ async def test_map_degrades_when_c3_is_down(client, auth, container):
 
 
 async def test_map_connection_is_online_for_a_fresh_sample(client, auth, container):
+    # The seed writes AV-01 samples up to the moment it ran, so this sample is placed just after the
+    # newest one: it is then the latest sample however soon after the seed the test runs.
+    newest = await container.mongo["vehicle_telemetry"].find_one(
+        {"meta.vehicleId": "AV-01"}, sort=[("ts", -1)])
+    ts = max(utcnow() - timedelta(seconds=5), newest["ts"] + timedelta(seconds=1)) if newest else utcnow()
     await container.mongo["vehicle_telemetry"].insert_one({
-        "ts": utcnow() - timedelta(seconds=5), "meta": {"tenantId": "tA", "vehicleId": "AV-01"}, "speedKph": 0,
+        "ts": ts, "meta": {"tenantId": "tA", "vehicleId": "AV-01"}, "speedKph": 0,
         "driveMode": "MANUAL", "ignition": True, "location": {"type": "Point", "coordinates": [-121.8811, 37.3352]}})
     response = await client.get("/api/v1/dashboard/map", headers=await auth.headers("anh"))
     car = response.json()["vehicles"][0]

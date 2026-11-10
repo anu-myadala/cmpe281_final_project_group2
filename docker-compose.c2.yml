@@ -1,0 +1,93 @@
+# C2 Edge Agent and IoT Device Management (Brandon Rivera Venegas) on top of the base stack. Adds the
+# real C2 service and the simulated cars, and switches C1, nginx and the stubs over to them without
+# editing any shared file:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.c2.yml up -d --build
+#   with C3 too (Ray's c3-alert-service branch merged):
+#   docker compose -f docker-compose.yml -f docker-compose.c3.yml -f docker-compose.c2.yml -f docker-compose.c2c3.yml up -d --build
+#
+#   c2      the real C2 (c2/), c2:8002 inside the network; also on 127.0.0.1:8012 for curl and /api/v1/docs
+#   c2-sim  the simulated cars AV-01, AV-10, AV-11, AV-12 (c2/edge): provisioned through C2, telemetry every
+#           10 s over MQTT, a clip every 30-90 s (datasets in c2/edge/datasets, or synthetic sounds)
+#   api     C2_BASE_URL -> c2 (C1's VehicleClient: overview cards and device status)
+#   stubs   DEMO_ENABLED=0: the stub generator no longer writes telemetry or device faults (the cars do);
+#           the simulated C4 worker keeps running until Ray's C4 replaces it
+#   web     nginx /c2/ -> c2:8002 (c2/deploy/nginx-default.conf: C1's file with that one upstream changed)
+#
+# The console: http://localhost:8080/c2/console/   The live laptop car: see c2/README.md.
+
+services:
+  c2:
+    build:
+      context: ./c2
+    image: scicp/c2:local
+    env_file: .env          # DATABASE_URL, MONGO_URL, JWT_SECRET, SERVICE_TOKEN_SECRET, MQTT_*
+    environment:
+      C1_BASE_URL: http://api:8000/api/v1
+      MQTT_URL: mqtt://mosquitto:1883
+      C2_MQTT_CLIENT_ID: c2-api
+      C2_CLIP_BACKEND: ${C2_CLIP_BACKEND:-local}
+      C2_CLIP_DIR: /data/clips
+      C2_PUBLIC_MQTT_HOST: ${C2_PUBLIC_MQTT_HOST:-localhost}
+      C2_PUBLIC_MQTT_PORT: ${C2_PUBLIC_MQTT_PORT:-1883}
+      C2_PUBLIC_API_BASE: ${C2_PUBLIC_API_BASE:-http://localhost:8080/c2/api/v1}
+    ports:
+      - "127.0.0.1:8012:8002"
+    volumes:
+      - clips:/data/clips
+    depends_on:
+      mysql:
+        condition: service_healthy
+      mongo:
+        condition: service_healthy
+      seed:
+        condition: service_completed_successfully
+      mosquitto:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8002/api/v1/health').status==200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+
+  c2-sim:
+    build:
+      context: ./c2/edge
+    image: scicp/c2-sim:local
+    environment:
+      SIM_CARS: ${SIM_CARS:-tA:AV-01,tB:AV-10,tB:AV-11,tB:AV-12}
+      C1_BASE_URL: http://api:8000/api/v1
+      C2_URL: http://c2:8002/api/v1
+      SIM_MQTT_HOST: mosquitto
+      SIM_MQTT_PORT: "1883"
+      DATASETS_DIR: /datasets
+      SIM_MIN_GAP: ${SIM_MIN_GAP:-30}
+      SIM_MAX_GAP: ${SIM_MAX_GAP:-90}
+    volumes:
+      - ./c2/edge/datasets:/datasets:ro
+    depends_on:
+      c2:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+  api:
+    environment:
+      C2_BASE_URL: http://c2:8002/api/v1
+
+  stubs:
+    environment:
+      DEMO_ENABLED: "0"
+
+  web:
+    volumes:
+      - ./c2/deploy/nginx-default.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      c2:
+        condition: service_healthy
+
+volumes:
+  clips:
