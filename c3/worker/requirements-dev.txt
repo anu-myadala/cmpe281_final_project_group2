@@ -1,0 +1,15 @@
+# Unit tests: no transformers and no CLAP weights needed (the tests use a fake encoder).
+#   uv venv --python 3.11 c3/worker/.venv
+#   uv pip install --python c3/worker/.venv --index-url https://download.pytorch.org/whl/cpu torch==2.5.1
+#   uv pip install --python c3/worker/.venv -r c3/worker/requirements-dev.txt
+numpy==2.1.3
+scipy==1.14.1
+paho-mqtt==2.1.0
+httpx==0.28.1
+PyJWT==2.15.0
+motor==3.7.1
+pymongo==4.19.0
+mongomock==4.3.0
+mongomock-motor==0.0.36
+pytest==9.2.0
+pytest-asyncio==1.4.1

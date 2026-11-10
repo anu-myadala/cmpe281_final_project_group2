@@ -1,0 +1,12 @@
+# SCICP C4 classifier worker - Python 3.11. torch comes from the CPU wheel index
+# (the Dockerfile installs it first with --index-url https://download.pytorch.org/whl/cpu).
+torch==2.5.1
+transformers==4.46.3
+numpy==2.1.3
+scipy==1.14.1
+paho-mqtt==2.1.0
+# same pins as c3/requirements.txt
+httpx==0.28.1
+PyJWT==2.15.0
+motor==3.7.1
+pymongo==4.19.0
