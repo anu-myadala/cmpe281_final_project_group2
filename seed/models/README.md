@@ -13,20 +13,31 @@ at most 120 per class. Each clip is prepared like a car's clip: 16 kHz mono, a 5
 then CLAP `laion/clap-htsat-unfused`. Split: 550 training and 237 test clips, stratified, `random_state=281`.
 Both versions are scored on the same 237 test clips; `1.2.0` never saw them.
 
-| Class | F1 1.1.0 | F1 1.2.0 | Test clips |
-| --- | --- | --- | --- |
-| siren | 0.91 | 1.00 | 36 |
-| crash | 0.68 | 0.98 | 27 |
-| glass_break | 0.85 | 0.98 | 30 |
-| scream | 0.93 | 0.99 | 36 |
-| honking | 0.69 | 1.00 | 36 |
-| traffic | 0.57 | 1.00 | 36 |
-| environmental | 0.14 | 0.99 | 36 |
-| **macro-F1** | **0.68** | **0.99** | 237 |
-| accuracy | 0.72 | 0.99 | |
+| Class | F1 1.1.0 | F1 1.2.0 | F1 1.3.0 | Test clips |
+| --- | --- | --- | --- | --- |
+| siren | 0.91 | 1.00 | 1.00 | 36 |
+| crash | 0.68 | 0.98 | 0.98 | 27 |
+| glass_break | 0.85 | 0.98 | 0.98 | 30 |
+| scream | 0.93 | 0.99 | 0.97 | 36 |
+| honking | 0.69 | 1.00 | 1.00 | 36 |
+| traffic | 0.57 | 1.00 | 1.00 | 36 |
+| environmental | 0.14 | 0.99 | 1.00 | 36 |
+| **macro-F1** | **0.68** | **0.99** | **0.99** | 237 |
+| accuracy | 0.72 | 0.99 | 0.99 | |
 
 `evaluation.json` holds every number, the confusion matrices and the test file names. Files of one class
-may be cut from the same longer recordings, so the scores of `1.2.0` are likely higher than on new audio.
+may be cut from the same longer recordings, so the scores of `1.2.0` and `1.3.0` are likely higher than on new audio.
+
+## 1.3.0: the version uploaded in the demo
+
+`1.3.0/model.pt` is not seeded. It is the file the administrator uploads on the AI models page in the
+demo (Upload new version), so that the registry shows the whole path: upload, checksum, REGISTERED,
+activation, deployment to the worker, rollback. It is the same head as `1.2.0`, trained on the same 550
+training clips with label smoothing 0.1 (`train_1_3_0.py`) and scored on the same 237 test clips. Its
+scores equal those of `1.2.0` to two decimals, but it is less overconfident: its mean top confidence on the
+test clips is 0.88 against 0.99 for `1.2.0`, which matters because C3 compares the confidence with its rule
+thresholds. `1.3.0/metrics.json` holds its scores; `1.3.0/per-class.json` is the per-class block to paste into
+the upload dialog (macro-F1 0.99, accuracy 0.99).
 
 Rebuild (needs the clips as `clips/<class>/NNN.wav`, each with `NNN.src` holding its dataset file name, and
 torch, transformers, scikit-learn):
@@ -34,4 +45,5 @@ torch, transformers, scikit-learn):
 ```bash
 C4_SRC=c3/worker python seed/models/embed_clips.py clips emb.npz
 C4_SRC=c3/worker python seed/models/train_and_score.py emb.npz out/
+C4_SRC=c3/worker python seed/models/train_1_3_0.py emb.npz seed/models/1.3.0
 ```

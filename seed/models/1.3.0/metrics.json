@@ -1,0 +1,119 @@
+{
+  "version": "1.3.0",
+  "kind": "head",
+  "training": "550 course clips, label smoothing 0.1, 300 epochs, seed 1300",
+  "sha256": "f4b273c0eeeea35ace674fce2e7daeed7216180e2d55b6951fb10f698348a33a",
+  "sizeBytes": 268288,
+  "macroF1": 0.991,
+  "accuracy": 0.9916,
+  "perClass": {
+    "siren": {
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1": 1.0,
+      "support": 36
+    },
+    "crash": {
+      "precision": 0.9643,
+      "recall": 1.0,
+      "f1": 0.9818,
+      "support": 27
+    },
+    "glass_break": {
+      "precision": 0.9677,
+      "recall": 1.0,
+      "f1": 0.9836,
+      "support": 30
+    },
+    "scream": {
+      "precision": 1.0,
+      "recall": 0.9444,
+      "f1": 0.9714,
+      "support": 36
+    },
+    "honking": {
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1": 1.0,
+      "support": 36
+    },
+    "traffic": {
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1": 1.0,
+      "support": 36
+    },
+    "environmental": {
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1": 1.0,
+      "support": 36
+    }
+  },
+  "confusion": [
+    [
+      36,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      27,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      0,
+      30,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      1,
+      1,
+      34,
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      0,
+      0,
+      0,
+      36,
+      0,
+      0
+    ],
+    [
+      0,
+      0,
+      0,
+      0,
+      0,
+      36,
+      0
+    ],
+    [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      36
+    ]
+  ],
+  "meanTopConfidence": 0.879
+}
