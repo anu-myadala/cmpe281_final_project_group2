@@ -87,7 +87,12 @@ export function LoginPage() {
             fullWidth
             margin="dense"
             value={email}
-            onChange={(event) => setEmail(event.target.value)}
+            onChange={(event) => {
+              setEmail(event.target.value);
+              // The lock (BR-02) belongs to the account that was locked, not to this form: another
+              // email may sign in at once.
+              if (error?.kind === '423') setError(null);
+            }}
             autoComplete="username"
             autoFocus
             inputProps={{ 'data-testid': 'login-email' }}
