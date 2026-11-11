@@ -1,4 +1,4 @@
-// UploadVersionDialog: picks the artifact, computes its SHA-256 with SubtleCrypto, registers the
+// UploadVersionDialog: picks the artifact, computes its SHA-256 in the browser, registers the
 // version (POST /models/{id}/versions), PUTs the file to the presigned URL, then calls complete
 // with the checksum, size and held-out metrics.
 import { useMemo, useState } from 'react';
@@ -15,19 +15,12 @@ import Alert from '@mui/material/Alert';
 import { ApiClient, errorMessage, isApiError } from '../api/ApiClient';
 import type { BeginUploadResponse, PerClassMetric, VersionDto } from '../api/types';
 import { formatBytes } from '../util/format';
+import { sha256Hex } from '../util/sha256';
 
 const CLASSES = ['siren', 'crash', 'glass_break', 'scream', 'honking', 'traffic', 'environmental'];
 const SEMVER = /^\d+\.\d+\.\d+$/;
 
 type Step = 'idle' | 'hashing' | 'registering' | 'uploading' | 'completing' | 'done';
-
-export async function sha256Hex(file: Blob): Promise<string> {
-  const buffer = await file.arrayBuffer();
-  const digest = await crypto.subtle.digest('SHA-256', buffer);
-  return Array.from(new Uint8Array(digest))
-    .map((b) => b.toString(16).padStart(2, '0'))
-    .join('');
-}
 
 function defaultPerClass(): Record<string, PerClassMetric> {
   return Object.fromEntries(CLASSES.map((cls) => [cls, { precision: 0.85, recall: 0.85, f1: 0.85, support: 60 }]));
@@ -95,7 +88,7 @@ export function UploadVersionDialog({ open, modelId, modelName, suggestedVersion
 
   const steps: Record<Step, string> = {
     idle: '',
-    hashing: 'Computing SHA-256 in the browser (SubtleCrypto)...',
+    hashing: 'Computing SHA-256 in the browser...',
     registering: 'Registering the version (POST /models/{id}/versions)...',
     uploading: 'Uploading the artifact to the presigned URL...',
     completing: 'Verifying the checksum and saving the metrics (POST .../complete)...',
