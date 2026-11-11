@@ -89,7 +89,9 @@ class WsHub:
         tenant_id = await self._resolve_tenant(tenant_id)
         if tenant_id is not None:
             await self.broadcast(f"tenant:{tenant_id}", message)
-        await self.broadcast("staff", message)
+        # Staff see every tenant, so their copy says which tenant the event belongs to: the staff
+        # pages show one selected tenant at a time and add only that tenant's live rows and pins.
+        await self.broadcast("staff", message if tenant_id is None else {**message, "tenantId": tenant_id})
 
     async def _resolve_tenant(self, value: Any) -> Optional[int]:
         if value is None:

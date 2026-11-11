@@ -88,10 +88,11 @@ def test_fan_out_to_tenant_rooms_and_staff(ws_client):
         assert second == {"type": "alert.updated", "alertId": 90001, "status": "ACKNOWLEDGED", "by": "Anh Nguyen"}
         # Tenant B's first message is its own alert (it did not receive tenant A's).
         assert maria.receive_json() == {"type": "alert.created", "alert": alert_b}
-        # Staff receive everything plus model.activated.
-        assert staff.receive_json()["alert"]["alertId"] == 90001
-        assert staff.receive_json()["alert"]["alertId"] == 90002
-        assert staff.receive_json()["type"] == "alert.updated"
+        # Staff receive everything plus model.activated; their copies name the tenant (tB resolved to 2).
+        assert staff.receive_json() == {"type": "alert.created", "alert": alert_a, "tenantId": 1}
+        assert staff.receive_json() == {"type": "alert.created", "alert": alert_b, "tenantId": 2}
+        updated = staff.receive_json()
+        assert updated["type"] == "alert.updated" and updated["tenantId"] == 1
         assert staff.receive_json() == {"type": "model.activated", "modelId": 1, "version": "1.2.0"}
 
 

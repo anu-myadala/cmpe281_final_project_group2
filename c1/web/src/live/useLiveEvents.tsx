@@ -24,10 +24,13 @@ export interface LiveState extends WsStatus {
 const LiveContext = createContext<LiveState | null>(null);
 
 export function LiveProvider({ children }: { children: ReactNode }) {
-  const { accessToken } = useAuth();
+  const { accessToken, tenantId } = useAuth();
   const { toast } = useToast();
   const tokenRef = useRef<string | null>(accessToken);
   tokenRef.current = accessToken;
+  // The tenant on screen: the user's own, or the one a staff user selected in the top bar.
+  const tenantRef = useRef<number | null>(tenantId);
+  tenantRef.current = tenantId;
   const clientRef = useRef<WsClient | null>(null);
   const [status, setStatus] = useState<WsStatus>({ connected: false, polling: false, missedPings: 0 });
   const [highlighted, setHighlighted] = useState<Set<number>>(new Set());
@@ -53,12 +56,17 @@ export function LiveProvider({ children }: { children: ReactNode }) {
     const offStatus = client.onStatus(setStatus);
     const offAll = client.subscribe('*', (message: LiveMessage) => {
       invalidateFor(message.type);
+      // Staff receive the events of every tenant, each with its tenantId. Rows, pins, the badge and
+      // the toast follow only the tenant on screen; tenant users never get another tenant's events.
+      const eventTenant = 'tenantId' in message && typeof message.tenantId === 'number' ? message.tenantId : null;
+      const onScreen = eventTenant === null || eventTenant === tenantRef.current;
       if (message.type === 'alert.created' && 'alert' in message && message.alert) {
+        if (!onScreen) return;
         const alert = message.alert as AlertRow & { lat?: number; lon?: number };
         highlight(alert.alertId);
         if (typeof alert.lat === 'number' && typeof alert.lon === 'number') {
           // A pin appears on every mounted map at once; the 10 s refetch confirms it from C3.
-          queryCache.setQueriesData<MapResponse>({ queryKey: ['map'] }, (current) =>
+          queryCache.setQueriesData<MapResponse>({ queryKey: ['map', tenantRef.current] }, (current) =>
             current && !current.alerts.some((a) => a.alertId === alert.alertId)
               ? { ...current, alerts: [...current.alerts, { alertId: alert.alertId, vehicleId: alert.vehicleId, lat: alert.lat as number, lon: alert.lon as number, severity: alert.severity, type: alert.type, createdAt: alert.createdAt }] }
               : current,
@@ -69,6 +77,7 @@ export function LiveProvider({ children }: { children: ReactNode }) {
         setBadgePulse((n) => n + 1);
         toast(`${alert.severity} ${alert.type} alert on ${alert.vehicleId}`, alert.severity === 'CRITICAL' ? 'error' : 'warning');
       } else if (message.type === 'alert.updated' && 'alertId' in message) {
+        if (!onScreen) return;
         const status = String(message.status ?? '');
         const alertId = Number(message.alertId);
         if (status === 'RESOLVED' || status === 'FALSE_ALARM') {
@@ -85,6 +94,12 @@ export function LiveProvider({ children }: { children: ReactNode }) {
       offAll();
     };
   }, [highlight, toast]);
+
+  // Another tenant on screen (a staff user picked one): its live rows start empty.
+  useEffect(() => {
+    setLiveAlerts([]);
+    setBadgeDelta(0);
+  }, [tenantId]);
 
   useEffect(() => {
     const client = clientRef.current!;

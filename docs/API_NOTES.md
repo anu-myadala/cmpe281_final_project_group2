@@ -57,6 +57,7 @@ front end, the stubs, and the seed rely on. OpenAPI is served at `/api/v1/docs` 
 - `/ws` (also `/api/v1/ws`): first message `{"type":"auth","token":"<jwt>"}` within 10 s; close 4401 on failure; no ack; server `{"type":"ping"}` every 30 s -> answer `{"type":"pong"}`;
   messages `alert.created {type, alert{...}}`, `alert.updated {type, alertId, status, by}`, `device.status {type, vehicleId, deviceId, status, lastSeenAt, faultReason?, muted?, config?}`, `model.activated {type, modelId, version}`,
   `model.deployed {type, workerId, modelId, modelName, modelVersion, state, loadedAt, sha256, sha256Verified, detail, lastHeartbeatAt}` (staff room only, like model.activated).
+  The staff room's copy of a tenant event also carries `tenantId` (numeric), because staff see every tenant: the pages show the live rows and pins of the selected tenant only.
 
 ## Internal (service token: JWT with role SERVICE signed with SERVICE_TOKEN_SECRET, mint with `container.tokens.issue_service_token()`)
 - `POST /internal/events {topic, payload, tenantId}` (tenantId numeric or code "tA"); alert.created puts the alert under `payload.alert`.
