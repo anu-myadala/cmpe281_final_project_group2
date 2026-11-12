@@ -8,6 +8,7 @@ import Select from '@mui/material/Select';
 import MenuItem from '@mui/material/MenuItem';
 import FormControl from '@mui/material/FormControl';
 import InputLabel from '@mui/material/InputLabel';
+import OutlinedInput from '@mui/material/OutlinedInput';
 import Typography from '@mui/material/Typography';
 import Alert from '@mui/material/Alert';
 import { useAuth } from '../auth/AuthProvider';
@@ -118,8 +119,9 @@ export function ReportsPage() {
           <TextField label="From" type="date" value={from} onChange={(event) => setFrom(event.target.value)} InputLabelProps={{ shrink: true }} sx={{ width: 150 }} />
           <TextField label="To" type="date" value={to} onChange={(event) => setTo(event.target.value)} InputLabelProps={{ shrink: true }} sx={{ width: 150 }} error={Boolean(rangeError)} helperText={rangeError ?? undefined} />
           <FormControl sx={{ minWidth: 170 }}>
-            <InputLabel id="report-vehicle">Vehicle</InputLabel>
-            <Select labelId="report-vehicle" label="Vehicle" value={vehicleId} onChange={(event) => setVehicleId(event.target.value)} displayEmpty>
+            {/* "All vehicles" is shown for the empty value, so the label must stay above the box. */}
+            <InputLabel id="report-vehicle" shrink>Vehicle</InputLabel>
+            <Select labelId="report-vehicle" input={<OutlinedInput notched label="Vehicle" />} value={vehicleId} onChange={(event) => setVehicleId(event.target.value)} displayEmpty>
               <MenuItem value="">All vehicles{vehicles.length ? ` (${vehicles.length})` : ''}</MenuItem>
               {vehicles.map((v) => (
                 <MenuItem key={v.vehicleId} value={v.vehicleId}>
