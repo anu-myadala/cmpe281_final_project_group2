@@ -86,8 +86,8 @@ def test_c1_accepts_alert_updated_and_pushes_it_to_the_tenant_room(c1):
         assert status == {"tenant1": True, "tenant2": True}  # publish() is True only on a 2xx from C1
         assert _receive(anh) == {"type": "alert.updated", **updated}          # no tenantId on the socket
         assert _receive(maria) == {"type": "alert.created", **created}
-        assert _receive(staff) == {"type": "alert.updated", **updated}
-        assert _receive(staff) == {"type": "alert.created", **created}
+        assert _receive(staff) == {"type": "alert.updated", **updated, "tenantId": 1}
+        assert _receive(staff) == {"type": "alert.created", **created, "tenantId": 2}
 
 
 def test_c1_answers_2xx_to_the_c3_token(c1):
