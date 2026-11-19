@@ -26,7 +26,7 @@ from .core.fanout import MqttFanout
 from .db import create_schema
 from .errors import install_error_handlers
 from .models import Tenant
-from .routers import admin, auth, dashboard, internal, models, reports, storage, subscriptions, ws
+from .routers import admin, auth, billing, dashboard, internal, models, reports, storage, subscriptions, ws
 
 log = logging.getLogger("scicp")
 
@@ -137,7 +137,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                        allow_methods=["*"], allow_headers=["*"])
 
     prefix = settings.api_prefix
-    for router in (auth.router, dashboard.router, subscriptions.router, reports.router, admin.router,
+    for router in (auth.router, dashboard.router, subscriptions.router, reports.router, admin.router, billing.router,
                    models.router, internal.router, storage.router):
         app.include_router(router, prefix=prefix)
     app.include_router(ws.router)            # /ws (what nginx proxies)

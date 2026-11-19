@@ -18,6 +18,7 @@ export const MENU: MenuEntry[] = [
   { key: 'subscriptions', label: 'Subscriptions', path: '/subscriptions', permission: 'subscriptions' },
   { key: 'reports', label: 'Reports', path: '/reports', permission: 'reports' },
   { key: 'stats', label: 'Statistics', path: '/stats', permission: 'stats' },
+  { key: 'billing', label: 'Billing', path: '/billing', permission: 'billing' },
   { key: 'models', label: 'AI models', path: '/models', permission: 'models' },
   { key: 'alerts', label: 'Alert monitor', path: '/alerts', permission: 'alerts', hosted: true },
   { key: 'alert-rules', label: 'Alert rules', path: '/alert-rules', permission: 'alert-rules', hosted: true },

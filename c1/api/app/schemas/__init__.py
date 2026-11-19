@@ -162,3 +162,16 @@ class WorkerStatusBody(Body):
     state: WorkerState
     loadedAt: Optional[str] = Field(default=None, max_length=40)
     detail: Optional[str] = Field(default=None, max_length=500)
+
+
+class PriceBody(Body):
+    """PUT /billing/prices/{plan}: any subset of the plan's prices, in US cents."""
+    monthlyFeeCents: Optional[int] = Field(default=None, ge=0, le=10_000_000)
+    includedVehicles: Optional[int] = Field(default=None, ge=0, le=100_000)
+    extraVehicleCents: Optional[int] = Field(default=None, ge=0, le=1_000_000)
+    includedClips: Optional[int] = Field(default=None, ge=0, le=1_000_000_000)
+    per1000ClipsCents: Optional[int] = Field(default=None, ge=0, le=100_000)
+    includedEmails: Optional[int] = Field(default=None, ge=0, le=100_000_000)
+    per100EmailsCents: Optional[int] = Field(default=None, ge=0, le=100_000)
+    storageGbCents: Optional[int] = Field(default=None, ge=0, le=100_000)
+

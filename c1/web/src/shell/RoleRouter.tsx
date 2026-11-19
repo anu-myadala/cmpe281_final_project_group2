@@ -21,6 +21,7 @@ import { ModelsPage } from '../pages/ModelsPage';
 import { AlertMonitorPage, AlertDetailPage } from '../pages/AlertMonitorPage';
 import { HostedPage } from '../pages/HostedPage';
 import { AuditLogPage } from '../pages/admin/AuditLogPage';
+import { BillingPage } from '../pages/BillingPage';
 import { HealthPage } from '../pages/admin/HealthPage';
 
 interface RouteDef {
@@ -37,6 +38,7 @@ export const ROUTES: RouteDef[] = [
   { path: '/subscriptions', permission: 'subscriptions', element: <SubscriptionsPage /> },
   { path: '/reports', permission: 'reports', element: <ReportsPage /> },
   { path: '/stats', permission: 'stats', element: <StatsPage /> },
+  { path: '/billing', permission: 'billing', element: <BillingPage /> },
   { path: '/models', permission: 'models', element: <ModelsPage /> },
   { path: '/alerts', permission: 'alerts', element: <AlertMonitorPage /> },
   { path: '/alerts/:alertId', permission: 'alerts', element: <AlertDetailPage /> },

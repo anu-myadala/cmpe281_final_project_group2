@@ -57,8 +57,9 @@ async def test_registry_roles(client, auth):
 
 async def test_permissions_follow_the_access_matrix(client, auth):
     expected = {
-        "anh": {"overview", "map", "vehicles", "alerts", "subscriptions", "reports"},
-        "maria": {"overview", "map", "vehicles", "alerts", "subscriptions", "reports", "stats", "alert-rules"},
+        "anh": {"overview", "map", "vehicles", "alerts", "subscriptions", "reports", "billing"},
+        "maria": {"overview", "map", "vehicles", "alerts", "subscriptions", "reports", "stats", "alert-rules",
+                  "billing"},
         "rider": {"alerts"},
         "iot": {"vehicles", "devices", "provisioning", "models", "tenants"},
     }

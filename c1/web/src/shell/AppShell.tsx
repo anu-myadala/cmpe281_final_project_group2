@@ -30,6 +30,7 @@ import PeopleOutlineIcon from '@mui/icons-material/PeopleOutline';
 import LabelOutlinedIcon from '@mui/icons-material/LabelOutlined';
 import HistoryOutlinedIcon from '@mui/icons-material/HistoryOutlined';
 import MonitorHeartOutlinedIcon from '@mui/icons-material/MonitorHeartOutlined';
+import ReceiptLongOutlinedIcon from '@mui/icons-material/ReceiptLongOutlined';
 import SearchIcon from '@mui/icons-material/Search';
 import AccountCircleOutlinedIcon from '@mui/icons-material/AccountCircleOutlined';
 import { useAuth } from '../auth/AuthProvider';
@@ -47,6 +48,7 @@ const ICONS: Record<string, ReactNode> = {
   subscriptions: <NotificationsActiveOutlinedIcon fontSize="small" />,
   reports: <AssessmentOutlinedIcon fontSize="small" />,
   stats: <BarChartOutlinedIcon fontSize="small" />,
+  billing: <ReceiptLongOutlinedIcon fontSize="small" />,
   models: <MemoryOutlinedIcon fontSize="small" />,
   alerts: <WarningAmberOutlinedIcon fontSize="small" />,
   'alert-rules': <RuleOutlinedIcon fontSize="small" />,

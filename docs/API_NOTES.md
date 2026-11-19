@@ -20,9 +20,9 @@ front end, the stubs, and the seed rely on. OpenAPI is served at `/api/v1/docs` 
 - `POST /api/v1/auth/login {email, password}` -> 200 `{accessToken, expiresIn, user{userId, email, name, role, tenantId, plan, mustChangePassword}}`
   and an httpOnly cookie `refreshToken` (Path=/api/v1/auth, SameSite=Strict; Secure only with COOKIE_SECURE=true). 401 UNAUTHORIZED, 423 LOCKED, 429 RATE_LIMIT.
 - `POST /auth/refresh` (cookie) -> new accessToken; `POST /auth/logout`; `GET /auth/me` -> user + `permissions[]` page keys:
-  OWNER [overview, map, vehicles, alerts, subscriptions, reports]; FLEET_MANAGER + [stats, alert-rules]; RIDER [alerts];
+  OWNER [overview, map, vehicles, alerts, subscriptions, reports, billing]; FLEET_MANAGER + [stats, alert-rules]; RIDER [alerts];
   IOT_ENGINEER [vehicles, devices, provisioning, models, tenants]; SERVICE_STAFF [overview, map, vehicles, alerts, subscriptions, reports, stats, alert-rules, models, tenants];
-  SYS_ADMIN all + [users, alert-types, audit, health]. `mustChangePassword` is a client-side gate (show the change-password dialog first).
+  SYS_ADMIN all + [users, alert-types, audit, health] (SERVICE_STAFF and SYS_ADMIN also have billing). `mustChangePassword` is a client-side gate (show the change-password dialog first).
 - `POST /auth/password/change {currentPassword, newPassword}`.
 - Error envelope everywhere: `{"error": {"code", "message", "details"}}`.
 
@@ -46,6 +46,17 @@ front end, the stubs, and the seed rely on. OpenAPI is served at `/api/v1/docs` 
 - `GET/POST/PATCH /admin/users`, `POST /admin/users/{id}/reset-password`, `GET/PUT /admin/alert-types`. Pagination `page` (1-based), `size` (default 25, max 100 -> 400).
 - `GET /admin/audit?actor&entity&action&tenantId&from&to&page&size` (SYS_ADMIN) -> `{items[{auditId, ts, actorUserId, actor (email or "system"), tenantId, tenant, action, entity, entityId, before, after, ip}], page, size, total, facets{actions[], entities[]}}`, newest first; `actor` matches part of the email, a date-only `to` covers the whole day; 400 when from > to.
 - `GET /admin/health` (SYS_ADMIN) -> `{status UP|DEGRADED, down[], parts[{name, kind, state UP|DOWN|STALE, latencyMs, detail, lastSeenAt?}], uptimeSeconds, checkedAt}`: parts api, mysql (SELECT 1), mongodb (ping), mqtt (TCP connect to MQTT_URL), c2 and c3 (their `GET /health`), one row per classifier worker (heartbeat older than 90 s = STALE). A failed probe is a DOWN row, never an error.
+
+## Billing (report section 5.1)
+- `GET /billing/prices` (OWNER, FLEET_MANAGER, SERVICE_STAFF, SYS_ADMIN) -> `[{plan, monthlyFeeCents, includedVehicles, extraVehicleCents, includedClips, per1000ClipsCents, includedEmails, per100EmailsCents, storageGbCents, updatedAt}]`; the defaults are inserted on first read.
+- `PUT /billing/prices/{plan}` (SYS_ADMIN) any subset of those fields (integers >= 0) -> the row; audited PRICE_UPDATE; 404 for an unknown plan.
+- `GET /billing/invoice?month=YYYY-MM&tenantId` (tenant roles: own tenant; staff: tenantId required) -> `{tenantId, tenant, plan, month, from, to, running, currency, usage{vehicles, alerts, clips, emails, storageGb, notMeasured[]}, allowances{vehicles, clips, emails}, lines[{code PLAN|VEHICLES|CLIPS|EMAILS|STORAGE, description, quantity, unit, unitCents, amountCents}], totalCents, projectedTotalCents}`.
+  Usage: vehicles not RETIRED (MySQL vehicle), audio_events of the month (MongoDB), notification rows EMAIL/SENT of the month (C3), STORED clip bytes (C2); a missing C2/C3 table is listed in notMeasured. 400 for a bad or future month.
+- `GET /billing/summary?month` (SERVICE_STAFF, SYS_ADMIN) -> `{month, running, currency, tenants[{tenantId, tenant, plan, status, vehicles, clips, emails, alerts, totalCents, projectedTotalCents}], totalCents, projectedTotalCents}` (totals over ACTIVE tenants).
+
+## Several replicas (docker-compose.scale.yml)
+- Every answer carries `X-SCICP-Instance` (the replica's host name and pid); `GET /health` returns it as `instance`. Through nginx, `X-Upstream` names the replica's address.
+- `EVENT_FANOUT=1`: each replica forwards what it publishes on the EventBus to MQTT `scicp/v1/platform/c1-events` `{origin, topic, payload}`; the others deliver it to their own subscribers (WebSocket rooms, caches) and do not forward it again.
 
 ## Models (C4 registry)
 - `GET/POST /models`, `GET /models/{id}/versions`, `POST /models/{id}/versions {version, sizeBytes, sha256?, notes?}` -> `{versionId, version, status, upload{url, key, expiresInSeconds}}` (presigned PUT: a relative signed `/api/v1/storage/objects/...` URL with STORAGE_BACKEND=local, an S3 URL with s3),

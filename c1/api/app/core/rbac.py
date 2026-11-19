@@ -22,14 +22,15 @@ from .security import Claims
 
 # Page keys per role (Part I, Table 26). The front end builds its routes from this list.
 PAGE_PERMISSIONS = {
-    "OWNER": ["overview", "map", "vehicles", "alerts", "subscriptions", "reports"],
-    "FLEET_MANAGER": ["overview", "map", "vehicles", "alerts", "subscriptions", "reports", "stats", "alert-rules"],
+    "OWNER": ["overview", "map", "vehicles", "alerts", "subscriptions", "reports", "billing"],
+    "FLEET_MANAGER": ["overview", "map", "vehicles", "alerts", "subscriptions", "reports", "stats", "alert-rules",
+                      "billing"],
     "RIDER": ["alerts"],
     "IOT_ENGINEER": ["vehicles", "devices", "provisioning", "models", "tenants"],
     "SERVICE_STAFF": ["overview", "map", "vehicles", "alerts", "subscriptions", "reports", "stats",
-                      "alert-rules", "models", "tenants"],
+                      "alert-rules", "models", "tenants", "billing"],
     "SYS_ADMIN": ["overview", "map", "vehicles", "alerts", "subscriptions", "reports", "stats", "alert-rules",
-                  "models", "tenants", "users", "alert-types", "audit", "health"],
+                  "models", "tenants", "users", "alert-types", "audit", "health", "billing"],
 }
 
 

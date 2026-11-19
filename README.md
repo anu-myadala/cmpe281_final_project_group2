@@ -11,7 +11,7 @@ laptop or on one AWS EC2 instance.
 
 | Component | Owner | Folder | What it does |
 |---|---|---|---|
-| C1 Cloud Platform Dashboard and System Admin | Anukrithi Myadala | `c1/` (web app and API), `seed/`, `deploy/` | Login and roles, tenant dashboard with the live vehicle map, subscriptions, reports and statistics, tenants and users, audit log, platform health, the AI model registry (C4 pages) |
+| C1 Cloud Platform Dashboard and System Admin | Anukrithi Myadala | `c1/` (web app and API), `seed/`, `deploy/` | Login and roles, tenant dashboard with the live vehicle map, subscriptions, reports and statistics, billing, tenants and users, audit log, platform health, the AI model registry (C4 pages), the load-balanced deployment |
 | C2 Edge Agent and IoT Device Management | Brandon Rivera Venegas | `c2/` (service, console, edge agent) | Vehicles and devices, provisioning, device config and commands, telemetry and clip ingestion over MQTT and HTTP, the simulated cars |
 | C3 Alert Tracking and Monitoring | Ray Zhao | `c3/` | Alert rules, the alert engine, the alert queue and alert page, notifications (email) |
 | C4 Sound classifier worker | Ray Zhao | `c3/worker/` | CLAP audio model (zero-shot or with a trained head): classifies each clip, loads the model version that C1's registry activates |
@@ -86,6 +86,7 @@ README.md                 this file
 docker-compose.yml        base stack: mysql, mongo, mailhog, mosquitto, seed, api, stubs, web
 docker-compose.c3.yml     overlay: the real C3            docker-compose.c2.yml   overlay: the real C2 and the simulated cars
 docker-compose.c2c3.yml   overlay: nginx with both        docker-compose.c4.yml   overlay: the C4 classifier worker
+docker-compose.scale.yml  overlay: two replicas of the API, C2 and C3 behind the nginx load balancer
 docker-compose.aws.yml    EC2 overrides (web on :80, no published database ports, optional Amazon S3)
 .env.example              every variable with development defaults; COMPOSE_FILE selects the full platform
 c1/api/                   C1 FastAPI backend (Python 3.11), pytest suite in tests/
@@ -94,7 +95,8 @@ c2/                       C2 service (c2_service), console, edge agent (edge/), 
 c3/                       C3 service (c3_service), tests, tools; c3/worker/ is the C4 classifier worker
 seed/                     seed.py (shared demo data) and the sound-classifier model versions with their training scripts
 stubs/                    C2 and C3 stand-ins for running C1 alone
-deploy/                   ec2-bootstrap.sh, reset-demo.sh, show.sh, mosquitto.conf, DEMO_SCRIPT.md
+deploy/                   ec2-bootstrap.sh, reset-demo.sh, show.sh, nginx-scaled.conf, mosquitto.conf, DEMO_SCRIPT.md
+tools/                    loadtest.py (load test through the load balancer)
 docs/                     BRIEF.md, API_NOTES.md, the design (spec_DESIGN.md, spec_overview, spec_part1..3)
 ```
 
@@ -160,6 +162,35 @@ or FAILED). The **AI models** page shows this in the Deployment card (live throu
 message `model.deployed`), and new alerts carry the version the worker has loaded
 (`inference.modelVersion`, shown on the alert detail page).
 
+## Scalability and load balancing
+
+`docker-compose.scale.yml` (added last to `COMPOSE_FILE`; the EC2 bootstrap adds it by default) runs
+two replicas each of the C1 API, C2 and C3 with nginx as the load balancer (`deploy/nginx-scaled.conf`):
+
+| Concern | How |
+|---|---|
+| Load balancing | nginx round robin over the replicas of each service; `X-Upstream` in every answer names the replica (`bash deploy/show.sh lb` counts them) |
+| Service discovery | Docker's DNS returns every replica of `api`, `c2`, `c3`; nginx re-resolves every 10 s (`resolve`), so `docker compose up -d --scale c2=3` adds a replica without a restart |
+| Failover | a replica that fails is skipped for 10 s (`max_fails`), and the request is retried on the next one (`proxy_next_upstream`); stopping a replica loses no request |
+| Shared state | everything durable is in MySQL, MongoDB and the volumes; the API replicas share their live events over MQTT (`EVENT_FANOUT=1`), so every WebSocket sees every alert |
+| Message streams | C2's replicas use MQTT shared subscriptions (`$share/c2/...`): the broker gives each telemetry or status message to one replica; the C4 worker supports the same (`C4_SHARE_GROUP`) for a pool of workers |
+| Background jobs | C2's sweep, command timeouts and retention run on one replica at a time (MySQL `GET_LOCK`); C2 and C3 create their tables under the same lock |
+
+`tools/loadtest.py` measures the platform through the load balancer (requests per second and
+latency per endpoint, and which replica served them); `docs/LOADTEST.md` has the numbers measured on EC2.
+
+## Billing
+
+Every tenant pays the monthly fee of its plan plus usage over the plan's allowances, measured from
+the platform's own data: vehicles (C2), clips classified (C4's `audio_events`), alert emails sent
+(C3's `notification`) and clip storage (C2's `clip`). The **Billing** page shows the tenant's
+invoice for the month (to date and projected), the usage against the allowances and the price
+list; staff see every tenant's bill and the platform's revenue, and the system administrator edits
+the price list (audited). Default prices (per month): BASIC $9.99 (3 vehicles, 10,000 clips, 500
+emails), FLEET $199 (10 vehicles, then $12 each; 100,000 clips), ENTERPRISE $1,499 (100 vehicles,
+then $9 each; 2,000,000 clips); clips over the allowance $0.30 to $0.50 per 1,000, emails $0.50 to
+$1.00 per 100, storage $0.05 to $0.10 per GB-month. API: `docs/API_NOTES.md`.
+
 ## Demo accounts
 
 All passwords are `Passw0rd!demo`.
@@ -208,11 +239,11 @@ Each component has its own suite; none needs Docker or a running platform (SQLit
 and fakes for the neighbors).
 
 ```bash
-cd c1/api && python -m pytest -q          # C1: 96 tests (decision tables of BR-02/04/06/07/08/09/10/11, tenancy,
-                                          #     WebSocket, storage, model deployment, audit log and health pages)
-cd c2 && python -m pytest -q              # C2: 25 tests (needs c2/requirements.txt, c2/edge/requirements.txt, c1/api/requirements.txt)
+cd c1/api && python -m pytest -q          # C1: 107 tests (decision tables of BR-02/04/06/07/08/09/10/11, tenancy,
+                                          #     WebSocket, storage, model deployment, audit log, health, billing, event fan-out)
+cd c2 && python -m pytest -q              # C2: 28 tests (needs c2/requirements.txt, c2/edge/requirements.txt, c1/api/requirements.txt)
 cd c3 && python -m pytest -q              # C3: 405 tests (needs c3/requirements.txt and c1/api/requirements.txt)
-cd c3/worker && python -m pytest -q       # C4: fake encoder, no model download (see c3/worker/requirements-dev.txt)
+cd c3/worker && python -m pytest -q       # C4: 68 tests, fake encoder, no model download (see c3/worker/requirements-dev.txt)
 cd c1/web && npm run typecheck && npm run build
 cd c1/web && npx playwright test          # C1 smoke test (starts the API and the Vite server itself)
 cd c1/web && E2E_BASE_URL=http://localhost:8080 npx playwright test   # against the running platform

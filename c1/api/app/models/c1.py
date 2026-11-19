@@ -116,6 +116,25 @@ class AlertType(Base):
     description: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
 
 
+class PriceList(Base):
+    """Billing (report section 5.1): the monthly price of each plan and its usage allowances.
+    Amounts are integer US cents. One row per plan; the admin edits them on the billing page."""
+    __tablename__ = "price_list"
+
+    plan: Mapped[str] = mapped_column(Enum(*PLANS, name="price_plan"), primary_key=True)
+    monthly_fee_cents: Mapped[int] = mapped_column(Integer, nullable=False)
+    included_vehicles: Mapped[int] = mapped_column(Integer, nullable=False)
+    extra_vehicle_cents: Mapped[int] = mapped_column(Integer, nullable=False)
+    included_clips: Mapped[int] = mapped_column(Integer, nullable=False)
+    per_1000_clips_cents: Mapped[int] = mapped_column(Integer, nullable=False)
+    included_emails: Mapped[int] = mapped_column(Integer, nullable=False)
+    per_100_emails_cents: Mapped[int] = mapped_column(Integer, nullable=False)
+    storage_gb_cents: Mapped[int] = mapped_column(Integer, nullable=False)
+    updated_by: Mapped[Optional[int]] = mapped_column(ForeignKey("app_user.user_id", name="fk_price_user"),
+                                                      nullable=True)
+    updated_at: Mapped[object] = mapped_column(UtcDateTime, nullable=False, default=utcnow, onupdate=utcnow)
+
+
 class AuditLog(Base):
     __tablename__ = "audit_log"
     __table_args__ = (Index("ix_audit_tenant_ts", "tenant_id", "ts"), Index("ix_audit_entity", "entity", "entity_id"))

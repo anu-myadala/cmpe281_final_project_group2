@@ -33,6 +33,8 @@ Where the text and this brief differ, this brief wins (it contains the late chan
 - Feedback: the C3 alert page posts FALSE_ALARM on "False alarm" and CONFIRMED on "Resolve".
 - M8 (Nov 19, for the final project): the audit log viewer (`GET /admin/audit`, AuditLogPage) and the platform health page
   (`GET /admin/health`, HealthPage) are built; they were design only (FR-C1-06, priority L) in Deliverable #2.
+- Final project (Nov 19): billing (`/billing/*`, BillingPage, table `price_list`) for report section 5.1, and the scaled
+  deployment (`docker-compose.scale.yml`: two replicas of the API, C2 and C3 behind nginx; EventBus shared over MQTT).
 - VEHICLE MAP (added Oct 30 after the instructor asked for tracking on a map; priority HIGH, it is the demo's centerpiece):
   - `GET /dashboard/map?tenantId` -> `{vehicles[{vehicleId, label, status, connection, lat, lon, headingDeg, speedKph, driveMode, ignition, sampleAt}], alerts[{alertId, vehicleId, lat, lon, severity, type, createdAt}], asOf, degraded?}`.
     Roles like /dashboard/overview (403 RIDER, IOT_ENGINEER; staff pass tenantId). Cars without a sample: lat/lon/sampleAt null.
