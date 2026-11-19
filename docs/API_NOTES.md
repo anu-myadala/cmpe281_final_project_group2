@@ -44,6 +44,8 @@ front end, the stubs, and the seed rely on. OpenAPI is served at `/api/v1/docs` 
 ## Admin
 - `GET/POST/PATCH /admin/tenants` (GET also for IOT_ENGINEER and SERVICE_STAFF; DTO has id, code, name, plan, status, maxVehicles, timeZone, vehicles, updatedAt).
 - `GET/POST/PATCH /admin/users`, `POST /admin/users/{id}/reset-password`, `GET/PUT /admin/alert-types`. Pagination `page` (1-based), `size` (default 25, max 100 -> 400).
+- `GET /admin/audit?actor&entity&action&tenantId&from&to&page&size` (SYS_ADMIN) -> `{items[{auditId, ts, actorUserId, actor (email or "system"), tenantId, tenant, action, entity, entityId, before, after, ip}], page, size, total, facets{actions[], entities[]}}`, newest first; `actor` matches part of the email, a date-only `to` covers the whole day; 400 when from > to.
+- `GET /admin/health` (SYS_ADMIN) -> `{status UP|DEGRADED, down[], parts[{name, kind, state UP|DOWN|STALE, latencyMs, detail, lastSeenAt?}], uptimeSeconds, checkedAt}`: parts api, mysql (SELECT 1), mongodb (ping), mqtt (TCP connect to MQTT_URL), c2 and c3 (their `GET /health`), one row per classifier worker (heartbeat older than 90 s = STALE). A failed probe is a DOWN row, never an error.
 
 ## Models (C4 registry)
 - `GET/POST /models`, `GET /models/{id}/versions`, `POST /models/{id}/versions {version, sizeBytes, sha256?, notes?}` -> `{versionId, version, status, upload{url, key, expiresInSeconds}}` (presigned PUT: a relative signed `/api/v1/storage/objects/...` URL with STORAGE_BACKEND=local, an S3 URL with s3),

@@ -2,85 +2,100 @@
 
 CMPE 281 (Cloud Technologies), San Jose State University, Fall 2026, Group 2. Instructor: Dr. Jerry Gao.
 
-| Component | Owner | Where |
-|---|---|---|
-| C1 Cloud Platform Dashboard and System Admin (with the C4 model registry pages) | Anukrithi Myadala | `c1/`, `seed/`, `stubs/`, `deploy/` (this repository state) |
-| C2 Vehicle, Device and Data Management | Brandon Rivera Venegas | joins this monorepo as `c2/` |
-| C3 Sound Intelligence and Alerting | Ray Zhao | joins this monorepo as `c3/` |
+SCICP monitors autonomous cars through the microphones of an in-car edge device. Each car sends
+telemetry and short sound clips; a classifier in the cloud labels every clip (siren, crash, glass
+break, scream, honking, traffic, environmental); rules turn the result into alerts; and the
+platform notifies owners, fleet managers and the service staff in a live, multi-tenant web app.
+All four components below are in this repository and run together (`docker compose up`), on a
+laptop or on one AWS EC2 instance.
 
-SCICP monitors autonomous cars through the microphones of an in-car edge device: audio events
-are classified in the cloud (siren, crash, glass break, scream, honking, traffic,
-environmental), rules turn them into alerts, and the platform notifies owners, fleet managers
-and the service staff. Component C1 is the multi-tenant web platform: authentication and
-roles, the tenant dashboard with the live vehicle map, intelligence-service subscriptions,
-reports and statistics, tenant and user administration, and the AI model registry.
+| Component | Owner | Folder | What it does |
+|---|---|---|---|
+| C1 Cloud Platform Dashboard and System Admin | Anukrithi Myadala | `c1/` (web app and API), `seed/`, `deploy/` | Login and roles, tenant dashboard with the live vehicle map, subscriptions, reports and statistics, tenants and users, audit log, platform health, the AI model registry (C4 pages) |
+| C2 Edge Agent and IoT Device Management | Brandon Rivera Venegas | `c2/` (service, console, edge agent) | Vehicles and devices, provisioning, device config and commands, telemetry and clip ingestion over MQTT and HTTP, the simulated cars |
+| C3 Alert Tracking and Monitoring | Ray Zhao | `c3/` | Alert rules, the alert engine, the alert queue and alert page, notifications (email) |
+| C4 Sound classifier worker | Ray Zhao | `c3/worker/` | CLAP audio model (zero-shot or with a trained head): classifies each clip, loads the model version that C1's registry activates |
 
-The design is fixed by Deliverable #2 (`docs/spec_DESIGN.md`, `docs/spec_part1_c1.txt`);
-`docs/BRIEF.md` lists the late changes and `docs/API_NOTES.md` what the running API returns.
+`stubs/` holds the stand-ins for C2 and C3 that C1 was built against before the merge; they are
+used only when C1 runs alone (see [Running C1 alone](#running-c1-alone-with-the-stand-ins)).
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-  subgraph Browser
+  subgraph Cars["Edge (simulated cars, c2/edge)"]
+    E[edge agent per car<br/>telemetry 10 s, clip 30-90 s]
+  end
+  subgraph Web["Browser"]
     W[React web app<br/>c1/web]
   end
-  subgraph Platform
-    N[nginx :8080<br/>static + proxies]
-    A[C1 API, FastAPI :8000<br/>auth, dashboard, subscriptions,<br/>reports, admin, models, /ws]
-    S2[C2 vehicles / devices / telemetry<br/>stub :8002]
-    S3[C3 alerts / rules<br/>stub :8003]
-    G[demo event generator<br/>+ C4 classifier worker]
+  subgraph Cloud["Cloud (docker compose / EC2)"]
+    N[nginx :8080 / :80<br/>web app + proxies]
+    A[C1 API :8000<br/>auth, dashboard, reports, admin,<br/>model registry, WebSocket]
+    C2[C2 service :8002<br/>vehicles, devices, clips]
+    C3[C3 service :8003<br/>rules, alerts, notifications]
+    C4[C4 worker :8010<br/>CLAP classifier]
+    Q[Mosquitto MQTT :1883]
+    M[(MySQL 8<br/>shared SQL tables)]
+    D[(MongoDB 7<br/>telemetry, audio_events)]
+    O[(model artifacts<br/>and clips)]
+    E2[MailHog / SES]
   end
-  subgraph Data
-    M[(MySQL 8)]
-    D[(MongoDB 7<br/>audio_events,<br/>vehicle_telemetry)]
-    O[(model artifacts<br/>local volume or S3 scicp-models)]
-    Q[Mosquitto MQTT]
-    E[MailHog / SES]
-  end
+  E -->|telemetry, status| Q
+  E -->|POST /ingest/clips| C2
+  E -->|audio/event| Q
+  Q --> C2
+  Q -->|audio/event| C4
+  C4 -->|GET /internal/clips| C2
+  C4 -->|POST /internal/events/:ref/result| C3
+  C3 -->|POST /internal/events| A
+  C2 -->|device.status| A
+  A -->|model.activated| Q
+  Q -->|model.activated| C4
+  C4 -->|GET /internal/models/active,<br/>POST /internal/worker/status| A
   W -->|/api, /ws, /c2, /c3| N
   N --> A
-  N --> S2
-  N --> S3
-  A -->|GET /vehicles, /devices| S2
-  A -->|GET /alerts, /alerts/map| S3
-  S3 -->|POST /internal/events, feedback labels| A
-  G --> S2
-  G --> S3
+  N --> C2
+  N --> C3
+  A -->|GET /vehicles| C2
+  A -->|GET /alerts, /alerts/map| C3
+  C3 --> E2
+  A --> E2
   A --- M
+  C2 --- M
+  C3 --- M
   A --- D
+  C2 --- D
+  C4 --- D
   A --- O
-  A -->|model.activated| Q
-  Q -->|model.activated| G
-  G -->|GET /internal/models/active,<br/>POST /internal/worker/status| A
-  A -->|invitations| E
-  S2 --- M
-  S2 --- D
-  S3 --- M
-  S3 --- D
+  C2 --- O
 ```
 
-Inside the API the names follow the design: `AuthService`, `LoginThrottle`, `TokenService`,
-`RbacGuard`, `TenantContext`, `DashboardService`, `SubscriptionService`, `ReportService`,
-`AdminService`, `ModelRegistryService`, `AuditLogger`, `WsHub`, `EventBus`, `MailSender`,
-`StorageClient`, `VehicleClient`, `AlertClient` and the `*Repo` repositories. Live updates
-travel EventBus -> `WsHub` -> WebSocket rooms (`tenant:{id}` and `staff`); the other
-components reach the bus through `POST /internal/events` with a service token.
+One alert, end to end: a simulated car uploads a 5 s clip to C2 and announces it on MQTT; the C4
+worker fetches the clip, classifies it with the active model version and stores the result in
+MongoDB; C3 applies the alert rules, writes the alert and emails the subscribers; C3 tells C1, and
+C1's WebSocket hub pushes the alert to every open dashboard of that tenant (toast, badge, map pin).
+Activating another model version in C1's registry reaches the worker over MQTT; the worker
+downloads the file through C1, verifies its SHA-256 and reports back, and the next alerts carry
+the new version.
 
 ## Repository layout
 
 ```
 README.md                 this file
-docker-compose.yml        local stack: mysql, mongo, mailhog, mosquitto, seed, api, stubs, web (+ volume objects)
+docker-compose.yml        base stack: mysql, mongo, mailhog, mosquitto, seed, api, stubs, web
+docker-compose.c3.yml     overlay: the real C3            docker-compose.c2.yml   overlay: the real C2 and the simulated cars
+docker-compose.c2c3.yml   overlay: nginx with both        docker-compose.c4.yml   overlay: the C4 classifier worker
 docker-compose.aws.yml    EC2 overrides (web on :80, no published database ports, optional Amazon S3)
-.env.example              every variable with development defaults (copy to .env)
-c1/api/                   FastAPI backend (Python 3.11), package `app`, pytest suite in tests/
-c1/web/                   React 18 + TypeScript + Vite + MUI + Recharts + Leaflet + TanStack Query, Playwright smoke test
-seed/                     seed.py: idempotent MySQL + MongoDB (+ model artifacts) seed with the Deliverable #2 sample data
-stubs/                    C2 and C3 stand-ins (FastAPI) + demo event generator + simulated C4 classifier worker; inline or standalone
-deploy/                   ec2-bootstrap.sh, mosquitto.conf, DEMO_SCRIPT.md
-docs/                     BRIEF.md, API_NOTES.md, the design (spec_DESIGN.md, spec_part1..3, spec_overview)
+.env.example              every variable with development defaults; COMPOSE_FILE selects the full platform
+c1/api/                   C1 FastAPI backend (Python 3.11), pytest suite in tests/
+c1/web/                   C1 React 18 + TypeScript + Vite + MUI web app, Playwright tests
+c2/                       C2 service (c2_service), console, edge agent (edge/), tests
+c3/                       C3 service (c3_service), tests, tools; c3/worker/ is the C4 classifier worker
+seed/                     seed.py (shared demo data) and the sound-classifier model versions with their training scripts
+stubs/                    C2 and C3 stand-ins for running C1 alone
+deploy/                   ec2-bootstrap.sh, reset-demo.sh, show.sh, mosquitto.conf, DEMO_SCRIPT.md
+docs/                     BRIEF.md, API_NOTES.md, the design (spec_DESIGN.md, spec_overview, spec_part1..3)
 ```
 
 ## Prerequisites
@@ -88,28 +103,37 @@ docs/                     BRIEF.md, API_NOTES.md, the design (spec_DESIGN.md, sp
 - Docker Engine 24+ with the compose plugin (`docker compose version` >= 2.24, for the `!override` tag used by the AWS file).
 - For the developer mode without Docker: Python 3.11+ (3.13 works), Node 20+, a MySQL 8 or MariaDB 10.11 server with a database `scicp` and user `scicp`/`scicp` (or SQLite, see below). MongoDB is optional: `MONGO_URL=mock` runs an in-process mock.
 
-## Quick start with Docker
+## Quick start with Docker (the whole platform)
 
 ```bash
-cp .env.example .env
-docker compose up --build          # add -d to run in the background
+cp .env.example .env               # COMPOSE_FILE in it selects C1 + C2 + C3 + C4
+docker compose up -d --build
 ```
 
-The first build takes a few minutes (Python wheels, npm install, Vite build). `seed` runs once
-and exits 0; `api` waits for it. Then:
+The first build takes several minutes (Python wheels, npm install, Vite build), and the C4 worker
+downloads the CLAP weights once (about 600 MB, kept on the volume `c4-hf-cache`). `seed` runs once
+and exits 0; the services wait for it. The simulated cars start sending telemetry at once and a
+clip every 30 to 90 s, so the first live alerts arrive after a minute or two. Then:
 
 | What | URL |
 |---|---|
 | Web app | http://localhost:8080 |
-| API docs (OpenAPI) | http://localhost:8000/api/v1/docs |
-| API health | http://localhost:8000/api/v1/health |
-| C2 / C3 stub docs | http://localhost:8002/api/v1/docs, http://localhost:8003/api/v1/docs |
-| MailHog (invitation emails) | http://localhost:8025 |
+| C2 console (vehicles, devices, provisioning, clips) | http://localhost:8080/c2/console/ |
+| API docs (OpenAPI): C1, C2, C3 | http://localhost:8000/api/v1/docs, http://localhost:8012/api/v1/docs, http://localhost:8003/api/v1/docs |
+| Health: C1, C4 worker | http://localhost:8000/api/v1/health, http://localhost:8010/healthz (and **Platform health** in the web app as admin) |
+| MailHog (invitations, alert emails) | http://localhost:8025 |
 | MySQL / MongoDB / MQTT | localhost:3306 (scicp/scicp), localhost:27017, localhost:1883 |
 
-Useful commands: `docker compose logs -f api stubs`, `docker compose exec mysql mysql -uscicp -pscicp scicp`,
-`docker compose exec mongo mongosh scicp`, `docker compose run --rm seed` (re-seed; existing rows are kept),
-`docker compose down -v` (fresh databases and artifacts).
+The C4 worker needs about 3 GB of memory on top of the rest (give Docker Desktop 8 GB). On a
+smaller machine remove `:docker-compose.c4.yml` from `COMPOSE_FILE`: the stubs container then runs
+a simulated worker instead. The sound clips come from `c2/edge/datasets/<class>/*.wav` when that
+folder has the course's Smart Car audio clips, otherwise the cars send synthetic sounds.
+
+Useful commands: `docker compose ps`, `docker compose logs -f api c2 c3 c4`,
+`docker compose exec mysql mysql -uscicp -pscicp scicp`, `docker compose exec mongo mongosh scicp`,
+`bash deploy/show.sh services|tests|audit|models|alerts|logs` (read-only back-end views),
+`bash deploy/reset-demo.sh` (fresh demo data, keeps the CLAP weights), `docker compose down -v`
+(remove everything, including the databases).
 
 All images are official multi-architecture images (mysql:8.0, mongo:7, eclipse-mosquitto:2,
 python:3.11-slim, node:20-alpine, nginx:1.27-alpine), so the stack builds natively on an
@@ -127,14 +151,14 @@ hands out presigned URLs. Locally these are relative, HMAC-signed API paths
 browser uploads and downloads through nginx on whatever host name the page was opened with; each
 object gets a `<file>.sha256` sidecar with its digest.
 
-The stubs container also runs a simulated C4 classifier worker (`stubs/worker.py`). After an
-activation or a rollback it is notified on MQTT (`scicp/v1/platform/model/activated`, QoS 1,
+The C4 classifier worker (`c3/worker`; when C1 runs alone, the simulated one in `stubs/worker.py`)
+follows the registry. After an activation or a rollback it is notified on MQTT (`scicp/v1/platform/model/activated`, QoS 1,
 retained; inline mode: the EventBus topic `model.activated`) and polls C1 every 30 s as a fallback.
 It asks `GET /internal/models/active` for the version, its SHA-256 and a presigned download URL,
 downloads and verifies the artifact, and reports `POST /internal/worker/status` (LOADING, then READY
 or FAILED). The **AI models** page shows this in the Deployment card (live through the WebSocket
-message `model.deployed`), and new alerts from the demo generator carry the version the worker has
-loaded (`inference.modelVersion`, shown on the alert detail page).
+message `model.deployed`), and new alerts carry the version the worker has loaded
+(`inference.modelVersion`, shown on the alert detail page).
 
 ## Demo accounts
 
@@ -147,16 +171,17 @@ All passwords are `Passw0rd!demo`.
 | rider@example.com | RIDER | 1 (active rider of AV-01) | alert monitor restricted to the trip's car |
 | iot@scicp.example | IOT_ENGINEER | staff | vehicles, devices, provisioning, models, tenants (no alerts) |
 | staff@scicp.example | SERVICE_STAFF | staff | any tenant through the tenant selector, statistics, models |
-| admin@scicp.example | SYS_ADMIN | staff | tenants, users and roles, alert types, model activation |
+| admin@scicp.example | SYS_ADMIN | staff | tenants, users and roles, alert types, audit log, platform health, model activation |
 
 Seed data: 2 tenants, 6 users, 6 vehicles (AV-13 went offline 14 min ago, AV-14 was never
 provisioned), 41 alerts over 14 days (20482 is the NEW ACCIDENT on AV-01), ~400 audio events,
-10 min of telemetry per online car around SJSU, model `sound-classifier` 1.1.0 (active) and
-1.2.0, 15 feedback labels. `deploy/DEMO_SCRIPT.md` is the minute-by-minute script.
+10 min of telemetry per online car around SJSU, model `sound-classifier` 1.1.0 (active, CLAP
+zero-shot, macro-F1 0.68) and 1.2.0 (trained head, 0.99), 15 feedback labels; `seed/models/README.md`
+explains how the versions were trained and scored. `deploy/DEMO_SCRIPT.md` is the demo script.
 
-## Developer mode without Docker
+## Developer mode without Docker (C1)
 
-One process is the whole demo: the API with the C2/C3 stubs mounted inline, the seed at
+One process runs C1 with everything it needs: the API with the C2/C3 stubs mounted inline, the seed at
 startup and the in-process MongoDB mock.
 
 ```bash
@@ -179,52 +204,61 @@ default `C2_BASE_URL`/`C3_BASE_URL` on the API.
 
 ## Tests
 
+Each component has its own suite; none needs Docker or a running platform (SQLite, a MongoDB mock
+and fakes for the neighbors).
+
 ```bash
-cd c1/api && python -m pytest -q                 # 90 tests: BR-02/04/06/07/08/09/10/11 decision tables, tenancy, WebSocket,
-                                                 # signed local storage, model deployment endpoints
-cd c1/web && npm run typecheck && npm run build  # tsc --noEmit, Vite production build
-cd c1/web && npx playwright test                 # smoke: login -> overview -> map -> subscriptions -> reports -> admin -> models
-cd c1/web && E2E_BASE_URL=http://localhost:8080 npx playwright test   # against the running docker compose stack
+cd c1/api && python -m pytest -q          # C1: 96 tests (decision tables of BR-02/04/06/07/08/09/10/11, tenancy,
+                                          #     WebSocket, storage, model deployment, audit log and health pages)
+cd c2 && python -m pytest -q              # C2: 25 tests (needs c2/requirements.txt, c2/edge/requirements.txt, c1/api/requirements.txt)
+cd c3 && python -m pytest -q              # C3: 405 tests (needs c3/requirements.txt and c1/api/requirements.txt)
+cd c3/worker && python -m pytest -q       # C4: fake encoder, no model download (see c3/worker/requirements-dev.txt)
+cd c1/web && npm run typecheck && npm run build
+cd c1/web && npx playwright test          # C1 smoke test (starts the API and the Vite server itself)
+cd c1/web && E2E_BASE_URL=http://localhost:8080 npx playwright test   # against the running platform
 ```
 
 With `E2E_BASE_URL` the configuration starts no server and also runs `tests/stack.spec.ts`: the
 owner flow, Maria's moving cars and a live acknowledge seen from a second session, and the admin
 flow (tenant, invitation found in MailHog's API on :8025, model upload through the UI, activation
-with the BR-10 dialog, the Deployment card going LOADING -> READY, rollback).
-
-The backend tests use SQLite and the MongoDB mock by default (`TEST_DATABASE_URL` switches to
-MySQL/MariaDB). The Playwright configuration starts the API (SQLite, seeded) and the Vite dev
-server itself, or reuses servers already running on :8000 and :5173, so it also works against
-the inline-stubs process above.
+with the BR-10 dialog, the Deployment card going LOADING -> READY, rollback). On EC2,
+`bash deploy/show.sh tests -q` runs the C1 suite in a one-off container.
 
 ## AWS EC2 deployment
 
-1. Launch Ubuntu 24.04 LTS (x86_64), `t3.medium` recommended (`t3.small` works: the bootstrap adds a 4 GB swap file because the image builds need about 3 GB of memory), 20 GB gp3 disk, a key pair, and a security group with 22 from your IP, 80 from anywhere, and 8025 (MailHog) from your IP. Nothing else is needed for the default setup: the model artifacts stay on the instance disk and the invitation emails go to MailHog. Optional Amazon S3 for the artifacts: set `AWS_STORAGE_BACKEND=s3` in `.env`, attach an instance role with `s3:*` on `arn:aws:s3:::scicp-models*` (or set `AWS_S3_ACCESS_KEY` / `AWS_S3_SECRET_KEY`), and create the private bucket `scicp-models` in `us-west-2` with a CORS rule allowing `PUT` and `GET` from `http://<public-host>`; the browser and the classifier worker then use presigned S3 URLs.
+1. Launch Ubuntu 24.04 LTS (x86_64) with 8 GB of memory for the whole platform (`t3.large`, or `m7i-flex.large` on the AWS Free plan; the C4 worker alone needs about 3 GB) and a 30 GB gp3 disk (`t3.small` with 20 GB is enough for C1 with the stand-ins: the bootstrap adds a 4 GB swap file for the image builds), a key pair, and a security group with 22 from your IP, 80 from anywhere, and 8025 (MailHog) from your IP. Nothing else is needed for the default setup: the model artifacts stay on the instance disk and the invitation emails go to MailHog. Optional Amazon S3 for the artifacts: set `AWS_STORAGE_BACKEND=s3` in `.env`, attach an instance role with `s3:*` on `arn:aws:s3:::scicp-models*` (or set `AWS_S3_ACCESS_KEY` / `AWS_S3_SECRET_KEY`), and create the private bucket `scicp-models` in `us-west-2` with a CORS rule allowing `PUT` and `GET` from `http://<public-host>`; the browser and the classifier worker then use presigned S3 URLs.
 2. SSH in and run the bootstrap (installs Docker, clones, writes `.env` with fresh secrets and the public hostname, starts the stack):
    ```bash
    curl -fsSL https://raw.githubusercontent.com/anu-myadala/cmpe281_final_project_group2/main/deploy/ec2-bootstrap.sh | bash -s -- https://github.com/anu-myadala/cmpe281_final_project_group2.git
    ```
    or clone first and run `bash deploy/ec2-bootstrap.sh`. It ends with the URLs; the web app is `http://<public-host>/`.
-3. Operate: `sudo docker compose ps|logs -f|down` in `~/scicp`. The bootstrap writes the compose files to `.env` as `COMPOSE_FILE`: `docker-compose.yml` and `docker-compose.aws.yml`, plus the C3 and C2 overlays and `docker-compose.c4.yml` (the C4 classifier worker; use t3.large) when they are in the repository (`SCICP_STUBS_ONLY=1` keeps the stand-ins). `bash deploy/show.sh services|tests|audit|models|alerts|logs` prints the back-end views used in the demo (containers, the C1 unit tests in a one-off container, the audit log, the model versions, the newest alerts), and `bash deploy/reset-demo.sh` restores the fresh demo data without downloading the CLAP weights again. After a stop/start of the instance the public DNS changes: run the bootstrap again (it rewrites `PUBLIC_HOST`, `C3_PUBLIC_BASE_URL` and `CORS_ORIGINS`). Mail goes to MailHog (`http://<public-host>:8025`); `AWS_MAIL_MODE=log` writes it to the API log instead and `AWS_MAIL_MODE=ses` sends it through SES with a verified `MAIL_FROM`. HTTPS is out of scope for the course demo; put an ALB or Caddy in front for a real deployment and set `COOKIE_SECURE=true`.
+3. Operate: `sudo docker compose ps|logs -f|down` in `~/scicp`. The bootstrap writes the compose files to `.env` as `COMPOSE_FILE`: `docker-compose.yml` and `docker-compose.aws.yml`, plus the C3, C2 and C4 overlays (`SCICP_STUBS_ONLY=1` keeps the stand-ins). `bash deploy/show.sh services|tests|audit|models|alerts|logs` prints the back-end views used in the demo (containers, the C1 unit tests in a one-off container, the audit log, the model versions, the newest alerts), and `bash deploy/reset-demo.sh` restores the fresh demo data without downloading the CLAP weights again. After a stop/start of the instance the public DNS changes: run the bootstrap again (it rewrites `PUBLIC_HOST`, `C3_PUBLIC_BASE_URL` and `CORS_ORIGINS`). Mail goes to MailHog (`http://<public-host>:8025`); `AWS_MAIL_MODE=log` writes it to the API log instead and `AWS_MAIL_MODE=ses` sends it through SES with a verified `MAIL_FROM`. HTTPS is out of scope for the course demo; put an ALB or Caddy in front for a real deployment and set `COOKIE_SECURE=true`.
 
-## Replacing the stubs by the real C2 and C3
+## Running C1 alone with the stand-ins
 
-C1 only knows the base URLs and the contract in `docs/API_NOTES.md`:
+C1 only knows the base URLs and the contract in `docs/API_NOTES.md`, so it also runs without the
+other components: comment out `COMPOSE_FILE` in `.env` (or run `docker compose -f docker-compose.yml up -d --build`).
+The `stubs` container then serves C2 and C3 from the same shared tables, generates telemetry and
+alerts, and simulates the C4 worker; nginx sends `/c2/` and `/c3/` to it. On EC2,
+`SCICP_STUBS_ONLY=1 bash deploy/ec2-bootstrap.sh` does the same.
 
-- `C2_BASE_URL` / `C3_BASE_URL` in `.env` point the API's `VehicleClient` and `AlertClient` at the real services; the nginx upstreams `c2_stub` and `c3_stub` in `c1/web/nginx/default.conf` (same-origin `/c2/` and `/c3/` paths for the browser) point at them too.
-- C2 and C3 accept the user JWT (`JWT_SECRET`) and the service token (`SERVICE_TOKEN_SECRET`), and publish `alert.created`, `alert.updated` and `device.status` with `POST /internal/events`.
-- The shared tables `vehicle`, `vehicle_rider`, `alert`, `alert_action` and the view `v_alert_summary` keep the columns of Parts II and III; the stubs read exactly those, so the dashboard does not change.
-- Each real service comes as an overlay that changes no shared file: `docker-compose.c3.yml` (C3), `docker-compose.c2.yml` (C2 and the simulated cars) and `docker-compose.c2c3.yml` (the nginx file for both). With all three in the repository, run
-  ```bash
-  docker compose -f docker-compose.yml -f docker-compose.c3.yml -f docker-compose.c2.yml -f docker-compose.c2c3.yml -f docker-compose.c4.yml up -d --build
-  ```
-  or uncomment `COMPOSE_FILE` in `.env` and use a plain `docker compose ...`. `docker-compose.c4.yml` adds the real C4 classifier worker (CLAP, about 3 GB of memory) and turns off the simulated worker of the stubs container; without it the simulated worker stays on.
+How the real components plug in, without changing a shared file:
+
+- `C2_BASE_URL` / `C3_BASE_URL` point the API's `VehicleClient` and `AlertClient` at C2 and C3; the
+  overlays `docker-compose.c2.yml`, `docker-compose.c3.yml` and `docker-compose.c2c3.yml` set them and
+  swap the nginx file so that the browser's `/c2/` and `/c3/` paths reach the real services.
+- C2 and C3 accept the user JWT (`JWT_SECRET`) and the service token (`SERVICE_TOKEN_SECRET`), and
+  publish `alert.created`, `alert.updated` and `device.status` with `POST /internal/events`.
+- The shared tables `vehicle`, `vehicle_rider`, `alert`, `alert_action` and the view `v_alert_summary`
+  keep the columns of Parts II and III of the design, so the dashboard reads the same data either way.
+- `docker-compose.c4.yml` adds the real classifier worker and turns off the simulated one.
 
 ## Documentation
 
 `docs/BRIEF.md` (implementation brief with the late changes), `docs/API_NOTES.md` (the exact
 request and response shapes, the WebSocket protocol and the internal endpoints),
 `docs/spec_DESIGN.md` and `docs/spec_part1_c1.txt` (Deliverable #2 design of C1),
-`docs/spec_overview.txt`, `docs/spec_part2_c2.txt`, `docs/spec_part3_c3.txt` (interfaces of the
-other components), `c1/api/README.md` and `c1/web/README.md` (component notes),
-`deploy/DEMO_SCRIPT.md` (the demo).
+`docs/spec_overview.txt`, `docs/spec_part2_c2.txt`, `docs/spec_part3_c3.txt` (the design of the
+other components), `c1/api/README.md`, `c1/web/README.md`, `c2/README.md` (with the console and
+the live laptop car), `c3/README.md` (with the C4 worker), `seed/models/README.md` (the model
+versions), `deploy/DEMO_SCRIPT.md` (the demo).

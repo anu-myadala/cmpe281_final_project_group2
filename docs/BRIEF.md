@@ -31,6 +31,8 @@ Where the text and this brief differ, this brief wins (it contains the late chan
   (`GET /internal/models/active`), verifies the SHA-256 and reports `POST /internal/worker/status`; `GET /models/{id}/deployment` and the
   WebSocket message `model.deployed` drive the Deployment card on the models page.
 - Feedback: the C3 alert page posts FALSE_ALARM on "False alarm" and CONFIRMED on "Resolve".
+- M8 (Nov 19, for the final project): the audit log viewer (`GET /admin/audit`, AuditLogPage) and the platform health page
+  (`GET /admin/health`, HealthPage) are built; they were design only (FR-C1-06, priority L) in Deliverable #2.
 - VEHICLE MAP (added Oct 30 after the instructor asked for tracking on a map; priority HIGH, it is the demo's centerpiece):
   - `GET /dashboard/map?tenantId` -> `{vehicles[{vehicleId, label, status, connection, lat, lon, headingDeg, speedKph, driveMode, ignition, sampleAt}], alerts[{alertId, vehicleId, lat, lon, severity, type, createdAt}], asOf, degraded?}`.
     Roles like /dashboard/overview (403 RIDER, IOT_ENGINEER; staff pass tenantId). Cars without a sample: lat/lon/sampleAt null.
