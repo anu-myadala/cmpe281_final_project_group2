@@ -78,6 +78,9 @@ Arguments: `class confidence vehicle tenant speedKph`; options `--also CLASS:CON
 c3/.venv/bin/python c3/tools/watch_ws.py --email maria@bayshuttle.example --seconds 300
 ```
 
+Since Nov 11, C1's WebSocket hub (`c1/api/app/ws/hub.py`) adds `tenantId` to messages sent to the `staff`
+room (tenant rooms still get it stripped). The two staff assertions in `tests/test_publisher_c1.py` now expect it.
+
 ## C4 classifier worker
 
 `c3/worker/` (package `c4_worker`, its own requirements and Dockerfile) replaces the stubs' simulated worker:
@@ -92,10 +95,27 @@ c3/.venv/bin/python c3/tools/watch_ws.py --email maria@bayshuttle.example --seco
 
 - `{'kind': 'head', 'state_dict', 'classes', 'embedding_dim': 512}`: Linear(512,128), ReLU, Dropout, Linear(128,7) on the normalized embedding.
 - `{'kind': 'zero_shot', 'classes', 'prompts': {class: [texts]}, 'temperature'}`: the worker embeds the prompts when it loads the model and scores by softmax(cosine / temperature).
-  The default temperature is 0.05: CLAP's cosines are close together, and 0.01 (version 1.3.0) gave 1.00 for almost every clip, while 0.05 gives about 0.67 - 0.91 on the C2 clips.
-  On the simulator's labeled events, zero-shot gets about 46% right: correct on siren, traffic and glass_break, wrong on honking, environmental, scream and crash.
+  The default temperature is 0.05: CLAP's cosines are close together, and 0.01 (an earlier zero-shot build) gave 1.00 for almost every clip, while 0.05 gives about 0.67 - 0.91 on the C2 clips.
+  *Older, separate measurement* (the earlier 0.01-temperature build, live run on the simulator's labeled events, not comparable to the seed scores below): zero-shot got about 46% right, correct on siren, traffic and glass_break, wrong on honking, environmental, scream and crash.
 
-**Build the zero-shot model** (needs torch only; the venv commands are in `c3/worker/requirements-dev.txt`):
+**Seeded versions** (from `seed/models/README.md`, which has the data, the split and the per-class table; every number is in `seed/models/evaluation.json`):
+
+- `1.1.0`: CLAP zero-shot with text prompts, temperature 0.05 (the worker's default), no training. ACTIVE after the seed. Macro-F1 0.68, accuracy 0.72.
+- `1.2.0`: a trained head (512 -> 128 -> 7) on CLAP embeddings. REGISTERED. Macro-F1 0.99, accuracy 0.99.
+- Both are real `model.pt` artifacts the worker loads, scored on the same 237 test clips (787 clips from the course `Audio_Datasets`, stratified split 550 / 237, `random_state=281`; 1.2.0 never saw the test clips).
+- **Caveat**: the head's score comes from a random file-level split, and files of one class may be cut from the same longer recordings, so 0.99 is likely optimistic for new audio.
+
+**Upload and activate** at http://localhost:8080 -> AI models, as `admin@scicp.example` / `Passw0rd!demo`
+(only SERVICE_STAFF and SYS_ADMIN can write to the registry). The main example is the one in `seed/models/README.md`
+and `deploy/DEMO_SCRIPT.md`: version `1.3.0`, which the seed does not register.
+
+- *Upload new version*: version `1.3.0`, the file `seed/models/1.3.0/model.pt`, macro-F1 0.99, accuracy 0.99, and the per-class block from `seed/models/1.3.0/per-class.json`. The browser computes the SHA-256 itself.
+  Per the seed README, 1.3.0 is the same head as 1.2.0 trained with label smoothing 0.1 on the same 550 training clips and scored on the same 237 test clips, so the same caveat applies: its scores are likely higher than on new audio.
+  Its mean top confidence on the test clips is 0.88 against 0.99 for 1.2.0, which matters because C3 compares the confidence with its rule thresholds.
+- *Set as active*: BR-10 fails only when macro-F1 is more than 0.05 below the active version. With the seed's 1.1.0 (0.68) active, 1.2.0 and 1.3.0 (0.99) pass without *Force*.
+- The *Deployment* card shows `c4-worker-1` go LOADING, then READY with the SHA-256 verified (or FAILED with the reason).
+
+**Optional: build a zero-shot model** (needs torch only; the venv commands are in `c3/worker/requirements-dev.txt`):
 
 ```bash
 c3/worker/.venv/bin/python c3/worker/make_zero_shot_model.py     # -> $SCICP_DATA/work/models/zero_shot_1.3.1/
@@ -103,13 +123,8 @@ c3/worker/.venv/bin/python c3/worker/make_zero_shot_model.py     # -> $SCICP_DAT
 # writes model.pt, model.pt.sha256 and metrics.json ({macroF1, accuracy, perClass}; zeros: not evaluated)
 ```
 
-**Upload and activate** at http://localhost:8080 -> AI models, as `admin@scicp.example` / `Passw0rd!demo`
-(only SERVICE_STAFF and SYS_ADMIN can write to the registry):
-
-- *Upload new version*: version `1.3.1`, the `model.pt` file, and macro-F1, accuracy and per-class from `metrics.json`. The browser computes the SHA-256 itself.
-- *Set as active*: BR-10 fails when macro-F1 is more than 0.05 below the active version (the seed's 1.1.0 has 0.84, the zero-shot model 0), so tick *Force* and write a note.
-- The *Deployment* card shows `c4-worker-1` go LOADING, then READY with the SHA-256 verified (or FAILED with the reason).
-  Until then it shows FAILED on 1.1.0: the seed's artifacts are dummy text, not torch files.
+Upload it the same way as version `1.3.1` with the values from its `metrics.json`. Those are zeros (not evaluated),
+so BR-10 fails against the active version: tick *Force* and write a note to activate it.
 
 **Run** (the five-file command from `docker-compose.c4.yml`; it also sets `WORKER_ENABLED=0` on the stubs, because
 `DEMO_ENABLED=0` alone still starts their simulated worker):
@@ -136,11 +151,12 @@ The CLAP weights (about 600 MB) download on the first start into the named volum
 ```bash
 DC="docker compose -f docker-compose.yml -f docker-compose.c3.yml -f docker-compose.c2.yml -f docker-compose.c2c3.yml -f docker-compose.c4.yml"
 eval $DC up -d --build                        # 1. the stack (cp .env.example .env once before)
-curl -s http://127.0.0.1:8010/healthz         # 2. status NO_MODEL, queueDepth grows
-c3/worker/.venv/bin/python c3/worker/make_zero_shot_model.py   # 3. zero_shot_1.3.1/: model.pt + metrics.json
-# 4. web: admin@scicp.example -> AI models -> Upload new version 1.3.1 -> Set as active (Force + note)
+curl -s http://127.0.0.1:8010/healthz         # 2. the seed's 1.1.0 is ACTIVE; the worker loads it
+# 3. web: admin@scicp.example -> AI models -> Upload new version 1.3.0 (seed/models/1.3.0/model.pt,
+#    macro-F1 0.99, accuracy 0.99, seed/models/1.3.0/per-class.json)
+# 4. web: Set as active 1.3.0 (no Force: 0.99 is not below the active 1.1.0's 0.68)
 eval $DC logs -f c4                           # 5. LOADING -> READY, then one line per classified event
-curl -s http://127.0.0.1:8010/healthz         # 6. status READY, modelVersion sound-classifier-1.3.1
+curl -s http://127.0.0.1:8010/healthz         # 6. modelVersion sound-classifier-1.3.0
 # 7. web: the alert monitor gets the alerts C3 decides from the simulated cars' events
 ```
 
