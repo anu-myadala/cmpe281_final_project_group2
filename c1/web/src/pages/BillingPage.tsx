@@ -20,6 +20,14 @@ import { useToast } from '../components/Toast';
 import { formatDate, formatNumber } from '../util/format';
 
 interface Line { code: string; description: string; quantity: number; unit: string; unitCents: number; amountCents: number }
+
+/** "1 month", "2 vehicles", "3 × 1,000 clips", "0.001 GB-month". */
+function quantityText(l: Line): string {
+  const n = formatNumber(l.quantity, l.code === 'STORAGE' ? 3 : 0);
+  if (/^[\d,]+ /.test(l.unit)) return `${n} × ${l.unit}`;
+  if (l.unit === 'vehicle' || l.unit === 'month') return `${n} ${l.unit}${l.quantity === 1 ? '' : 's'}`;
+  return `${n} ${l.unit}`;
+}
 interface Invoice {
   tenantId: number; tenant: string; plan: string; month: string; from: string; to: string; running: boolean;
   usage: { vehicles: number; alerts: number; clips: number; emails: number; storageGb: number; notMeasured: string[] };
@@ -120,7 +128,7 @@ export function BillingPage() {
 
   const lineColumns: Column<Line>[] = [
     { key: 'description', header: 'Item', render: (l) => l.description },
-    { key: 'quantity', header: 'Quantity', align: 'right', render: (l) => `${formatNumber(l.quantity, l.code === 'STORAGE' ? 3 : 0)} ${l.unit}` },
+    { key: 'quantity', header: 'Quantity', align: 'right', render: (l) => quantityText(l) },
     { key: 'unitCents', header: 'Unit price', align: 'right', render: (l) => usd(l.unitCents) },
     { key: 'amountCents', header: 'Amount', align: 'right', render: (l) => <b>{usd(l.amountCents)}</b> },
   ];

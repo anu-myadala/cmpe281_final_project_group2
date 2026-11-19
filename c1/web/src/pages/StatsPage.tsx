@@ -150,7 +150,7 @@ export function StatsPage() {
         <>
           <Box sx={{ display: 'flex', gap: 1.25, mb: 1.25, flexWrap: 'wrap' }} data-testid="stats-kpis">
             <KpiTile label="Devices online" value={deviceDegraded ? 'n/a' : `${online} of ${deviceTotal}`} hint={deviceDegraded ? 'C2 unavailable' : undefined} />
-            <KpiTile label="Open alerts" value={stats.data.totals.open} />
+            <KpiTile label="Open, of those in range" value={stats.data.totals.open} />
             <KpiTile label="Alerts in range" value={formatNumber(stats.data.totals.alerts)} />
             <KpiTile label="Events in range" value={formatNumber(stats.data.totals.events)} />
             <KpiTile label="False-alarm rate" value={formatPercent(stats.data.falseAlarmRate)} />

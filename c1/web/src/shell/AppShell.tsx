@@ -35,7 +35,7 @@ import SearchIcon from '@mui/icons-material/Search';
 import AccountCircleOutlinedIcon from '@mui/icons-material/AccountCircleOutlined';
 import { useAuth } from '../auth/AuthProvider';
 import { useLiveEvents } from '../live/useLiveEvents';
-import { useOverview, useTenants } from '../api/queries';
+import { useC3Alerts, useOverview, useTenants } from '../api/queries';
 import { LiveBanner } from '../components/common';
 import { ChangePasswordDialog } from '../pages/ChangePasswordDialog';
 import { colors } from '../theme';
@@ -117,7 +117,7 @@ function TenantSelector() {
       displayEmpty
       size="small"
       data-testid="tenant-selector"
-      sx={{ height: 28, fontSize: 12, mr: 1.5, minWidth: 190, '& .MuiSelect-select': { py: 0.4 } }}
+      sx={{ height: 28, fontSize: 12, mr: { xs: 1, sm: 1.5 }, minWidth: { xs: 0, sm: 190 }, maxWidth: { xs: 150, sm: 'none' }, flexShrink: 1, '& .MuiSelect-select': { py: 0.4 } }}
       renderValue={(value) => {
         const tenant = items.find((t) => String(t.tenantId) === value);
         return `Tenant: ${tenant ? tenant.name : tenants.isLoading ? '...' : 'select'}`;
@@ -135,8 +135,11 @@ function TenantSelector() {
 function OpenAlertBadge() {
   const { tenantId, permissions } = useAuth();
   const { badgePulse, polling } = useLiveEvents();
-  const canSee = permissions.includes('overview') || permissions.includes('alerts');
-  const overview = useOverview(canSee ? tenantId : null, polling);
+  const hasOverview = permissions.includes('overview');
+  const canSee = hasOverview || permissions.includes('alerts');
+  // A rider has the alert monitor but not the overview: count the open alerts C3 returns instead.
+  const overview = useOverview(hasOverview ? tenantId : null, polling);
+  const openAlerts = useC3Alerts(!hasOverview && canSee ? tenantId : null, 'OPEN', polling);
   const [pulse, setPulse] = useState(false);
   useEffect(() => {
     if (!badgePulse) return;
@@ -145,7 +148,7 @@ function OpenAlertBadge() {
     return () => window.clearTimeout(timer);
   }, [badgePulse]);
   if (!canSee) return null;
-  const count = overview.data?.kpis.openAlerts ?? 0;
+  const count = hasOverview ? overview.data?.kpis.openAlerts ?? 0 : openAlerts.data?.total ?? 0;
   return (
     <Tooltip title="Open alerts">
       <IconButton
@@ -191,7 +194,7 @@ export function AppShell() {
   const collapsed = narrow;
 
   const tenantName = user?.tenantName ?? tenants.data?.items.find((t) => t.tenantId === tenantId)?.name;
-  const title = `${pageTitle(location.pathname)}${tenantName && !location.pathname.startsWith('/admin') && !location.pathname.startsWith('/models') ? ` - ${tenantName}` : ''}`;
+  const title = `${pageTitle(location.pathname, items)}${tenantName && !location.pathname.startsWith('/admin') && !location.pathname.startsWith('/models') ? ` - ${tenantName}` : ''}`;
 
   useEffect(() => {
     document.title = `${title} | SCICP`;

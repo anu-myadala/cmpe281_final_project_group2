@@ -50,8 +50,10 @@ export function firstAllowedPath(permissions: string[], role: Role | null): stri
   return items[0]?.path ?? '/login';
 }
 
-export function pageTitle(pathname: string): string {
-  const entry = MENU.find((item) => pathname === item.path || pathname.startsWith(`${item.path}/`));
+/** The page title; `items` (the user's own menu) gives the role's label, e.g. "Vehicles" for staff. */
+export function pageTitle(pathname: string, items: MenuEntry[] = MENU): string {
+  const match = (item: MenuEntry) => pathname === item.path || pathname.startsWith(`${item.path}/`);
+  const entry = items.find(match) ?? MENU.find(match);
   if (entry) return entry.label;
   if (pathname.startsWith('/admin')) return 'Administration';
   return 'SCICP';

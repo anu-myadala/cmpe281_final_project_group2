@@ -89,7 +89,6 @@ export function AuditLogPage() {
     { key: 'action', header: 'Action', render: (r) => <b>{r.action}</b> },
     { key: 'entity', header: 'Entity', render: (r) => `${r.entity}${r.entityId ? ` ${r.entityId}` : ''}` },
     { key: 'tenant', header: 'Tenant', render: (r) => r.tenant ?? '-' },
-    { key: 'ip', header: 'IP', render: (r) => r.ip ?? '-' },
   ];
 
   return (
@@ -134,7 +133,7 @@ export function AuditLogPage() {
           {selected ? (
             <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
               <Typography sx={{ fontSize: 12.5 }}>
-                <b>{selected.actor}</b> {'·'} {formatDateTime(selected.ts)} {'·'} {selected.entity} {selected.entityId ?? ''} {selected.tenant ? `· ${selected.tenant}` : ''}
+                <b>{selected.actor}</b> {'·'} {formatDateTime(selected.ts)} {'·'} {selected.entity} {selected.entityId ?? ''} {selected.tenant ? `· ${selected.tenant}` : ''} {selected.ip ? `· from ${selected.ip}` : ''}
               </Typography>
               <Typography variant="subtitle2">Before</Typography>
               <Json value={selected.before} />

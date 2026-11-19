@@ -18,7 +18,7 @@ import torch
 from c4_worker.config import CLASSES, Settings
 from c4_worker.classifiers import build_head
 
-SECRET = "test-service-secret"
+SECRET = "test-service-secret-at-least-32-bytes"
 C1 = "http://api:8000/api/v1"
 C2 = "http://c2:8002/api/v1"
 C3 = "http://c3:8003/api/v1"
