@@ -94,11 +94,13 @@ async def test_N4_riders_are_emailed_only_during_their_trip(engine_env, trip, em
     env = await engine_env(mailer=FakeMailer("ok"), clock=lambda: NOON_LA)
     async with env.app.state.session_factory() as session:
         await session.execute(update(Subscription).where(Subscription.vehicle_id == 1).values(notify_riders=True))
-        if trip != "active":  # replace the seeded open trip of rider 1003 on AV-01
-            await session.execute(delete(VehicleRider).where(VehicleRider.user_id == 1003))
-            start, end = ((NOON_LA - timedelta(hours=3), NOON_LA - timedelta(hours=1)) if trip == "ended"
-                          else (NOON_LA + timedelta(hours=1), None))
-            session.add(VehicleRider(vehicle_id=1, user_id=1003, valid_from=start, valid_to=end, tenant_id=1))
+        # Replace the seeded trip of rider 1003 on AV-01: the seed dates it from today, the test clock
+        # is fixed, so the trip is set relative to the test clock in every case.
+        await session.execute(delete(VehicleRider).where(VehicleRider.user_id == 1003))
+        start, end = {"active": (NOON_LA - timedelta(hours=1), None),
+                      "ended": (NOON_LA - timedelta(hours=3), NOON_LA - timedelta(hours=1)),
+                      "starts-later": (NOON_LA + timedelta(hours=1), None)}[trip]
+        session.add(VehicleRider(vehicle_id=1, user_id=1003, valid_from=start, valid_to=end, tenant_id=1))
         await session.commit()
     alert_id = await _crash_on_av01(env)
     await env.app.state.notifier.drain()
