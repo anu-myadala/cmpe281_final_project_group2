@@ -171,7 +171,7 @@ two replicas each of the C1 API, C2 and C3 with nginx as the load balancer (`dep
 |---|---|
 | Load balancing | nginx round robin over the replicas of each service; `X-Upstream` in every answer names the replica (`bash deploy/show.sh lb` counts them) |
 | Service discovery | Docker's DNS returns every replica of `api`, `c2`, `c3`; nginx re-resolves every 10 s (`resolve`), so `docker compose up -d --scale c2=3` adds a replica without a restart |
-| Failover | a replica that fails is skipped for 10 s (`max_fails`), and the request is retried on the next one (`proxy_next_upstream`); stopping a replica loses no request |
+| Failover | a replica that fails is skipped for 10 s (`max_fails`), and the request is retried on the next one (`proxy_next_upstream`); in the AWS test all 5,625 requests succeeded while a replica of each service was stopped (`docs/LOADTEST.md`) |
 | Shared state | everything durable is in MySQL, MongoDB and the volumes; the API replicas share their live events over MQTT (`EVENT_FANOUT=1`), so every WebSocket sees every alert |
 | Message streams | C2's replicas use MQTT shared subscriptions (`$share/c2/...`): the broker gives each telemetry or status message to one replica; the C4 worker supports the same (`C4_SHARE_GROUP`) for a pool of workers |
 | Background jobs | C2's sweep, command timeouts and retention run on one replica at a time (MySQL `GET_LOCK`); C2 and C3 create their tables under the same lock |
@@ -239,7 +239,7 @@ Each component has its own suite; none needs Docker or a running platform (SQLit
 and fakes for the neighbors).
 
 ```bash
-cd c1/api && python -m pytest -q          # C1: 107 tests (decision tables of BR-02/04/06/07/08/09/10/11, tenancy,
+cd c1/api && python -m pytest -q          # C1: 108 tests (decision tables of BR-02/04/06/07/08/09/10/11, tenancy,
                                           #     WebSocket, storage, model deployment, audit log, health, billing, event fan-out)
 cd c2 && python -m pytest -q              # C2: 28 tests (needs c2/requirements.txt, c2/edge/requirements.txt, c1/api/requirements.txt)
 cd c3 && python -m pytest -q              # C3: 405 tests (needs c3/requirements.txt and c1/api/requirements.txt)
