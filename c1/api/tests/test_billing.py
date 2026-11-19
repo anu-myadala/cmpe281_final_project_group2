@@ -83,3 +83,25 @@ async def test_billing_roles(client, auth):
     assert (await client.get("/api/v1/billing/summary", headers=owner)).status_code == 403
     me = (await client.get("/api/v1/auth/me", headers=owner)).json()
     assert "billing" in me["permissions"]
+
+
+async def test_concurrent_first_reads_of_the_price_list(container):
+    """Two requests that both find the price list empty insert the defaults at the same time; the
+    loser rolls back, and its invoice must still work (the tenant is loaded after the prices)."""
+    import asyncio
+
+    from sqlalchemy import delete
+
+    from app.models import PriceList
+    from app.services import BillingService
+
+    async with container.session_factory() as session:
+        await session.execute(delete(PriceList))
+        await session.commit()
+
+    async def one():
+        async with container.session_factory() as session:
+            return await BillingService(container, session).invoice(2, None)
+
+    first, second = await asyncio.gather(one(), one())
+    assert first["plan"] == second["plan"] == "FLEET" and first["lines"][0]["amountCents"] == 19_900

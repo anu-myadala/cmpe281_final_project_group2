@@ -139,8 +139,9 @@ class BillingService:
                 self.session.add(PriceList(plan=plan, **DEFAULT_PRICES[plan]))
             try:
                 await self.session.commit()
-            except IntegrityError:  # another replica inserted them at the same moment
+            except IntegrityError:  # another replica or request inserted them at the same moment
                 await self.session.rollback()
+                log.info("billing: default prices inserted concurrently; using the stored rows")
             rows = {r.plan: r for r in (await self.session.execute(select(PriceList))).scalars()}
         return rows
 
@@ -202,10 +203,12 @@ class BillingService:
 
     # -- invoices ---------------------------------------------------------------------------------
     async def invoice(self, tenant_id: int, month: Optional[str]) -> Dict[str, Any]:
+        # The price list first: inserting the defaults may roll back (another replica inserted them at
+        # the same moment), and a rollback expires every object already loaded in the session.
+        prices = await self._ensure_prices()
         tenant = await self.session.get(Tenant, tenant_id)
         if tenant is None:
             raise NotFound("Tenant not found")
-        prices = await self._ensure_prices()
         now = utcnow()
         label, start, nxt, end, running = month_range(month, now)
         usage = await self.usage(tenant, start, end)
@@ -220,6 +223,7 @@ class BillingService:
                 **bill}
 
     async def summary(self, month: Optional[str]) -> Dict[str, Any]:
+        await self._ensure_prices()  # before loading the tenants (see invoice)
         tenants = list((await self.session.execute(select(Tenant).order_by(Tenant.tenant_id))).scalars())
         rows = []
         for tenant in tenants:
