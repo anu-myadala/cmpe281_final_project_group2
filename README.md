@@ -174,7 +174,7 @@ two replicas each of the C1 API, C2 and C3 with nginx as the load balancer (`dep
 | Failover | a replica that fails is skipped for 10 s (`max_fails`), and the request is retried on the next one (`proxy_next_upstream`); in the AWS test all 5,625 requests succeeded while a replica of each service was stopped (`docs/LOADTEST.md`) |
 | Shared state | everything durable is in MySQL, MongoDB and the volumes; the API replicas share their live events over MQTT (`EVENT_FANOUT=1`), so every WebSocket sees every alert |
 | Message streams | C2's replicas use MQTT shared subscriptions (`$share/c2/...`): the broker gives each telemetry or status message to one replica; the C4 worker supports the same (`C4_SHARE_GROUP`) for a pool of workers |
-| Background jobs | C2's sweep, command timeouts and retention run on one replica at a time (MySQL `GET_LOCK`); C2 and C3 create their tables under the same lock |
+| Background jobs | C2's sweep, command timeouts and retention run on one replica at a time (MySQL `GET_LOCK`); C1, C2 and C3 create their tables under the same kind of lock, so replicas that start together on an empty database do not collide |
 
 `tools/loadtest.py` measures the platform through the load balancer (requests per second and
 latency per endpoint, and which replica served them); `docs/LOADTEST.md` has the numbers measured on EC2.
