@@ -9,7 +9,7 @@ from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..core.pagination import Page
-from ..models import (AiModel, AlertType, AppUser, FeedbackLabel, IntelligenceService, ModelVersion, RefreshToken,
+from ..models import (AiModel, AlertType, AppUser, AuditLog, FeedbackLabel, IntelligenceService, ModelVersion, RefreshToken,
                       Subscription, Tenant, Vehicle, utcnow)
 
 
@@ -242,3 +242,37 @@ class FeedbackRepo:
         if version_id is not None:
             stmt = stmt.where(FeedbackLabel.version_id == version_id)
         return list((await session.execute(stmt.order_by(FeedbackLabel.ts, FeedbackLabel.label_id))).scalars())
+
+
+class AuditRepo:
+    """Reads of audit_log for the audit log page (GET /admin/audit), newest first."""
+
+    @staticmethod
+    async def page(session: AsyncSession, page: Page, actor: Optional[str] = None, entity: Optional[str] = None,
+                   action: Optional[str] = None, tenant_id: Optional[int] = None, start: Optional[datetime] = None,
+                   end: Optional[datetime] = None) -> Tuple[List[tuple], int]:
+        stmt = (select(AuditLog, AppUser.email, Tenant.name)
+                .outerjoin(AppUser, AppUser.user_id == AuditLog.actor_user_id)
+                .outerjoin(Tenant, Tenant.tenant_id == AuditLog.tenant_id))
+        if actor:
+            stmt = stmt.where(func.lower(AppUser.email).like(f"%{actor.strip().lower()}%"))
+        if entity:
+            stmt = stmt.where(AuditLog.entity == entity)
+        if action:
+            stmt = stmt.where(AuditLog.action == action)
+        if tenant_id is not None:
+            stmt = stmt.where(AuditLog.tenant_id == tenant_id)
+        if start is not None:
+            stmt = stmt.where(AuditLog.ts >= start)
+        if end is not None:
+            stmt = stmt.where(AuditLog.ts <= end)
+        total = (await session.execute(select(func.count()).select_from(stmt.subquery()))).scalar_one()
+        rows = await session.execute(stmt.order_by(AuditLog.audit_id.desc()).offset(page.offset).limit(page.size))
+        return [tuple(r) for r in rows], int(total)
+
+    @staticmethod
+    async def facets(session: AsyncSession) -> Dict[str, List[str]]:
+        """The actions and entities that occur, for the filter menus."""
+        actions = (await session.execute(select(AuditLog.action).distinct().order_by(AuditLog.action))).scalars()
+        entities = (await session.execute(select(AuditLog.entity).distinct().order_by(AuditLog.entity))).scalars()
+        return {"actions": list(actions), "entities": list(entities)}

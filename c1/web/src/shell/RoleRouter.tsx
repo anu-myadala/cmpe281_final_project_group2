@@ -20,6 +20,8 @@ import { AlertTypesPage } from '../pages/admin/AlertTypesPage';
 import { ModelsPage } from '../pages/ModelsPage';
 import { AlertMonitorPage, AlertDetailPage } from '../pages/AlertMonitorPage';
 import { HostedPage } from '../pages/HostedPage';
+import { AuditLogPage } from '../pages/admin/AuditLogPage';
+import { HealthPage } from '../pages/admin/HealthPage';
 
 interface RouteDef {
   path: string;
@@ -44,8 +46,8 @@ export const ROUTES: RouteDef[] = [
   { path: '/admin/tenants', permission: 'tenants', element: <TenantsPage /> },
   { path: '/admin/users', permission: 'users', element: <UsersPage /> },
   { path: '/admin/alert-types', permission: 'alert-types', element: <AlertTypesPage /> },
-  { path: '/admin/audit', permission: 'audit', element: <HostedPage page="audit" /> },
-  { path: '/admin/health', permission: 'health', element: <HostedPage page="health" /> },
+  { path: '/admin/audit', permission: 'audit', element: <AuditLogPage /> },
+  { path: '/admin/health', permission: 'health', element: <HealthPage /> },
 ];
 
 function Splash() {

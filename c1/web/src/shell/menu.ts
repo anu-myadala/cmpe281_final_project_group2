@@ -26,8 +26,8 @@ export const MENU: MenuEntry[] = [
   { key: 'tenants', label: 'Tenants', path: '/admin/tenants', permission: 'tenants', section: 'admin' },
   { key: 'users', label: 'Users and roles', path: '/admin/users', permission: 'users', section: 'admin' },
   { key: 'alert-types', label: 'Alert types', path: '/admin/alert-types', permission: 'alert-types', section: 'admin' },
-  { key: 'audit', label: 'Audit log', path: '/admin/audit', permission: 'audit', hosted: true, section: 'admin' },
-  { key: 'health', label: 'Platform health', path: '/admin/health', permission: 'health', hosted: true, section: 'admin' },
+  { key: 'audit', label: 'Audit log', path: '/admin/audit', permission: 'audit', section: 'admin' },
+  { key: 'health', label: 'Platform health', path: '/admin/health', permission: 'health', section: 'admin' },
 ];
 
 /** Menu entries of a user, in menu order, filtered by the permissions list. */

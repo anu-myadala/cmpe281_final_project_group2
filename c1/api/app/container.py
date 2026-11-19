@@ -4,6 +4,7 @@ built once in create_app and reached through request.app.state.container, so
 a test can swap a client for a fake."""
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Union
 
@@ -41,6 +42,8 @@ class AppContainer:
     events: EventQueryRepo = field(init=False)
     # Latest status report of each classifier worker (POST /internal/worker/status), by workerId.
     workers: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    # For the uptime on the platform health page.
+    started_monotonic: float = field(default_factory=time.monotonic)
 
     def __post_init__(self) -> None:
         self.events = EventQueryRepo(self.mongo)

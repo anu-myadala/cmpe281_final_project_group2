@@ -1,11 +1,11 @@
-"""AdminRouter: /admin/tenants, /admin/users, /admin/alert-types.
+"""AdminRouter: /admin/tenants, /admin/users, /admin/alert-types, /admin/audit, /admin/health.
 SYS_ADMIN only, except GET /admin/tenants, which the other staff roles read
 for the tenant selector."""
 from __future__ import annotations
 
 from typing import Optional
 
-from fastapi import APIRouter, Depends, Request, Response
+from fastapi import APIRouter, Depends, Query, Request, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..container import AppContainer
@@ -14,7 +14,7 @@ from ..core.rbac import RbacGuard
 from ..core.security import Claims
 from ..deps import client_ip, get_container, get_session
 from ..schemas import AlertTypeBody, TenantCreateBody, TenantPatchBody, UserCreateBody, UserPatchBody
-from ..services import AdminService
+from ..services import AdminService, HealthService
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
@@ -79,3 +79,20 @@ async def update_alert_type(code: str, body: AlertTypeBody, request: Request, cl
                             session: AsyncSession = Depends(get_session),
                             container: AppContainer = Depends(get_container)):
     return await AdminService(container, session).update_alert_type(code, body, claims.user_id, client_ip(request))
+
+
+@router.get("/audit")
+async def list_audit(actor: Optional[str] = None, entity: Optional[str] = None, action: Optional[str] = None,
+                     tenantId: Optional[int] = None, from_: Optional[str] = Query(None, alias="from"),
+                     to: Optional[str] = None, page: Page = Depends(page_params), _: Claims = Depends(admin_only),
+                     session: AsyncSession = Depends(get_session), container: AppContainer = Depends(get_container)):
+    """M8 audit log viewer (BR-12): newest first, filtered by actor email, entity, action, tenant and dates."""
+    return await AdminService(container, session).list_audit(page, actor, entity, action, tenantId, from_, to)
+
+
+@router.get("/health")
+async def platform_health(_: Claims = Depends(admin_only), session: AsyncSession = Depends(get_session),
+                          container: AppContainer = Depends(get_container)):
+    """M8 platform health: one row per dependency (database, MongoDB, MQTT, C2, C3, classifier workers)."""
+    return await HealthService(container, session).report()
+

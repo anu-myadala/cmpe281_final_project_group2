@@ -52,6 +52,11 @@ class _ServiceClient:
             raise ClientError(f"{self.name} answered a non-JSON body") from exc
 
 
+    async def health(self) -> Any:
+        """GET /health of the neighbor, for the platform health page."""
+        return await self.get("/health")
+
+
 class VehicleClient(_ServiceClient):
     """GET /vehicles?tenantId and GET /vehicles/{vehicleId}/devices on C2."""
 

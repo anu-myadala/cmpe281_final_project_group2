@@ -56,6 +56,17 @@ def stubs_mount(app: FastAPI, container: AppContainer) -> Optional[object]:
         return None
     app.include_router(c2_router, prefix="/c2/api/v1")
     app.include_router(c3_router, prefix="/c3/api/v1")
+
+    # The standalone stubs answer GET /api/v1/health; the inline ones answer the same, so the
+    # platform health page works in every mode.
+    @app.get("/c2/api/v1/health", tags=["c2-stub"])
+    async def c2_stub_health():
+        return {"status": "ok", "component": "c2", "stub": True}
+
+    @app.get("/c3/api/v1/health", tags=["c3-stub"])
+    async def c3_stub_health():
+        return {"status": "ok", "component": "c3", "stub": True}
+
     log.info("Inline C2/C3 stubs mounted at /c2/api/v1 and /c3/api/v1")
     return demo_generator
 

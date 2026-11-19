@@ -54,6 +54,8 @@ SEED_VEHICLES = {
 
 
 class FakeVehicleClient:
+    base_url = "http://c2.test/api/v1"
+
     def __init__(self) -> None:
         self.fail = False
         self.calls = 0
@@ -68,11 +70,18 @@ class FakeVehicleClient:
                                    "offline": 2 if conn == "OFFLINE" else 0, "fault": 0, "disabled": 0}}
                 for code, vin, label, status, conn in SEED_VEHICLES.get(tenant_id, [])]
 
+    async def health(self) -> Dict[str, Any]:
+        if self.fail:
+            raise ClientError("C2 unreachable")
+        return {"status": "ok", "component": "c2", "database": "ok"}
+
     async def device_summary(self, vehicle_id: str, tenant_id: Optional[int] = None):
         return [{"deviceId": "dev-0111", "type": "MIC_INTERIOR", "status": "ONLINE", "lastSeenAt": None}]
 
 
 class FakeAlertClient:
+    base_url = "http://c3.test/api/v1"
+
     def __init__(self) -> None:
         self.fail = False
         self.alerts = {
@@ -96,6 +105,11 @@ class FakeAlertClient:
                 if a["alertId"] == alert_id:
                     return a
         raise ClientError("C3 answered 404")
+
+    async def health(self) -> Dict[str, Any]:
+        if self.fail:
+            raise ClientError("C3 unreachable")
+        return {"status": "ok", "component": "c3", "database": "ok"}
 
     async def map_points(self, tenant_id: int) -> List[Dict[str, Any]]:
         if self.fail:

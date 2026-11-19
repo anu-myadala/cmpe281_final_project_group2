@@ -1,4 +1,4 @@
-// Tabs shared by the administration pages (tenants, users and roles, alert types).
+// Tabs shared by the administration pages (tenants, users and roles, alert types, audit log, health).
 import { Link, useLocation } from 'react-router-dom';
 import Tabs from '@mui/material/Tabs';
 import Tab from '@mui/material/Tab';
@@ -8,6 +8,8 @@ const TABS = [
   { path: '/admin/tenants', label: 'Tenants', permission: 'tenants' },
   { path: '/admin/users', label: 'Users and roles', permission: 'users' },
   { path: '/admin/alert-types', label: 'Alert types', permission: 'alert-types' },
+  { path: '/admin/audit', label: 'Audit log', permission: 'audit' },
+  { path: '/admin/health', label: 'Platform health', permission: 'health' },
 ];
 
 export function AdminTabs() {

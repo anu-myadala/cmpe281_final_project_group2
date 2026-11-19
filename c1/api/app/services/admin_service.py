@@ -10,10 +10,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..container import AppContainer
 from ..core.audit import AuditLogger, snapshot
 from ..core.pagination import Page, page_body
-from ..core.timeutil import iso
+from ..core.timeutil import iso, parse_iso
 from ..errors import BusinessRule, Conflict, NotFound, Validation
 from ..models import PLAN_MAX_VEHICLES, STAFF_ROLES, AlertType, AppUser, Tenant
-from ..repos import AlertTypeRepo, TenantRepo, UserRepo
+from ..repos import AlertTypeRepo, AuditRepo, TenantRepo, UserRepo
 from ..schemas import AlertTypeBody, TenantCreateBody, TenantPatchBody, UserCreateBody, UserPatchBody
 
 
@@ -32,6 +32,13 @@ def admin_user_dto(u: AppUser) -> Dict[str, Any]:
 def alert_type_dto(a: AlertType) -> Dict[str, Any]:
     return {"code": a.code, "name": a.name, "defaultSeverity": a.default_severity,
             "escalationMinutes": a.escalation_minutes, "description": a.description}
+
+
+def audit_dto(row: Any, actor_email: Optional[str], tenant_name: Optional[str]) -> Dict[str, Any]:
+    return {"auditId": row.audit_id, "ts": iso(row.ts), "actorUserId": row.actor_user_id,
+            "actor": actor_email or "system", "tenantId": row.tenant_id, "tenant": tenant_name,
+            "action": row.action, "entity": row.entity, "entityId": row.entity_id, "before": row.before_json,
+            "after": row.after_json, "ip": row.ip}
 
 
 class AdminService:
@@ -187,3 +194,18 @@ class AdminService:
         AuditLogger.write(self.session, actor, None, "ALERT_TYPE_UPDATE", "alert_type", code, before, snapshot(row), ip)
         await self.session.commit()
         return alert_type_dto(row)
+
+    # -- audit log (M8 viewer, GET /admin/audit) --------------------------------------------------
+    async def list_audit(self, page: Page, actor: Optional[str], entity: Optional[str], action: Optional[str],
+                         tenant_id: Optional[int], from_: Optional[str], to: Optional[str]) -> Dict[str, Any]:
+        start = parse_iso(from_, "from") if from_ else None
+        end = parse_iso(to, "to") if to else None
+        if end is not None and to and len(to.strip()) == 10:
+            end = end.replace(hour=23, minute=59, second=59)  # a date "to" includes the whole day
+        if start is not None and end is not None and start > end:
+            raise Validation("from must not be after to", {"field": "from"})
+        rows, total = await AuditRepo.page(self.session, page, actor, entity, action, tenant_id, start, end)
+        body = page_body([audit_dto(r, email, name) for r, email, name in rows], total, page)
+        body["facets"] = await AuditRepo.facets(self.session)
+        return body
+

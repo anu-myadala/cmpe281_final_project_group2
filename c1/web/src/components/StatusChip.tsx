@@ -32,6 +32,10 @@ const KIND_BY_TEXT: Record<string, Kind> = {
   OPEN: 'blue',
   READY: 'green',
   LOADING: 'amber',
+  UP: 'green',
+  DOWN: 'red',
+  DEGRADED: 'orange',
+  STALE: 'amber',
 };
 
 const STYLES: Record<Kind, { bg: string; fg: string; border: string; weight?: number; strike?: boolean }> = {
