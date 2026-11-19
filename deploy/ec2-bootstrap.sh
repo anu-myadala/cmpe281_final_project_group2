@@ -14,7 +14,8 @@
 # AWS_STORAGE_BACKEND (local, the default: artifacts on the instance disk; or s3 with the bucket
 # scicp-models in us-west-2 and the CORS rule of README.md), AWS_S3_ACCESS_KEY / AWS_S3_SECRET_KEY
 # (only for s3 without an instance role), AWS_MAIL_MODE (smtp to MailHog, the default; log; ses),
-# SCICP_STUBS_ONLY=1 (run C1 with the C2/C3 stand-ins even when the real C2 and C3 are in the repo).
+# SCICP_STUBS_ONLY=1 (run C1 with the C2/C3 stand-ins even when the real C2 and C3 are in the repo),
+# SCICP_SCALE=0 (one container each of the API, C2 and C3 instead of two behind the load balancer).
 #
 # When the repository has the real C2 and C3 (docker-compose.c2.yml, docker-compose.c3.yml and
 # docker-compose.c2c3.yml), they start too, and so does the C4 classifier worker when
@@ -140,6 +141,11 @@ if [ "${SCICP_STUBS_ONLY:-0}" != "1" ] && [ -f docker-compose.c3.yml ] && [ -f d
     log "Starting C1 with the real C2, C3 and the C4 classifier worker"
   else
     log "Starting C1 with the real C2 and C3"
+  fi
+  # Scalability and load balancing: two replicas each of the API, C2 and C3 behind nginx.
+  if [ "${SCICP_SCALE:-1}" = "1" ] && [ -f docker-compose.scale.yml ]; then
+    COMPOSE_FILES="${COMPOSE_FILES}:docker-compose.scale.yml"
+    log "Two replicas each of the API, C2 and C3 behind the nginx load balancer (SCICP_SCALE=0 for one)"
   fi
 else
   log "Starting C1 with the C2/C3 stand-ins"

@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import socket
 from typing import Any, Dict, Optional
 from urllib.parse import urlparse
 
@@ -42,7 +43,7 @@ class MqttPublisher:
         parsed = urlparse(self.settings.mqtt_url or "")
         host = parsed.hostname or "localhost"
         port = parsed.port or (8883 if parsed.scheme in ("mqtts", "ssl") else 1883)
-        client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="scicp-c1-api")
+        client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=f"scicp-c1-api-{socket.gethostname()}"[:64])
         if self.settings.mqtt_username:
             client.username_pw_set(self.settings.mqtt_username, self.settings.mqtt_password)
         if parsed.scheme in ("mqtts", "ssl"):

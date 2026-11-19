@@ -9,12 +9,24 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import socket
 from typing import Any, Optional
 
 log = logging.getLogger("scicp.c2.mqtt")
 
 TOPIC_TELEMETRY = "scicp/v1/+/+/telemetry"
 TOPIC_STATUS = "scicp/v1/+/+/status"
+
+
+def subscription(topic: str, share_group: str) -> str:
+    """The topic filter to subscribe with: shared ($share/<group>/<topic>) when C2 runs as several
+    replicas, so that the broker delivers each message to one replica of the group only."""
+    return f"$share/{share_group}/{topic}" if share_group else topic
+
+
+def client_id(base: str) -> str:
+    """MQTT client ids must be unique: a second client with the same id would disconnect the first."""
+    return f"{base}-{socket.gethostname()}"[:64]
 
 
 class MqttGateway:
@@ -55,15 +67,17 @@ class MqttGateway:
         delay = 1.0
         while True:
             try:
-                async with aiomqtt.Client(hostname=host, port=port, identifier=self.settings.c2_mqtt_client_id,
+                async with aiomqtt.Client(hostname=host, port=port, identifier=client_id(self.settings.c2_mqtt_client_id),
                                           username=self.settings.mqtt_username or None,
                                           password=self.settings.mqtt_password or None, keepalive=30) as client:
                     self._client = client
-                    await client.subscribe(TOPIC_TELEMETRY, qos=0)
-                    await client.subscribe(TOPIC_STATUS, qos=1)
+                    group = self.settings.c2_mqtt_share_group
+                    await client.subscribe(subscription(TOPIC_TELEMETRY, group), qos=0)
+                    await client.subscribe(subscription(TOPIC_STATUS, group), qos=1)
                     self.connected.set()
                     delay = 1.0
-                    log.info("MQTT connected to %s:%s; listening to telemetry and status", host, port)
+                    log.info("MQTT connected to %s:%s; listening to telemetry and status%s", host, port,
+                             f" (shared group {group})" if group else "")
                     async for message in client.messages:
                         await self._dispatch(str(message.topic), message.payload)
             except asyncio.CancelledError:

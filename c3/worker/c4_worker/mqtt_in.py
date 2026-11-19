@@ -94,9 +94,9 @@ class MqttIn:
             if reason_code.is_failure:
                 log.warning("MQTT connect refused (%s)", reason_code)
                 return
-            cli.subscribe([(EVENT_TOPIC, 1), (MODEL_ACTIVATED_TOPIC, 1)])
+            cli.subscribe([(self.s.event_subscription, 1), (MODEL_ACTIVATED_TOPIC, 1)])
             log.info("connected to %s:%d, subscribed to %s and %s", self.s.mqtt_host, self.s.mqtt_port,
-                     EVENT_TOPIC, MODEL_ACTIVATED_TOPIC)
+                     self.s.event_subscription, MODEL_ACTIVATED_TOPIC)
 
         def on_disconnect(_cli, _ud, _flags, reason_code, _props=None):
             log.warning("MQTT disconnected (%s); reconnecting", reason_code)

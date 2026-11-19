@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import socket
 from dataclasses import dataclass
 from typing import Optional
 from urllib.parse import urlparse
@@ -38,6 +39,14 @@ class Settings:
     result_waits: tuple = (1.0, 2.0, 4.0)
     cache_dir: str = "/tmp/c4-models"
     clap_model: str = "laion/clap-htsat-unfused"
+    # Several workers: with a group name the audio events are taken with an MQTT shared subscription
+    # ($share/<group>/...), so each clip is classified by ONE worker of the pool. Model activations
+    # stay a plain subscription: every worker must load the new version.
+    share_group: str = ""
+
+    @property
+    def event_subscription(self) -> str:
+        return f"$share/{self.share_group}/{EVENT_TOPIC}" if self.share_group else EVENT_TOPIC
 
     @property
     def mongo_db_name(self) -> str:
@@ -63,7 +72,10 @@ class Settings:
             c2_base_url=os.environ.get("C2_BASE_URL", cls.c2_base_url).rstrip("/"),
             c3_base_url=os.environ.get("C3_BASE_URL", cls.c3_base_url).rstrip("/"),
             mongo_url=os.environ.get("MONGO_URL", cls.mongo_url),
-            worker_id=os.environ.get("WORKER_ID", cls.worker_id),
+            # WORKER_ID=auto names the worker after its container, for a pool of replicas.
+            worker_id=(f"c4-{socket.gethostname()}" if os.environ.get("WORKER_ID") == "auto"
+                       else os.environ.get("WORKER_ID", cls.worker_id)),
+            share_group=os.environ.get("C4_SHARE_GROUP", ""),
             model_name=os.environ.get("WORKER_MODEL", cls.model_name),
             poll_s=max(5.0, _float("WORKER_POLL_S", 30.0)),
             health_port=int(os.environ.get("HEALTH_PORT", cls.health_port)),

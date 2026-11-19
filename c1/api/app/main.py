@@ -22,6 +22,7 @@ from sqlalchemy import select
 
 from .config import Settings, get_settings
 from .container import AppContainer
+from .core.fanout import MqttFanout
 from .db import create_schema
 from .errors import install_error_handlers
 from .models import Tenant
@@ -103,6 +104,9 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         if settings.seed_on_start:
             await run_seed(container)
         tasks = []
+        if settings.event_fanout and settings.mqtt_url:
+            container.fanout = MqttFanout(settings, container.bus, container.instance_id)
+            container.fanout.start()
         generator = getattr(app.state, "demo_generator", None)
         if generator is not None:
             tasks.append(asyncio.create_task(generator(container.bus, container.mongo, settings.database_url)))
@@ -112,6 +116,8 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         finally:
             for task in tasks:
                 task.cancel()
+            if container.fanout is not None:
+                container.fanout.stop()
             await container.engine.dispose()
 
     app = FastAPI(title="SCICP C1 API", version="1.0.0", lifespan=lifespan,
@@ -119,6 +125,14 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     app.state.container = container
     app.state.settings = settings
     install_error_handlers(app)
+
+    @app.middleware("http")
+    async def instance_header(request, call_next):
+        # Which replica answered: visible in the browser's network tab and counted by the load test.
+        response = await call_next(request)
+        response.headers["X-SCICP-Instance"] = container.instance_id
+        return response
+
     app.add_middleware(CORSMiddleware, allow_origins=settings.cors_origins, allow_credentials=True,
                        allow_methods=["*"], allow_headers=["*"])
 
@@ -131,7 +145,8 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
 
     @app.get(f"{prefix}/health", tags=["health"])
     async def health():
-        return {"status": "ok", "component": "c1", "mongo": "mock" if settings.mongo_url == "mock" else "live",
+        return {"status": "ok", "component": "c1", "instance": container.instance_id,
+                "mongo": "mock" if settings.mongo_url == "mock" else "live",
                 "stubsInline": bool(getattr(app.state, "demo_generator", None))}
 
     app.state.demo_generator = stubs_mount(app, container)

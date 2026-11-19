@@ -8,6 +8,7 @@
 #   bash deploy/show.sh models     the model versions of the registry and what the worker loaded
 #   bash deploy/show.sh alerts     the newest alerts with the model version that decided them
 #   bash deploy/show.sh logs       follow the API and the classifier worker
+#   bash deploy/show.sh lb         the load balancer: which replica answered 12 requests per service
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -45,6 +46,23 @@ case "${1:-}" in
     ;;
   logs)
     $DOCKER compose logs -f --tail 5 api "$(worker)"
+    ;;
+  lb)
+    # Replica name for every container address on the compose network.
+    declare -A NAME
+    for id in $($DOCKER compose ps -q); do
+      n=$($DOCKER inspect -f '{{.Name}}' "$id" | sed 's#^/##')
+      for ip in $($DOCKER inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' "$id"); do NAME[$ip]=$n; done
+    done
+    for path in /api/v1/health /c2/api/v1/health /c3/api/v1/health; do
+      printf '%-20s' "$path"
+      for _ in $(seq 1 12); do
+        up=$($DOCKER compose exec -T web wget -S -q -O /dev/null "http://127.0.0.1:8080$path" 2>&1 \
+             | awk 'tolower($1)=="x-upstream:" {print $2}' | tr -d '\r' | cut -d: -f1)
+        echo "${NAME[$up]:-$up}"
+      done | sort | uniq -c | awk '{printf "  %s x%s", $2, $1}'
+      echo
+    done
     ;;
   *)
     sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'

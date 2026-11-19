@@ -1,0 +1,42 @@
+# Scalability and load balancing: two replicas each of the C1 API, C2 and C3 behind nginx.
+# Add it LAST, after the files of the whole platform (and docker-compose.aws.yml on EC2):
+#
+#   COMPOSE_FILE=...:docker-compose.c4.yml:docker-compose.scale.yml     (in .env)
+#   docker compose up -d --build
+#   docker compose up -d --scale c2=3         # more replicas at run time; nginx finds them in 10 s
+#
+#   api   2 replicas; EVENT_FANOUT=1 shares the EventBus over MQTT (c1/api/app/core/fanout.py), so a
+#         WebSocket on either replica gets every live event; the workers' reports are read from MongoDB
+#   c2    2 replicas; MQTT shared subscriptions ($share/c2/...): the broker gives each telemetry or
+#         status message to one replica; the timers run on one replica at a time (MySQL GET_LOCK)
+#   c3    2 replicas; stateless (the database decides); the schema is created by one at a time
+#   web   nginx is the load balancer (deploy/nginx-scaled.conf): round robin, health by max_fails,
+#         retry on the next replica, discovery through Docker's DNS, X-Upstream header
+#
+# The replicas publish no host ports (two containers cannot share one); use the web port, or
+# "docker compose exec api ..." for one replica. The C4 worker stays one container here (it needs
+# about 3 GB); C4_SHARE_GROUP=c4 and WORKER_ID=auto let a pool of workers share the clips.
+
+services:
+  api:
+    deploy:
+      replicas: 2
+    ports: !reset []
+    environment:
+      EVENT_FANOUT: "1"
+
+  c2:
+    deploy:
+      replicas: 2
+    ports: !reset []
+    environment:
+      C2_MQTT_SHARE_GROUP: c2
+
+  c3:
+    deploy:
+      replicas: 2
+    ports: !reset []
+
+  web:
+    volumes:
+      - ./deploy/nginx-scaled.conf:/etc/nginx/conf.d/default.conf:ro

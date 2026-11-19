@@ -25,7 +25,7 @@ from sqlalchemy import text
 
 from .auth import TenantDirectory
 from .config import Settings, get_settings
-from .db import make_engine, make_mongo, make_session_factory
+from .db import make_engine, make_mongo, make_session_factory, named_lock
 from .errors import install_error_handlers
 from .routers import clips, devices, vehicles
 from .schema import create_c2_schema
@@ -72,18 +72,27 @@ class OfflineGateway:
         pass
 
 
-async def _every(seconds: float, what, name: str) -> None:
+async def _every(seconds: float, what, name: str, engine=None) -> None:
     while True:
         await asyncio.sleep(seconds)
         try:
-            await what()
+            # With several replicas each runs the timers, one at a time (MySQL named lock): the jobs
+            # read the state from the database, so the second run finds nothing left to change.
+            async with named_lock(engine, f"scicp-c2-{name}") if engine is not None else _always() as mine:
+                if mine:
+                    await what()
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
             log.warning("%s failed: %s", name, exc)
 
 
-async def _daily(hour: int, minute: int, what) -> None:
+@asynccontextmanager
+async def _always():
+    yield True
+
+
+async def _daily(hour: int, minute: int, what, engine=None) -> None:
     while True:
         now = utcnow()
         target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
@@ -91,7 +100,9 @@ async def _daily(hour: int, minute: int, what) -> None:
             target += timedelta(days=1)
         await asyncio.sleep((target - now).total_seconds())
         try:
-            await what()
+            async with named_lock(engine, "scicp-c2-retention") if engine is not None else _always() as mine:
+                if mine:
+                    await what()
         except Exception as exc:  # noqa: BLE001
             log.warning("retention job failed: %s", exc)
 
@@ -122,7 +133,8 @@ def create_app(settings: Optional[Settings] = None, mongo: Any = None, publisher
         session_factory = make_session_factory(engine)
         db = mongo if mongo is not None else make_mongo(settings.mongo_url, settings.mongo_database_name)
         tenants = TenantDirectory(session_factory)
-        await create_c2_schema(engine, db, settings.c2_offline_after_s)
+        async with named_lock(engine, "scicp-c2-schema", 60):  # replicas start together: one at a time
+            await create_c2_schema(engine, db, settings.c2_offline_after_s)
         pub = publisher if publisher is not None else (
             NoopPublisher() if settings.publisher == "noop" or not settings.c1_base_url
             else HttpPublisher(settings.c1_base_url, settings.service_token_secret, 2.0))
@@ -147,9 +159,10 @@ def create_app(settings: Optional[Settings] = None, mongo: Any = None, publisher
         if hasattr(gw, "start"):
             gw.start()
         if settings.c2_background:
-            tasks += [asyncio.create_task(_every(settings.c2_sweep_every_s, tracker.sweep, "status sweep")),
-                      asyncio.create_task(_every(5.0, commands.timeouts, "command timeouts")),
-                      asyncio.create_task(_daily(settings.c2_retention_hour_utc, 15, services.clips.run_retention))]
+            tasks += [asyncio.create_task(_every(settings.c2_sweep_every_s, tracker.sweep, "status sweep", engine)),
+                      asyncio.create_task(_every(5.0, commands.timeouts, "command timeouts", engine)),
+                      asyncio.create_task(_daily(settings.c2_retention_hour_utc, 15, services.clips.run_retention,
+                                                 engine))]
         log.info("C2 ready: %s, MongoDB %s, MQTT %s, clips %s", engine.dialect.name, settings.mongo_database_name,
                  settings.mqtt_url if settings.c2_mqtt_enabled else "off", settings.c2_clip_backend)
         try:

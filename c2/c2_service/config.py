@@ -39,7 +39,11 @@ class Settings(BaseSettings):
     mqtt_username: Optional[str] = None
     mqtt_password: Optional[str] = None
     c2_mqtt_enabled: bool = True
-    c2_mqtt_client_id: str = "c2-api"
+    c2_mqtt_client_id: str = "c2-api"              # the container's host name is appended (unique per replica)
+    # Load balancing (several C2 replicas behind nginx): with a group name the replicas subscribe with
+    # MQTT shared subscriptions ($share/<group>/...), so the broker hands each telemetry or status
+    # message to ONE replica instead of all of them. Empty: a plain subscription (one replica).
+    c2_mqtt_share_group: str = ""
     # What the provisioning result tells the car (host and port as seen from the car)
     c2_public_mqtt_host: str = "localhost"
     c2_public_mqtt_port: int = 1883

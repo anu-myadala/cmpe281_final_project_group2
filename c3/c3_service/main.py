@@ -18,7 +18,7 @@ from sqlalchemy import text
 
 from .auth import TenantDirectory
 from .config import Settings, get_settings
-from .db import make_engine, make_mongo, make_session_factory
+from .db import make_engine, make_mongo, make_session_factory, named_lock
 from .errors import install_error_handlers
 from .routers import alerts, internal, rules
 from .schema import create_c3_schema
@@ -53,7 +53,8 @@ def create_app(settings: Optional[Settings] = None, mongo: Any = None, publisher
         app.state.session_factory = make_session_factory(engine)
         app.state.tenants = TenantDirectory(app.state.session_factory)
         app.state.mongo = mongo if mongo is not None else make_mongo(settings.mongo_url, settings.mongo_database_name)
-        await create_c3_schema(engine)
+        async with named_lock(engine, "scicp-c3-schema", 60):  # replicas start together: one at a time
+            await create_c3_schema(engine)
         app.state.notifier = NotificationService(app.state.session_factory, mailer or AlertMailer(settings),
                                                  settings.retry_waits)
         log.info("C3 ready: %s, MongoDB %s", engine.dialect.name, settings.mongo_database_name)

@@ -14,6 +14,7 @@ from .clients import AlertClient, LocalStorageClient, MailSender, MqttPublisher,
 from .config import Settings
 from .core.cache import RateCounter, TtlCache
 from .core.eventbus import EventBus
+from .core.fanout import instance_id
 from .core.security import PasswordHasher, TokenService
 from .db import make_engine, make_mongo, make_session_factory
 from .repos import EventQueryRepo
@@ -44,6 +45,9 @@ class AppContainer:
     workers: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     # For the uptime on the platform health page.
     started_monotonic: float = field(default_factory=time.monotonic)
+    # This replica's name (host name and pid), sent as the X-SCICP-Instance header and on the health page.
+    instance_id: str = field(default_factory=instance_id)
+    fanout: Optional[Any] = None   # MqttFanout when EVENT_FANOUT=1
 
     def __post_init__(self) -> None:
         self.events = EventQueryRepo(self.mongo)

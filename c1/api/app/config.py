@@ -52,6 +52,8 @@ class Settings(BaseSettings):
     mqtt_url: Optional[str] = None
     mqtt_username: Optional[str] = None
     mqtt_password: Optional[str] = None
+    # Several API replicas behind the load balancer: share the EventBus over MQTT (core/fanout.py).
+    event_fanout: bool = False
 
     # Neighboring components
     c2_base_url: str = "http://localhost:8002/api/v1"

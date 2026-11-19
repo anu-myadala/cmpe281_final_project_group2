@@ -15,7 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..container import AppContainer
 from ..core.timeutil import iso, parse_iso, utcnow
 from ..errors import Validation
-from .deployment_service import STALE_AFTER
+from .deployment_service import STALE_AFTER, load_workers
 
 PROBE_TIMEOUT = 3.0
 
@@ -98,12 +98,16 @@ class HealthService:
         results = [await _timed(p) for _, _, p in probes[:3]]
         results += await asyncio.gather(*(_timed(p) for _, _, p in probes[3:]))
         parts = [{"name": name, "kind": kind, **result} for (name, kind, _), result in zip(probes, results)]
+        await load_workers(self.c)
         parts.extend(self._workers())
         down = [p["name"] for p in parts if p["state"] != "UP"]
         return {"status": "UP" if not down else "DEGRADED", "down": down, "parts": parts,
+                "instance": self.c.instance_id,
                 "uptimeSeconds": round(time.monotonic() - self.c.started_monotonic),
                 "checkedAt": iso(utcnow())}
 
-    @staticmethod
-    async def _noop() -> Optional[str]:
-        return "answering"
+    async def _noop(self) -> Optional[str]:
+        fanout = self.c.fanout
+        shared = f", events shared with the other replicas ({'connected' if fanout.connected else 'broker down'})" \
+            if fanout is not None else ""
+        return f"replica {self.c.instance_id}{shared}"

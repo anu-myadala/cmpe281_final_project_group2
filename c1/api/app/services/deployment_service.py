@@ -6,7 +6,8 @@ classifier worker.
      presigned download URL, fetches the artifact and verifies the digest.
   3. It reports POST /internal/worker/status {workerId, modelVersion, sha256, state}.
   4. C1 keeps the newest report per worker (memory, mirrored in the MongoDB
-     collection worker_status so a restart of the API does not lose it), publishes
+     collection worker_status so a restart of the API does not lose it and every API
+     replica sees it), publishes
      model.deployed to the staff room, and GET /models/{id}/deployment shows it.
 
 sha256Verified is decided here, not by the worker: the reported digest must equal
@@ -33,6 +34,20 @@ WORKER_COLLECTION = "worker_status"
 DEFAULT_MODEL_NAME = "sound-classifier"
 # A worker that has not reported for this long is shown as stale (it polls every 30 s).
 STALE_AFTER = timedelta(seconds=90)
+
+
+async def load_workers(container: AppContainer) -> None:
+    """Refresh the workers' reports from MongoDB. With several API replicas the worker reports to one
+    of them, so every replica reads the shared collection; the memory copy is the fallback."""
+    try:
+        docs = await container.mongo[WORKER_COLLECTION].find({}).to_list(100)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("worker_status not readable: %s", exc)
+        return
+    for doc in docs:
+        doc.pop("_id", None)
+        if doc.get("workerId"):
+            container.workers[doc["workerId"]] = doc
 
 
 class DeploymentService:
@@ -96,18 +111,7 @@ class DeploymentService:
 
     # -- for the web app ------------------------------------------------------------------------
     async def _load_saved(self) -> None:
-        """After an API restart, start from the reports saved in MongoDB."""
-        if self.c.workers:
-            return
-        try:
-            docs = await self.c.mongo[WORKER_COLLECTION].find({}).to_list(100)
-        except Exception as exc:  # noqa: BLE001
-            log.warning("worker_status not readable: %s", exc)
-            return
-        for doc in docs:
-            doc.pop("_id", None)
-            if doc.get("workerId"):
-                self.c.workers[doc["workerId"]] = doc
+        await load_workers(self.c)
 
     async def deployment(self, model_id: int) -> Dict[str, Any]:
         model = await self._model(model_id)
